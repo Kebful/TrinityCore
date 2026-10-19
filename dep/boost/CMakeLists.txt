@@ -29,7 +29,7 @@ else()
   set(BOOST_REQUIRED_VERSION 1.74)
 endif()
 
-find_package(Boost ${BOOST_REQUIRED_VERSION} REQUIRED system filesystem program_options iostreams regex locale)
+find_package(Boost ${BOOST_REQUIRED_VERSION} REQUIRED filesystem program_options iostreams regex locale)
 
 if(NOT Boost_FOUND)
   if(NOT DEFINED ENV{BOOST_ROOT} AND NOT DEFINED Boost_DIR AND NOT DEFINED BOOST_ROOT AND NOT DEFINED BOOSTROOT)
@@ -54,7 +54,6 @@ target_compile_definitions(boost
     -DBOOST_CHRONO_NO_LIB
     -DBOOST_SERIALIZATION_NO_LIB
     -DBOOST_CONFIG_SUPPRESS_OUTDATED_MESSAGE
-    -DBOOST_ASIO_NO_DEPRECATED
     -DBOOST_SYSTEM_USE_UTF8
     -DBOOST_BIND_NO_PLACEHOLDERS)
 

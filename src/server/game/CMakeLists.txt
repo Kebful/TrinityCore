@@ -77,12 +77,18 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/ArthurSonzogni/nlohmann_json_cmake_fetchcontent
   GIT_TAG v3.9.1
 )
-FetchContent_GetProperties (json)
-if (NOT json_POPULATED)
-message (STATUS "Installing json.hpp...")
-FetchContent_Populate (json)
-endif()
-add_subdirectory (${json_SOURCE_DIR} ${json_BINARY_DIR})
+# The pinned header-only JSON wrapper requests CMake 3.1 policies, which
+# CMake 4 no longer supports. Scope the compatibility floor to this dependency
+# so it does not change policies for TrinityCore or other fetched projects.
+function(tswow_make_json_available)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0" AND
+      (NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR
+       CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS "3.10"))
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+  endif()
+  FetchContent_MakeAvailable(json)
+endfunction()
+tswow_make_json_available()
 
 FILE(GLOB TSWOW_PUBLIC ${TSWOW_CORE_PUBLIC}/*)
 FILE(GLOB TSWOW_PRIVATE ${TSWOW_CORE_PRIVATE}/*)
