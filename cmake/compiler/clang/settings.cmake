@@ -149,7 +149,9 @@ if(BUILD_SHARED_LIBS)
 
   # --no-undefined to throw errors when there are undefined symbols
   # (caused through missing TRINITY_*_API macros).
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --no-undefined")
-
-  message(STATUS "Clang: Disallow undefined symbols")
+  # Only apply on Linux - macOS ld64 doesn't support this flag
+  if(UNIX AND NOT APPLE)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --no-undefined")
+    message(STATUS "Clang: Disallow undefined symbols")
+  endif()
 endif()
