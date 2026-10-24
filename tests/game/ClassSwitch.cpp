@@ -244,6 +244,10 @@ TEST_CASE("Class switch only admits target-family or shared spells", "[ClassSwit
     REQUIRE(IsSpellAllowedForClassProfile(0, 7, false));
     REQUIRE(IsSpellAllowedForClassProfile(10, 7, false) == false);
     REQUIRE(IsSpellAllowedForClassProfile(10, 7, true));
+
+    REQUIRE(IsSharedClassProfileSpell(0, false, false));
+    REQUIRE(IsSharedClassProfileSpell(10, true, false));
+    REQUIRE_FALSE(IsSharedClassProfileSpell(0, false, true));
 }
 
 TEST_CASE("Class switch start levels follow config without resetting existing profiles", "[ClassSwitch]")
@@ -260,6 +264,79 @@ TEST_CASE("Class switch start levels follow config without resetting existing pr
         CLASS_WARRIOR, true, 12, 1, 1, 1) == 12);
     REQUIRE(ResolveClassStatusLevel(
         CLASS_WARRIOR, false, 0, 1, 1, 1) == 1);
+}
+
+TEST_CASE("Class switch starter weapon skills honor worldserver configuration", "[ClassSwitch]")
+{
+    REQUIRE(ResolveStarterLevelSkillValue(
+        400, 80, CLASS_WARRIOR, true, false, false, false) == 400);
+    REQUIRE(ResolveStarterLevelSkillValue(
+        400, 80, CLASS_WARRIOR, false, true, false, false) == 400);
+    REQUIRE(ResolveStarterLevelSkillValue(
+        300, 60, CLASS_WARRIOR, false, false, true, true) == 300);
+    REQUIRE(ResolveStarterLevelSkillValue(
+        400, 80, CLASS_DEATH_KNIGHT, false, false, false, false) == 395);
+    REQUIRE(ResolveStarterLevelSkillValue(
+        5, 1, CLASS_WARRIOR, true, false, false, false) == 5);
+    REQUIRE(ResolveStarterLevelSkillValue(
+        75, 15, CLASS_WARRIOR, true, false, false, true) == 1);
+    REQUIRE(ResolveStarterLevelSkillValue(
+        400, 80, CLASS_WARRIOR, false, false, false, false) == 1);
+}
+
+TEST_CASE("Class switch skill normalization is idempotent", "[ClassSwitch]")
+{
+    std::vector<SkillProfile> skills{
+        { 43, 0, 5, 5, 0, 0, false },
+        { 333, 1, 1, 75, 0, 0, false },
+        { 43, 0, 5, 5, 0, 0, false },
+        { 0, 0, 1, 1, 0, 0, false },
+    };
+
+    REQUIRE(NormalizeSkillProfiles(&skills) == 2);
+    REQUIRE(skills.size() == 2);
+    REQUIRE(skills[0].Id == 43);
+    REQUIRE(skills[1].Id == 333);
+    REQUIRE(NormalizeSkillProfiles(&skills) == 0);
+    REQUIRE(skills.size() == 2);
+}
+
+TEST_CASE("Death Knight profiles cannot retain First Aid or Riding starter grants", "[ClassSwitch]")
+{
+    REQUIRE(IsDeathKnightExcludedStarterSkill(CLASS_DEATH_KNIGHT, SKILL_FIRST_AID));
+    REQUIRE(IsDeathKnightExcludedStarterSkill(CLASS_DEATH_KNIGHT, SKILL_RIDING));
+    REQUIRE_FALSE(IsDeathKnightExcludedStarterSkill(CLASS_WARRIOR, SKILL_FIRST_AID));
+    REQUIRE_FALSE(CanInheritClassProfileSkill(
+        CLASS_DEATH_KNIGHT, SKILL_FIRST_AID, true));
+    REQUIRE_FALSE(CanInheritClassProfileSkill(
+        CLASS_DEATH_KNIGHT, SKILL_RIDING, true));
+    REQUIRE_FALSE(CanInheritClassProfileSkill(
+        CLASS_HUNTER, SKILL_RIDING, true));
+    REQUIRE(CanInheritClassProfileSkill(
+        CLASS_HUNTER, SKILL_FIRST_AID, true));
+    REQUIRE_FALSE(CanInheritClassProfileSkill(
+        CLASS_HUNTER, SKILL_FIRST_AID, false));
+
+    StoredClassProfile profile;
+    profile.ClassId = CLASS_DEATH_KNIGHT;
+    profile.Level = 1;
+    profile.Skills = {
+        { SKILL_FIRST_AID, 0, 1, 75, 0, 0, true },
+        { SKILL_RIDING, 0, 1, 75, 0, 0, true },
+        { SKILL_2H_SWORDS, 0, 1, 5, 0, 0, false },
+    };
+
+    RemoveDeathKnightExcludedStarterEntries(&profile);
+    REQUIRE(profile.Skills.size() == 1);
+    REQUIRE(profile.Skills[0].Id == SKILL_2H_SWORDS);
+}
+
+TEST_CASE("Class switch notifications require a live unsuppressed player", "[ClassSwitch]")
+{
+    REQUIRE(ShouldSendClassSwitchNotification(true, false));
+    REQUIRE_FALSE(ShouldSendClassSwitchNotification(true, true));
+    REQUIRE_FALSE(ShouldSendClassSwitchNotification(false, false));
+    REQUIRE_FALSE(ShouldSendClassSwitchNotification(false, true));
 }
 
 TEST_CASE("Character languages survive repeated class-profile application", "[ClassSwitch]")

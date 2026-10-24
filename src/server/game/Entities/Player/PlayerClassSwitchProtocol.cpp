@@ -315,6 +315,11 @@ bool IsSpellAllowedForClassProfile(uint32 spellFamily, uint32 classFamily, bool 
     return !spellFamily || professionOrRiding || spellFamily == classFamily;
 }
 
+bool IsSharedClassProfileSpell(uint32 spellFamily, bool profession, bool riding)
+{
+    return profession || (!spellFamily && !riding);
+}
+
 uint8 ResolveClassStartLevel(uint8 classId, uint8 configuredClassInitialLevel,
     uint8 configuredPlayerStartLevel, uint8 configuredDeathKnightStartLevel)
 {

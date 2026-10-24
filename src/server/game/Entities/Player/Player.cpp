@@ -2900,7 +2900,8 @@ void Player::SendInitialSpells()
 
 void Player::SendUnlearnSpells()
 {
-    if (m_classSwitchNotificationSuppression)
+    if (!ClassSwitch::ShouldSendClassSwitchNotification(
+        IsInWorld(), m_classSwitchNotificationSuppression != 0))
         return;
 
     WorldPacket data(SMSG_SEND_UNLEARN_SPELLS, 4 + 4 * m_spells.size());
@@ -3218,7 +3219,8 @@ bool Player::AddSpell(uint32 spellId, bool active, bool learning, bool dependent
                 if (spellInfo->IsPassive() && HandlePassiveSpellLearn(spellInfo))
                     CastSpell(this, spellId, true);
             }
-            else if (IsInWorld() && !m_classSwitchNotificationSuppression)
+            else if (ClassSwitch::ShouldSendClassSwitchNotification(
+                IsInWorld(), m_classSwitchNotificationSuppression != 0))
             {
                 if (next_active_spell_id)
                 {
@@ -3538,7 +3540,8 @@ void Player::LearnSpell(uint32 spell_id, bool dependent, uint32 fromSkill /*= 0*
     bool learning = AddSpell(spell_id, active, true, dependent, false, false, fromSkill);
 
     // prevent duplicated entires in spell book, also not send if not in world (loading)
-    if (learning && IsInWorld() && !m_classSwitchNotificationSuppression)
+    if (learning && ClassSwitch::ShouldSendClassSwitchNotification(
+        IsInWorld(), m_classSwitchNotificationSuppression != 0))
     {
         WorldPacket data(SMSG_LEARNED_SPELL, 6);
         data << uint32(spell_id);
@@ -3763,11 +3766,13 @@ void Player::RemoveSpell(uint32 spell_id, bool disabled, bool learn_low_rank)
     if (sWorld->getBoolConfig(CONFIG_OFFHAND_CHECK_AT_SPELL_UNLEARN))
         AutoUnequipOffhandIfNeed();
 
-    if (needsUnlearnSpellsPacket && !m_classSwitchNotificationSuppression)
+    if (needsUnlearnSpellsPacket && ClassSwitch::ShouldSendClassSwitchNotification(
+        IsInWorld(), m_classSwitchNotificationSuppression != 0))
         SendUnlearnSpells();
 
     // remove from spell book if not replaced by lesser rank
-    if (!prev_activate && !m_classSwitchNotificationSuppression)
+    if (!prev_activate && ClassSwitch::ShouldSendClassSwitchNotification(
+        IsInWorld(), m_classSwitchNotificationSuppression != 0))
     {
         WorldPacket data(SMSG_REMOVED_SPELL, 4);
         data << uint32(spell_id);
@@ -27318,7 +27323,8 @@ Pet* Player::SummonPet(uint32 entry, float x, float y, float z, float ang, PetTy
 
 void Player::SendSupercededSpell(uint32 oldSpell, uint32 newSpell) const
 {
-    if (m_classSwitchNotificationSuppression)
+    if (!ClassSwitch::ShouldSendClassSwitchNotification(
+        IsInWorld(), m_classSwitchNotificationSuppression != 0))
         return;
 
     WorldPacket data(SMSG_SUPERCEDED_SPELL, 8);

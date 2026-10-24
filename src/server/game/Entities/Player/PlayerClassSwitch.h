@@ -459,8 +459,17 @@ bool IsSwitchOwnedAura(uint64 playerGuid, uint64 creatorGuid, uint32 classFamily
     uint32 spellFamily, bool shapeshift);
 RequestResult EvaluateSelectionPolicy(SelectionPolicy const& policy);
 bool IsSpellAllowedForClassProfile(uint32 spellFamily, uint32 classFamily, bool professionOrRiding);
+bool IsSharedClassProfileSpell(uint32 spellFamily, bool profession, bool riding);
+bool IsDeathKnightExcludedStarterSkill(uint8 classId, uint32 skillId);
+bool CanInheritClassProfileSkill(uint8 targetClassId, uint32 skillId, bool shared);
+void RemoveDeathKnightExcludedStarterEntries(StoredClassProfile* profile);
 uint32 NormalizeActionSpellRank(uint32 requestedRank, std::vector<uint32> const& spellChain,
     std::set<uint32> const& activeRanks);
+uint16 ResolveStarterLevelSkillValue(uint16 levelMax, uint8 level, uint8 classId,
+    bool alwaysMaxWeaponSkill, bool alwaysMaxSkillForLevel,
+    bool alwaysMaxValueFlag, bool professionOrRiding);
+uint32 NormalizeSkillProfiles(std::vector<SkillProfile>* skills);
+bool ShouldSendClassSwitchNotification(bool inWorld, bool suppressionActive);
 void StripClassOwnedLanguages(StoredClassProfile* profile,
     std::set<uint32> const& languageSpellIds, std::set<uint32> const& languageSkillIds,
     uint32* removedSpells = nullptr, uint32* removedSkills = nullptr);

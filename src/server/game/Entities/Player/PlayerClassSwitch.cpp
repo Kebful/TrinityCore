@@ -176,6 +176,17 @@ bool IsLanguageSpellId(uint32 spellId)
             return true;
     return false;
 }
+
+bool IsDeathKnightExcludedStarterSpell(uint32 spellId)
+{
+    SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+    for (auto itr = bounds.first; itr != bounds.second; ++itr)
+        if (itr->second->SkillLine == SKILL_FIRST_AID ||
+            itr->second->SkillLine == SKILL_RIDING)
+            return true;
+    return false;
+}
+
 }
 
 class ClassSwitchManager
@@ -684,9 +695,14 @@ public:
         {
             if (IsLanguageSpellId(spell.Id))
                 continue;
+            if (target.ClassId == CLASS_DEATH_KNIGHT &&
+                IsDeathKnightExcludedStarterSpell(spell.Id))
+                continue;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.Id);
-            if (!info || !IsSpellAllowedForClassProfile(
-                info->SpellFamilyName, targetFamily, info->IsProfessionOrRiding()))
+            if (!info || (!IsSharedClassProfileSpell(
+                    info->SpellFamilyName, info->IsProfession(),
+                    info->IsProfessionOrRiding() && !info->IsProfession())
+                && info->SpellFamilyName != targetFamily))
                 continue;
             if (targetSpells.insert(spell.Id).second)
             {
@@ -712,7 +728,8 @@ public:
         {
             if (IsLanguageSkillId(sourceSkill.Id))
                 continue;
-            if (!sourceSkill.Shared)
+            if (!CanInheritClassProfileSkill(
+                target.ClassId, sourceSkill.Id, sourceSkill.Shared))
                 continue;
             auto targetSkill = std::find_if(target.Skills.begin(), target.Skills.end(),
                 [&sourceSkill](SkillProfile const& value) { return value.Id == sourceSkill.Id; });
@@ -1587,13 +1604,18 @@ private:
             if (action.type == ACTION_BUTTON_SPELL && sSpellMgr->GetSpellInfo(action.action))
                 spellIds.insert(action.action);
 
-        // Shared classless spells, professions, riding, and known mounts remain available.
+        // Shared professions and classless non-riding spells remain available.
         for (SpellProfile const& spell : source.Spells)
         {
             if (IsLanguageSpellId(spell.Id))
                 continue;
+            if (classId == CLASS_DEATH_KNIGHT &&
+                IsDeathKnightExcludedStarterSpell(spell.Id))
+                continue;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.Id);
-            if (info && (!info->SpellFamilyName || info->IsProfessionOrRiding()))
+            if (info && IsSharedClassProfileSpell(
+                info->SpellFamilyName, info->IsProfession(),
+                info->IsProfessionOrRiding() && !info->IsProfession()))
                 spellIds.insert(spell.Id);
         }
         spellIds.insert(_switchSpellId);
@@ -1609,25 +1631,29 @@ private:
         std::set<uint32> skillIds;
         for (PlayerCreateInfoSkill const& createSkill : createInfo->skills)
         {
+            if (IsDeathKnightExcludedStarterSkill(classId, createSkill.SkillId))
+                continue;
+            if (!skillIds.insert(createSkill.SkillId).second)
+                continue;
             SkillProfile skill;
             skill.Id = createSkill.SkillId;
             skill.Step = createSkill.Rank;
             CalculateStarterSkillValue(player->GetRace(), classId, created.Level, createSkill.SkillId,
                 createSkill.Rank, &skill);
             created.Skills.push_back(skill);
-            skillIds.insert(skill.Id);
         }
         for (SkillProfile const& skill : source.Skills)
         {
             if (IsLanguageSkillId(skill.Id))
                 continue;
-            if (!skill.Shared)
+            if (!CanInheritClassProfileSkill(classId, skill.Id, skill.Shared))
                 continue;
             auto itr = std::find_if(created.Skills.begin(), created.Skills.end(),
                 [&skill](SkillProfile const& value) { return value.Id == skill.Id; });
             if (itr == created.Skills.end())
                 created.Skills.push_back(skill);
         }
+        NormalizeSkillProfiles(&created.Skills);
 
         for (PlayerCreateInfoAction const& action : createInfo->action)
         {
@@ -1656,6 +1682,7 @@ private:
                     created.Groups[0].Actions[slot] = sourceAction;
         }
 
+        RemoveDeathKnightExcludedStarterEntries(&created);
         uint32 repaired = 0;
         if (!RepairActionSpells(player, &created, &repaired, error))
             return false;
@@ -1679,24 +1706,45 @@ private:
         if (!rcInfo)
         {
             profile->Value = profile->Max = 1;
-            profile->Shared = IsProfessionOrRidingSkill(skillId);
+            profile->Shared = IsProfessionSkill(skillId);
             return;
         }
-        if (rcInfo->Flags & SKILL_FLAG_ALWAYS_MAX_VALUE)
-            profile->Value = profile->Max;
-        else if (classId == CLASS_DEATH_KNIGHT)
-            profile->Value = uint16(std::min<uint32>(std::max<uint32>(1, (level - 1) * 5), profile->Max));
-        profile->Shared = IsProfessionOrRidingSkill(skillId)
+        profile->Shared = IsProfessionSkill(skillId)
             || GetSkillRangeType(rcInfo) == SKILL_RANGE_LANGUAGE;
-        if (GetSkillRangeType(rcInfo) == SKILL_RANGE_MONO)
-            profile->Value = profile->Max = 1;
-        else if (GetSkillRangeType(rcInfo) == SKILL_RANGE_RANK)
+        switch (GetSkillRangeType(rcInfo))
         {
-            SkillTiersEntry const* tier = sSkillTiersStore.LookupEntry(rcInfo->SkillTierID);
-            if (tier)
+            case SKILL_RANGE_LANGUAGE:
+                profile->Value = profile->Max = 300;
+                break;
+            case SKILL_RANGE_LEVEL:
+                profile->Value = ResolveStarterLevelSkillValue(
+                    profile->Max, level, classId,
+                    sWorld->getBoolConfig(CONFIG_ALWAYS_MAXSKILL),
+                    sWorld->getBoolConfig(CONFIG_ALWAYS_MAX_SKILL_FOR_LEVEL),
+                    (rcInfo->Flags & SKILL_FLAG_ALWAYS_MAX_VALUE) != 0,
+                    profile->Shared);
+                break;
+            case SKILL_RANGE_MONO:
+                profile->Value = profile->Max = 1;
+                break;
+            case SKILL_RANGE_RANK:
+            {
+                SkillTiersEntry const* tier = sSkillTiersStore.LookupEntry(rcInfo->SkillTierID);
+                if (!tier)
+                    break;
                 profile->Max = tier->Value[std::min<uint32>(
                     std::max<int32>(int32(rank) - 1, 0),
                     MAX_SKILL_STEP - 1)];
+                if (rcInfo->Flags & SKILL_FLAG_ALWAYS_MAX_VALUE)
+                    profile->Value = profile->Max;
+                else if (classId == CLASS_DEATH_KNIGHT)
+                    profile->Value = uint16(std::min<uint32>(
+                        std::max<uint32>(1, uint32(level > 0 ? level - 1 : 0) * 5),
+                        profile->Max));
+                break;
+            }
+            default:
+                break;
         }
     }
 
@@ -1849,6 +1897,9 @@ private:
             if (spell.state == PLAYERSPELL_REMOVED ||
                 languageIds.Spells.find(spellId) != languageIds.Spells.end())
                 continue;
+            if (player->GetClass() == CLASS_DEATH_KNIGHT &&
+                IsDeathKnightExcludedStarterSpell(spellId))
+                continue;
             SpellProfile& saved = captured.Spells.emplace_back();
             saved.Id = spellId;
             saved.State = spell.state;
@@ -1862,6 +1913,8 @@ private:
             if (status.uState == SKILL_DELETED ||
                 languageIds.Skills.find(skillId) != languageIds.Skills.end())
                 continue;
+            if (IsDeathKnightExcludedStarterSkill(player->GetClass(), skillId))
+                continue;
             uint32 const valueData = player->GetUInt32Value(SkillValueIndex(status.pos));
             uint32 const bonusData = player->GetUInt32Value(SkillBonusIndex(status.pos));
             SkillProfile skill;
@@ -1873,7 +1926,7 @@ private:
             skill.PermanentBonus = int16(PAIR32_HIPART(bonusData));
             SkillRaceClassInfoEntry const* skillInfo =
                 GetSkillRaceClassInfo(skillId, player->GetRace(), player->GetClass());
-            skill.Shared = IsProfessionOrRidingSkill(skillId)
+            skill.Shared = IsProfessionSkill(skillId)
                 || (skillInfo && GetSkillRangeType(skillInfo) == SKILL_RANGE_LANGUAGE);
             captured.Skills.push_back(skill);
         }
@@ -2490,11 +2543,8 @@ private:
         bool detachPet, EquipmentRollbackPlan* rollbackPlan,
         EquipmentRollbackPlan const* restorePlan)
     {
-        CharacterLanguageState const characterLanguages = CaptureCharacterLanguages(player);
-        LanguageEntryIds const languageIds = CollectLanguageEntryIds(player, &target);
         StoredClassProfile runtimeProfile = target;
-        MergeCharacterLanguages(
-            &runtimeProfile, characterLanguages, languageIds.Spells, languageIds.Skills);
+        RemoveDeathKnightExcludedStarterEntries(&runtimeProfile);
 
         ChrClassesEntry const* oldClass = sChrClassesStore.LookupEntry(player->GetClass());
         uint32 const oldFamily = oldClass ? oldClass->SpellClassSet : 0;
@@ -2508,6 +2558,7 @@ private:
                 oldFamily, info->SpellFamilyName,
                 info->HasAura(SPELL_AURA_MOD_SHAPESHIFT));
         });
+        player->SetShapeshiftForm(FORM_NONE);
         if (detachPet)
             DetachPetForStaging(player);
         player->RemoveAllControlled();
@@ -2546,39 +2597,35 @@ private:
             player->ResyncRunes();
         }
 
-        std::set<uint32> retainedSharedSkills;
-        for (SkillProfile const& skill : runtimeProfile.Skills)
-            if (skill.Shared && player->mSkillStatus.find(skill.Id) != player->mSkillStatus.end())
-                retainedSharedSkills.insert(skill.Id);
+        std::vector<SkillProfile> appliedSkills = runtimeProfile.Skills;
+        NormalizeSkillProfiles(&appliedSkills);
 
-        std::set<uint32> persistedSkillIds;
-        for (auto& [skillId, status] : player->mSkillStatus)
+        std::set<uint8> languageSkillSlots;
+        SkillStatusMap retainedLanguageSkillStatus;
+        for (auto const& [skillId, status] : player->mSkillStatus)
         {
-            if (retainedSharedSkills.count(skillId))
-            {
-                persistedSkillIds.insert(skillId);
+            if (status.uState == SKILL_DELETED ||
+                !IsLanguageSkillId(skillId) ||
+                status.pos >= PLAYER_MAX_SKILLS)
                 continue;
-            }
-            if (status.uState != SKILL_NEW)
-                persistedSkillIds.insert(skillId);
-            player->SetUInt32Value(SkillInfoIndex(status.pos), 0);
-            player->SetUInt32Value(SkillValueIndex(status.pos), 0);
-            player->SetUInt32Value(SkillBonusIndex(status.pos), 0);
-            status.uState = SKILL_DELETED;
+            languageSkillSlots.insert(status.pos);
+            retainedLanguageSkillStatus.emplace(skillId, status);
         }
-        for (SkillProfile const& skill : runtimeProfile.Skills)
+
+        for (uint8 slot = 0; slot < PLAYER_MAX_SKILLS; ++slot)
         {
-            if (retainedSharedSkills.count(skill.Id))
+            if (languageSkillSlots.count(slot))
                 continue;
-            uint8 position = PLAYER_MAX_SKILLS;
-            for (uint8 slot = 0; slot < PLAYER_MAX_SKILLS; ++slot)
-            {
-                if (!player->GetUInt32Value(SkillInfoIndex(slot)))
-                {
-                    position = slot;
-                    break;
-                }
-            }
+            player->SetUInt32Value(SkillInfoIndex(slot), 0);
+            player->SetUInt32Value(SkillValueIndex(slot), 0);
+            player->SetUInt32Value(SkillBonusIndex(slot), 0);
+        }
+        player->mSkillStatus = std::move(retainedLanguageSkillStatus);
+        uint8 position = 0;
+        for (SkillProfile const& skill : appliedSkills)
+        {
+            while (position < PLAYER_MAX_SKILLS && languageSkillSlots.count(position))
+                ++position;
             if (position == PLAYER_MAX_SKILLS)
                 return SetError(error, "target profile has no free player skill slots");
 
@@ -2587,16 +2634,9 @@ private:
             player->SetUInt32Value(SkillBonusIndex(position),
                 MAKE_PAIR32(uint16(skill.TemporaryBonus), uint16(skill.PermanentBonus)));
 
-            SkillUpdateState const state = persistedSkillIds.count(skill.Id)
-                ? SKILL_CHANGED : SKILL_NEW;
-            auto status = player->mSkillStatus.find(skill.Id);
-            if (status == player->mSkillStatus.end())
-                player->mSkillStatus.emplace(skill.Id, SkillStatusData(position, state));
-            else
-            {
-                status->second.pos = position;
-                status->second.uState = state;
-            }
+            player->mSkillStatus.emplace(skill.Id,
+                SkillStatusData(position, SKILL_UNCHANGED));
+            ++position;
         }
 
         PlayerSpellMap replacement;
@@ -2617,6 +2657,11 @@ private:
         }
         for (auto& [spellId, spell] : player->m_spells)
         {
+            if (spell.state != PLAYERSPELL_REMOVED && IsLanguageSpellId(spellId))
+            {
+                replacement[spellId] = spell;
+                continue;
+            }
             auto replacementItr = replacement.find(spellId);
             if (replacementItr == replacement.end())
             {
@@ -3114,7 +3159,9 @@ private:
         for (uint32 spellId : known)
         {
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-            if (info && (!info->SpellFamilyName || info->IsProfessionOrRiding()))
+            if (info && IsSharedClassProfileSpell(
+                info->SpellFamilyName, info->IsProfession(),
+                info->IsProfessionOrRiding() && !info->IsProfession()))
                 built.SharedProgression.SpellIds.push_back(spellId);
         }
         std::sort(built.SharedProgression.SpellIds.begin(), built.SharedProgression.SpellIds.end());
@@ -3182,10 +3229,10 @@ private:
                 uint8(sWorld->getIntConfig(CONFIG_START_PLAYER_LEVEL)),
                 uint8(sWorld->getIntConfig(CONFIG_START_DEATH_KNIGHT_PLAYER_LEVEL)));
             auto profileLevel = levels.find(classId);
-            if (profileLevel != levels.end() && profileLevel->second.first)
-                level = profileLevel->second.first;
-            else if (classId == player->GetClass())
+            if (classId == player->GetClass())
                 level = player->GetLevel();
+            else if (profileLevel != levels.end() && profileLevel->second.first)
+                level = profileLevel->second.first;
             available.push_back({ classId, uint8(level), flags, definition.Definition.Name });
         }
 
@@ -3217,6 +3264,66 @@ RequestResult RequestSwitch(Player* player, uint16 protocolVersion, uint8 reques
     uint64 revision, std::string* error)
 {
     return Manager().Request(player, protocolVersion, requestType, classId, revision, error);
+}
+
+bool IsDeathKnightExcludedStarterSkill(uint8 classId, uint32 skillId)
+{
+    return classId == CLASS_DEATH_KNIGHT &&
+        (skillId == SKILL_FIRST_AID || skillId == SKILL_RIDING);
+}
+
+bool CanInheritClassProfileSkill(uint8 targetClassId, uint32 skillId, bool shared)
+{
+    return shared && skillId != SKILL_RIDING &&
+        !IsDeathKnightExcludedStarterSkill(targetClassId, skillId);
+}
+
+void RemoveDeathKnightExcludedStarterEntries(StoredClassProfile* profile)
+{
+    if (!profile || profile->ClassId != CLASS_DEATH_KNIGHT)
+        return;
+
+    profile->Skills.erase(std::remove_if(profile->Skills.begin(), profile->Skills.end(),
+        [](SkillProfile const& skill) {
+            return IsDeathKnightExcludedStarterSkill(
+                CLASS_DEATH_KNIGHT, skill.Id);
+        }), profile->Skills.end());
+    profile->Spells.erase(std::remove_if(profile->Spells.begin(), profile->Spells.end(),
+        [](SpellProfile const& spell) {
+            return IsDeathKnightExcludedStarterSpell(spell.Id);
+        }), profile->Spells.end());
+}
+
+uint16 ResolveStarterLevelSkillValue(uint16 levelMax, uint8 level, uint8 classId,
+    bool alwaysMaxWeaponSkill, bool alwaysMaxSkillForLevel,
+    bool alwaysMaxValueFlag, bool professionOrRiding)
+{
+    if (((alwaysMaxWeaponSkill || alwaysMaxSkillForLevel) && !professionOrRiding) ||
+        alwaysMaxValueFlag)
+        return levelMax;
+    if (classId == CLASS_DEATH_KNIGHT)
+        return uint16(std::min<uint32>(
+            std::max<uint32>(1, uint32(level > 0 ? level - 1 : 0) * 5), levelMax));
+    return 1;
+}
+
+uint32 NormalizeSkillProfiles(std::vector<SkillProfile>* skills)
+{
+    if (!skills)
+        return 0;
+
+    std::set<uint32> seen;
+    size_t const previousSize = skills->size();
+    skills->erase(std::remove_if(skills->begin(), skills->end(),
+        [&seen](SkillProfile const& skill) {
+            return !skill.Id || !seen.insert(skill.Id).second;
+        }), skills->end());
+    return uint32(previousSize - skills->size());
+}
+
+bool ShouldSendClassSwitchNotification(bool inWorld, bool suppressionActive)
+{
+    return inWorld && !suppressionActive;
 }
 
 bool ProcessClientResponse(Player* player, uint8 const* payload, size_t size, std::string* error)
