@@ -2004,6 +2004,11 @@ void ScriptMgr::OnPlayerSpellCast(Player* player, Spell* spell, bool skipCheck)
     FOREACH_SCRIPT(PlayerScript)->OnSpellCast(player, spell, skipCheck);
 }
 
+void ScriptMgr::OnPlayerSpellCastSucceeded(Player* player, Spell* spell, bool skipCheck)
+{
+    FOREACH_SCRIPT(PlayerScript)->OnSpellCastSucceeded(player, spell, skipCheck);
+}
+
 void ScriptMgr::OnPlayerLogin(Player* player, bool firstLogin)
 {
     FOREACH_SCRIPT(PlayerScript)->OnLogin(player, firstLogin);
@@ -2744,6 +2749,10 @@ void PlayerScript::OnTextEmote(Player* /*player*/, uint32 /*textEmote*/, uint32 
 }
 
 void PlayerScript::OnSpellCast(Player* /*player*/, Spell* /*spell*/, bool /*skipCheck*/)
+{
+}
+
+void PlayerScript::OnSpellCastSucceeded(Player* /*player*/, Spell* /*spell*/, bool /*skipCheck*/)
 {
 }
 

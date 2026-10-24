@@ -59,6 +59,7 @@
 #include "WardenWin.h"
 #include "World.h"
 #include "WorldPacket.h"
+#include "PlayerClassSwitch.h"
 #include "WorldSocket.h"
 #include <boost/circular_buffer.hpp>
 #include <zlib.h>
@@ -500,6 +501,8 @@ void WorldSession::LogoutPlayer(bool save)
 
     if (_player)
     {
+        ClassSwitch::ClearPlayerRuntime(_player);
+
         if (ObjectGuid lguid = _player->GetLootGUID())
             DoLootRelease(lguid);
 
@@ -580,7 +583,10 @@ void WorldSession::LogoutPlayer(bool save)
                 _player->SetUInt32Value(PLAYER_FIELD_BUYBACK_PRICE_1 + eslot, 0);
                 _player->SetUInt32Value(PLAYER_FIELD_BUYBACK_TIMESTAMP_1 + eslot, 0);
             }
-            _player->SaveToDB();
+            if (!_player->SaveToDB())
+                TC_LOG_ERROR("entities.player.classswitch",
+                    "Player {} logout save failed; durable state remains at the last successful transaction",
+                    _player->GetGUID().ToString());
         }
 
         ///- Leave all channels before player delete...
@@ -1309,6 +1315,11 @@ TransactionCallback& WorldSession::AddTransactionCallback(TransactionCallback&& 
 SQLQueryHolderCallback& WorldSession::AddQueryHolderCallback(SQLQueryHolderCallback&& callback)
 {
     return _queryHolderProcessor.AddCallback(std::move(callback));
+}
+
+void WorldSession::InitClassSwitch(SessionKey const& k)
+{
+    _activeClassSessionTag = ClassSwitch::ComputeSessionTag(k.data(), k.size());
 }
 
 void WorldSession::InitWarden(SessionKey const& k, std::string const& os)

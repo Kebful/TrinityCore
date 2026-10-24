@@ -206,6 +206,7 @@ Player::Player(WorldSession* session): Unit(true)
     m_ExtraFlags = 0;
 
     m_spellModTakingSpell = nullptr;
+    m_classSwitchNotificationSuppression = 0;
     //m_pad = 0;
 
     // players always accept
@@ -522,7 +523,7 @@ bool Player::Create(ObjectGuid::LowType guidlow, CharacterCreateInfo* createInfo
         return false;
     }
 
-    if (!ValidateAppearance(createInfo->Race, createInfo->Class, createInfo->Gender, createInfo->HairStyle, createInfo->HairColor, createInfo->Face, createInfo->FacialHair, createInfo->Skin, true))
+    if (!ValidateAppearance(createInfo->Race, createInfo->Gender, createInfo->HairStyle, createInfo->HairColor, createInfo->Face, createInfo->FacialHair, createInfo->Skin, true))
     {
         TC_LOG_ERROR("entities.player.cheat", "Player::Create: Possible hacking attempt: Account {} tried to create a character named '{}' with invalid appearance attributes - refusing to do so",
             GetSession()->GetAccountId(), m_name);
@@ -1269,8 +1270,8 @@ void Player::Update(uint32 p_time)
         if (p_time >= m_nextSave)
         {
             // m_nextSave reset in SaveToDB call
-            SaveToDB();
-            TC_LOG_DEBUG("entities.player", "Player::Update: Player '{}' ({}) saved", GetName(), GetGUID().ToString());
+            if (SaveToDB())
+                TC_LOG_DEBUG("entities.player", "Player::Update: Player '{}' ({}) saved", GetName(), GetGUID().ToString());
         }
         else
             m_nextSave -= p_time;
@@ -1480,7 +1481,7 @@ bool Player::BuildEnumData(PreparedQueryResult result, WorldPacket* data)
 
     uint16 atLoginFlags = fields[18].GetUInt16();
 
-    if (!ValidateAppearance(uint8(plrRace), uint8(plrClass), gender, hairStyle, hairColor, face, facialStyle, skin))
+    if (!ValidateAppearance(uint8(plrRace), gender, hairStyle, hairColor, face, facialStyle, skin))
     {
         TC_LOG_ERROR("entities.player.loading", "Player {} has wrong Appearance values (Hair/Skin/Color), forcing recustomize", guid);
 
@@ -2894,6 +2895,9 @@ void Player::SendInitialSpells()
 
 void Player::SendUnlearnSpells()
 {
+    if (m_classSwitchNotificationSuppression)
+        return;
+
     WorldPacket data(SMSG_SEND_UNLEARN_SPELLS, 4 + 4 * m_spells.size());
 
     uint32 spellCount = 0;
@@ -3209,7 +3213,7 @@ bool Player::AddSpell(uint32 spellId, bool active, bool learning, bool dependent
                 if (spellInfo->IsPassive() && HandlePassiveSpellLearn(spellInfo))
                     CastSpell(this, spellId, true);
             }
-            else if (IsInWorld())
+            else if (IsInWorld() && !m_classSwitchNotificationSuppression)
             {
                 if (next_active_spell_id)
                 {
@@ -3529,7 +3533,7 @@ void Player::LearnSpell(uint32 spell_id, bool dependent, uint32 fromSkill /*= 0*
     bool learning = AddSpell(spell_id, active, true, dependent, false, false, fromSkill);
 
     // prevent duplicated entires in spell book, also not send if not in world (loading)
-    if (learning && IsInWorld())
+    if (learning && IsInWorld() && !m_classSwitchNotificationSuppression)
     {
         WorldPacket data(SMSG_LEARNED_SPELL, 6);
         data << uint32(spell_id);
@@ -3754,11 +3758,11 @@ void Player::RemoveSpell(uint32 spell_id, bool disabled, bool learn_low_rank)
     if (sWorld->getBoolConfig(CONFIG_OFFHAND_CHECK_AT_SPELL_UNLEARN))
         AutoUnequipOffhandIfNeed();
 
-    if (needsUnlearnSpellsPacket)
+    if (needsUnlearnSpellsPacket && !m_classSwitchNotificationSuppression)
         SendUnlearnSpells();
 
     // remove from spell book if not replaced by lesser rank
-    if (!prev_activate)
+    if (!prev_activate && !m_classSwitchNotificationSuppression)
     {
         WorldPacket data(SMSG_REMOVED_SPELL, 4);
         data << uint32(spell_id);
@@ -4246,6 +4250,8 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER);
             stmt->setUInt32(0, guid);
             trans->Append(stmt);
+            trans->PAppend(
+                "DELETE FROM `ffxiv_class_switch_profiles` WHERE `guid` = {}", guid);
 // @tswow-begin (Using Rochet2/Transmog)
 #ifdef PRESETS
             trans->PAppend("DELETE FROM `custom_transmogrification_sets` WHERE `Owner` = {}", guid);
@@ -17558,7 +17564,6 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     if (!ValidateAppearance(
         fields[3].GetUInt8(), // race
-        fields[4].GetUInt8(), // class
         gender, GetHairStyleId(), GetHairColorId(), GetFaceId(), GetFacialStyle(), GetSkinId()))
     {
         TC_LOG_ERROR("entities.player.loading", "Player::LoadFromDB: Player ({}) has wrong Appearance values (Hair/Skin/Color), can't load.", guid.ToString());
@@ -18110,6 +18115,10 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
         uint32 savedPower = fields[56 + i].GetUInt32();
         SetPower(static_cast<Powers>(i), savedPower);
     }
+
+    // Active class profiles are authoritative if a switch was interrupted
+    // between the profile write and the regular character-table save.
+    RestoreActiveClassProfileAfterLoad();
 
     TC_LOG_DEBUG("entities.player.loading", "Player::LoadFromDB: The value of player '{}' after load item and aura is: ", m_name);
     outDebugValues();
@@ -19573,16 +19582,27 @@ bool Player::_LoadHomeBind(PreparedQueryResult result)
 /***                   SAVE SYSTEM                     ***/
 /*********************************************************/
 
-void Player::SaveToDB(bool create /*=false*/)
+bool Player::SaveToDB(bool create /*=false*/)
 {
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
-    SaveToDB(trans, create);
+    if (!SaveToDB(trans, create))
+    {
+        m_nextSave = 0;
+        return false;
+    }
 
-    CharacterDatabase.CommitTransaction(trans);
+    TransactionCallback callback = CharacterDatabase.AsyncCommitTransaction(trans);
+    if (!callback.m_future.get())
+    {
+        m_nextSave = 0;
+        TC_LOG_ERROR("entities.player", "Player {} save transaction failed", GetGUID().ToString());
+        return false;
+    }
+    return true;
 }
 
-void Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false */)
+bool Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false */)
 {
     // delay auto save at any saves (manual, in code, or autosave)
     m_nextSave = sWorld->getIntConfig(CONFIG_INTERVAL_SAVE);
@@ -19591,7 +19611,7 @@ void Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false
     if (IsBeingTeleportedFar())
     {
         ScheduleDelayedOperation(DELAYED_SAVE_PLAYER);
-        return;
+        return true;
     }
 
     // first save/honor gain after midnight will also update the player's honor fields
@@ -19900,6 +19920,18 @@ void Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false
     // save pet (hunter pet level and experience and all type pets health/mana).
     if (Pet* pet = GetPet())
         pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+
+    std::string classSwitchError;
+    if (!create && !ClassSwitch::AppendActiveProfileToTransaction(
+        trans, this, &classSwitchError))
+    {
+        m_nextSave = 0;
+        TC_LOG_ERROR("entities.player.classswitch",
+            "Player {} save aborted because the active class profile could not be encoded: {}",
+            GetGUID().ToString(), classSwitchError);
+        return false;
+    }
+    return true;
 }
 
 // fast save function for item/money cheating preventing - save only inventory and money state
@@ -27255,20 +27287,19 @@ Pet* Player::SummonPet(uint32 entry, float x, float y, float z, float ang, PetTy
 
 void Player::SendSupercededSpell(uint32 oldSpell, uint32 newSpell) const
 {
+    if (m_classSwitchNotificationSuppression)
+        return;
+
     WorldPacket data(SMSG_SUPERCEDED_SPELL, 8);
     data << uint32(oldSpell) << uint32(newSpell);
     SendDirectMessage(&data);
 }
 
-bool Player::ValidateAppearance(uint8 race, uint8 class_, uint8 gender, uint8 hairID, uint8 hairColor, uint8 faceID, uint8 facialHair, uint8 skinColor, bool create /*=false*/)
+bool Player::ValidateAppearance(uint8 race, uint8 gender, uint8 hairID, uint8 hairColor, uint8 faceID, uint8 facialHair, uint8 skinColor, bool create /*=false*/)
 {
-    auto validateCharSection = [class_, create](CharSectionsEntry const* entry) -> bool
+    auto validateCharSection = [create](CharSectionsEntry const* entry) -> bool
     {
         if (!entry)
-            return false;
-
-        // Check Death Knight exclusive
-        if (class_ != CLASS_DEATH_KNIGHT && entry->HasFlag(SECTION_FLAG_DEATH_KNIGHT))
             return false;
 
         // Character creation/customize has some limited sections (as opposed to barbershop)

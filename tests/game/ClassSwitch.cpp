@@ -1,0 +1,341 @@
+/*
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.
+ */
+
+#include "tc_catch2.h"
+
+#include "PlayerClassSwitch.h"
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+
+using namespace ClassSwitch;
+
+namespace
+{
+StoredClassProfile MinimalProfile()
+{
+    StoredClassProfile profile;
+    profile.Revision = 1;
+    profile.ClassId = 8;
+    profile.Level = 1;
+    profile.NextLevelXp = 400;
+    profile.ActiveSpec = 0;
+    profile.SpecCount = 1;
+    profile.HealthPercent = 80.0f;
+    profile.PowerPercent.fill(100.0f);
+    profile.Spells.push_back({ 133, 2, true, false, false });
+    profile.Spells.push_back({ 116, 2, true, false, false });
+    profile.Groups[0].Actions[1] = 116;
+    return profile;
+}
+
+ActiveClassSnapshot MinimalSnapshot()
+{
+    ActiveClassSnapshot snapshot;
+    snapshot.Session = 12345;
+    snapshot.Revision = 1;
+    snapshot.Guid = 0x0000000000000001;
+    snapshot.Race = 1;
+    snapshot.ClassId = 8;
+    snapshot.Level = 1;
+    snapshot.TalentGroupCount = 1;
+    snapshot.Resources.Powers[0] = 100;
+    snapshot.Resources.MaxPowers[0] = 100;
+    snapshot.Spells.push_back({ 133, 0 });
+    snapshot.Resources.PredictedPowers.fill(0);
+    snapshot.Resources.Runes.PredictedMask = 0;
+    snapshot.Health = 100;
+    snapshot.MaxHealth = 100;
+    return snapshot;
+}
+}
+
+TEST_CASE("Class switch class IDs and masks cover the uint32 boundary", "[ClassSwitch]")
+{
+    for (uint32 classId = 1; classId <= 32; ++classId)
+    {
+        REQUIRE(IsSupportedClassId(uint8(classId)));
+        REQUIRE(ClassIdToMask(uint8(classId)) == (1u << (classId - 1)));
+    }
+    REQUIRE(ClassIdToMask(1) == 0x00000001u);
+    REQUIRE(ClassIdToMask(11) == 0x00000400u);
+    REQUIRE(ClassIdToMask(32) == 0x80000000u);
+    REQUIRE_FALSE(IsSupportedClassId(0));
+    REQUIRE_FALSE(IsSupportedClassId(33));
+    uint8 sessionKey[40] = {};
+    REQUIRE(ComputeSessionTag(sessionKey, sizeof(sessionKey)) == 0x40d69e0cf0f65c45ULL);
+}
+
+TEST_CASE("Class switch selection policy rejects stale and unsafe requests", "[ClassSwitch]")
+{
+    SelectionPolicy policy;
+    policy.ActiveRevision = 4;
+    policy.ClientRevision = 4;
+    REQUIRE(EvaluateSelectionPolicy(policy) == RequestResult::Ok);
+
+    policy.Pending = true;
+    REQUIRE(EvaluateSelectionPolicy(policy) == RequestResult::Busy);
+    policy.Pending = false;
+    policy.InCombat = true;
+    REQUIRE(EvaluateSelectionPolicy(policy) == RequestResult::NotReady);
+    policy.InCombat = false;
+    policy.ClientRevision = 3;
+    REQUIRE(EvaluateSelectionPolicy(policy) == RequestResult::StaleRevision);
+    policy.ClientRevision = 4;
+    policy.SameClass = true;
+    REQUIRE(EvaluateSelectionPolicy(policy) == RequestResult::TargetUnchanged);
+}
+
+TEST_CASE("Class switch only admits target-family or shared spells", "[ClassSwitch]")
+{
+    REQUIRE(IsSpellAllowedForClassProfile(7, 7, false));
+    REQUIRE(IsSpellAllowedForClassProfile(0, 7, false));
+    REQUIRE(IsSpellAllowedForClassProfile(10, 7, false) == false);
+    REQUIRE(IsSpellAllowedForClassProfile(10, 7, true));
+}
+
+TEST_CASE("Class switch reserves one target revision above both profiles", "[ClassSwitch]")
+{
+    uint64 reserved = 0;
+    REQUIRE(ReserveTransitionRevision(4, 2, &reserved));
+    REQUIRE(reserved == 5);
+    REQUIRE(ReserveTransitionRevision(3, 9, &reserved));
+    REQUIRE(reserved == 10);
+    REQUIRE_FALSE(ReserveTransitionRevision(0, 3, &reserved));
+    REQUIRE_FALSE(ReserveTransitionRevision(3, 0, &reserved));
+    REQUIRE_FALSE(ReserveTransitionRevision(
+        std::numeric_limits<uint64>::max(), 1, &reserved));
+}
+
+TEST_CASE("Class switch only removes self-owned class auras", "[ClassSwitch]")
+{
+    REQUIRE(IsSwitchOwnedAura(10, 10, 8, 8, false));
+    REQUIRE(IsSwitchOwnedAura(10, 10, 0, 0, true));
+    REQUIRE_FALSE(IsSwitchOwnedAura(10, 11, 8, 8, false));
+    REQUIRE_FALSE(IsSwitchOwnedAura(10, 10, 0, 0, false));
+    REQUIRE_FALSE(IsSwitchOwnedAura(10, 10, 8, 3, false));
+}
+
+TEST_CASE("Stored class profile round trips through its bounded wire form", "[ClassSwitch]")
+{
+    StoredClassProfile profile = MinimalProfile();
+    profile.Level = 42;
+    profile.Xp = 1234;
+    profile.NextLevelXp = 5678;
+    profile.Skills.push_back({ 333, 1, 50, 100, 2, 3, true });
+    profile.Groups[0].Talents.push_back({ 120, 0 });
+    profile.Groups[0].Glyphs[0] = 42;
+    profile.Groups[0].Actions[0] = 133;
+    profile.Runes.Count = 6;
+    profile.Runes.Types[0] = 1;
+    profile.Runes.BaseTypes[0] = 1;
+    profile.Runes.Cooldowns[0] = 2500;
+    profile.Runes.LastUsed[0] = 1;
+
+    std::string error;
+    REQUIRE(ValidateStoredProfile(profile, &error));
+    std::vector<uint8> encoded = EncodeStoredProfile(profile);
+    REQUIRE_FALSE(encoded.empty());
+
+    StoredClassProfile decoded;
+    REQUIRE(DecodeStoredProfile(encoded.data(), encoded.size(), &decoded, &error));
+    REQUIRE(decoded.ClassId == profile.ClassId);
+    REQUIRE(decoded.Level == profile.Level);
+    REQUIRE(decoded.Xp == 1234);
+    REQUIRE(decoded.NextLevelXp == 5678);
+    REQUIRE(decoded.Spells.size() == 2);
+    REQUIRE(decoded.Spells[0].Id == 133);
+    REQUIRE(decoded.Spells[1].Id == 116);
+    REQUIRE(decoded.Groups[0].Actions[0] == 133);
+    REQUIRE(decoded.Groups[0].Actions[1] == 116);
+    REQUIRE(decoded.Runes.Count == 6);
+    REQUIRE(decoded.Runes.Cooldowns[0] == 2500);
+}
+
+TEST_CASE("Druid profile preserves its starter action and reports a missing spell precisely", "[ClassSwitch]")
+{
+    StoredClassProfile druid;
+    druid.Revision = 9;
+    druid.ClassId = 11;
+    druid.Level = 13;
+    druid.NextLevelXp = 11000;
+    druid.ActiveSpec = 0;
+    druid.SpecCount = 1;
+    druid.HealthPercent = 100.0f;
+    druid.PowerPercent.fill(100.0f);
+    druid.Spells.push_back({ 6603, 0, true, false, false });
+    druid.Spells.push_back({ 5185, 0, true, false, false });
+    druid.Spells.push_back({ 80900, 0, true, false, false });
+    druid.Groups[0].Actions[1] = 5185;
+
+    std::string error;
+    REQUIRE(ValidateStoredProfile(druid, &error));
+    std::vector<uint8> encoded = EncodeStoredProfile(druid);
+    REQUIRE_FALSE(encoded.empty());
+
+    StoredClassProfile decoded;
+    REQUIRE(DecodeStoredProfile(encoded.data(), encoded.size(), &decoded, &error));
+    REQUIRE(decoded.ClassId == 11);
+    REQUIRE(decoded.Groups[0].Actions[1] == 5185);
+    REQUIRE(std::any_of(decoded.Spells.begin(), decoded.Spells.end(),
+        [](SpellProfile const& spell) { return spell.Id == 5185; }));
+
+    druid.Spells.erase(std::find_if(druid.Spells.begin(), druid.Spells.end(),
+        [](SpellProfile const& spell) { return spell.Id == 5185; }));
+    REQUIRE_FALSE(ValidateStoredProfile(druid, &error));
+    REQUIRE(error.find("action 1") != std::string::npos);
+    REQUIRE(error.find("specialization 0") != std::string::npos);
+    REQUIRE(error.find("spell 5185") != std::string::npos);
+}
+
+TEST_CASE("Class profile actions may reference a known inactive spell rank", "[ClassSwitch]")
+{
+    StoredClassProfile profile = MinimalProfile();
+    profile.Spells[0].Active = false;
+    profile.Groups[0].Actions[1] = profile.Spells[0].Id;
+
+    std::string error;
+    REQUIRE(ValidateStoredProfile(profile, &error));
+
+    profile.Spells.erase(profile.Spells.begin());
+    REQUIRE_FALSE(ValidateStoredProfile(profile, &error));
+    REQUIRE(error.find("spell 133") != std::string::npos);
+}
+
+TEST_CASE("Class profile backing-table writes are ordered and non-destructive", "[ClassSwitch]")
+{
+    StoredClassProfile profile = MinimalProfile();
+    profile.Groups[0].Talents.push_back({ 120, 0 });
+    profile.Groups[0].Glyphs[0] = 42;
+    profile.Groups[0].Actions[0] = 133;
+    profile.Groups[0].Actions[1] = 0x80000001u;
+
+    std::vector<std::string> statements = BuildProfileBackingTableStatements(77, profile);
+    REQUIRE_FALSE(statements.empty());
+    REQUIRE(statements.front().find("DELETE FROM character_action WHERE guid = 77") == 0);
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("INSERT INTO character_action") != std::string::npos
+            && sql.find(", 0, 0, 133, 0)") != std::string::npos;
+    }));
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("character_talent") != std::string::npos
+            && sql.find("INSERT") != std::string::npos;
+    }));
+    for (std::string const& sql : statements)
+        REQUIRE(sql.find("DROP TABLE") == std::string::npos);
+}
+
+TEST_CASE("Stored class profile rejects duplicate spell references", "[ClassSwitch]")
+{
+    StoredClassProfile profile = MinimalProfile();
+    profile.Spells.push_back(profile.Spells.front());
+    std::string error;
+    REQUIRE_FALSE(ValidateStoredProfile(profile, &error));
+    REQUIRE_FALSE(error.empty());
+}
+
+TEST_CASE("Stored class profile rejects rune state outside its active slots", "[ClassSwitch]")
+{
+    StoredClassProfile profile = MinimalProfile();
+    profile.Runes.Count = 6;
+    profile.Runes.Types[7] = 1;
+    std::string error;
+    REQUIRE_FALSE(ValidateStoredProfile(profile, &error));
+    REQUIRE(error.find("beyond") != std::string::npos);
+}
+
+TEST_CASE("Active class snapshot v1 encodes with the required field envelope", "[ClassSwitch]")
+{
+    ActiveClassSnapshot snapshot = MinimalSnapshot();
+    std::string error;
+    REQUIRE(ValidateActiveClassSnapshot(snapshot, &error));
+
+    std::vector<uint8> encoded = EncodeActiveClassSnapshot(snapshot);
+    REQUIRE(encoded.size() > 256);
+
+    uint32 magic = 0;
+    uint16 version = 0;
+    std::memcpy(&magic, encoded.data(), sizeof(magic));
+    std::memcpy(&version, encoded.data() + sizeof(magic), sizeof(version));
+    REQUIRE(magic == SNAPSHOT_MAGIC);
+    REQUIRE(version == SNAPSHOT_VERSION);
+}
+
+TEST_CASE("Class switch status encodes the final client field order", "[ClassSwitch]")
+{
+    std::vector<ActiveClassStatusDescriptor> classes{
+        { 8, 23, CLASS_FLAG_ACTIVE | CLASS_FLAG_AVAILABLE, "Mage" },
+        { 1, 1, CLASS_FLAG_PENDING | CLASS_FLAG_AVAILABLE, "Warrior" }
+    };
+    std::vector<uint8> encoded = EncodeActiveClassStatus(StatusStage::Accepted,
+        RequestResult::Ok, 8, 1, 7, 0x1020304050607080ULL, classes);
+    REQUIRE(encoded.size() == 23 + (5 + 4) + (5 + 7));
+
+    uint16 protocol = 0;
+    uint8 stage = 0;
+    uint8 result = 0;
+    uint8 active = 0;
+    uint8 pending = 0;
+    uint64 revision = 0;
+    uint64 session = 0;
+    uint8 count = 0;
+    std::memcpy(&protocol, encoded.data(), sizeof(protocol));
+    std::memcpy(&stage, encoded.data() + 2, sizeof(stage));
+    std::memcpy(&result, encoded.data() + 3, sizeof(result));
+    std::memcpy(&active, encoded.data() + 4, sizeof(active));
+    std::memcpy(&pending, encoded.data() + 5, sizeof(pending));
+    std::memcpy(&revision, encoded.data() + 6, sizeof(revision));
+    std::memcpy(&session, encoded.data() + 14, sizeof(session));
+    std::memcpy(&count, encoded.data() + 22, sizeof(count));
+    REQUIRE(protocol == REQUEST_PROTOCOL_VERSION);
+    REQUIRE(stage == static_cast<uint8>(StatusStage::Accepted));
+    REQUIRE(result == static_cast<uint8>(RequestResult::Ok));
+    REQUIRE(active == 8);
+    REQUIRE(pending == 1);
+    REQUIRE(revision == 7);
+    REQUIRE(session == 0x1020304050607080ULL);
+    REQUIRE(count == 2);
+
+    classes.push_back(classes.front());
+    REQUIRE(EncodeActiveClassStatus(StatusStage::State, RequestResult::Ok,
+        8, 0, 1, 2, classes).empty());
+}
+
+TEST_CASE("Active class snapshot rejects class-family action leakage", "[ClassSwitch]")
+{
+    ActiveClassSnapshot snapshot = MinimalSnapshot();
+    snapshot.Actions[0] = 9999;
+    std::string error;
+    REQUIRE_FALSE(ValidateActiveClassSnapshot(snapshot, &error));
+    REQUIRE(error.find("unavailable spell") != std::string::npos);
+}
+
+TEST_CASE("Active class snapshot matches client shape constraints", "[ClassSwitch]")
+{
+    ActiveClassSnapshot snapshot = MinimalSnapshot();
+    std::string error;
+    ActiveClassSpellModifier modifier;
+    modifier.Group = 1;
+    modifier.Operation = 31;
+    snapshot.Modifiers.push_back(modifier);
+    REQUIRE_FALSE(ValidateActiveClassSnapshot(snapshot, &error));
+
+    snapshot.Modifiers.front().Operation = 1;
+    snapshot.ActiveClassAuras.push_back({ 1, 133, 0, 1, 1, 0, 0 });
+    REQUIRE_FALSE(ValidateActiveClassSnapshot(snapshot, &error));
+
+    snapshot.ActiveClassAuras.clear();
+    snapshot.Pet.Mode = 1;
+    REQUIRE_FALSE(ValidateActiveClassSnapshot(snapshot, &error));
+
+    snapshot.Pet.Mode = 0;
+    snapshot.SharedProgression.SharedDataVersion = 2;
+    REQUIRE_FALSE(ValidateActiveClassSnapshot(snapshot, &error));
+}

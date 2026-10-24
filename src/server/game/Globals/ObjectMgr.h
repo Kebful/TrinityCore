@@ -1046,7 +1046,15 @@ class TC_GAME_API ObjectMgr
 
         PetLevelInfo const* GetPetLevelInfo(uint32 creature_id, uint8 level) const;
 
-        PlayerClassInfo const* GetPlayerClassInfo(uint32 class_) const { return class_ < MAX_CLASSES ? _playerClassInfo[class_].get() : nullptr; }
+        PlayerClassInfo const* GetPlayerClassInfo(uint32 class_) const { return class_ <= MAX_CLASSES ? _playerClassInfo[class_].get() : nullptr; }
+        PlayerCreateInfoActions GetClassCreateActions(uint8 class_) const;
+        std::vector<uint32> GetClassCreateActionSpells(uint8 class_) const;
+        bool HasRunesForRaceClass(uint8 race, uint8 class_) const
+        {
+            return race >= RACE_HUMAN && race < MAX_RACES &&
+                class_ >= CLASS_WARRIOR && class_ <= MAX_CLASSES &&
+                (_classHasRunes[class_ - 1] & (1u << (race - 1)));
+        }
 
         void GetPlayerClassLevelInfo(uint32 class_, uint8 level, PlayerClassLevelInfo* info) const;
 
@@ -1741,11 +1749,11 @@ class TC_GAME_API ObjectMgr
         typedef std::unordered_map<uint32 /*creatureId*/, std::unique_ptr<PetLevelInfo[] /*level*/>> PetLevelInfoContainer;
         PetLevelInfoContainer _petInfoStore;
 
-        std::unique_ptr<PlayerClassInfo> _playerClassInfo[MAX_CLASSES];
+        std::unique_ptr<PlayerClassInfo> _playerClassInfo[MAX_CLASSES + 1];
 
         void BuildPlayerLevelInfo(uint8 race, uint8 class_, uint8 level, PlayerLevelInfo* plinfo) const;
 
-        std::unique_ptr<PlayerInfo> _playerInfo[MAX_RACES][MAX_CLASSES];
+        std::unique_ptr<PlayerInfo> _playerInfo[MAX_RACES][MAX_CLASSES + 1];
 
         // @tswow-begin
         SpellAutoLearns _spellAutoLearns;

@@ -646,7 +646,7 @@ bool Guild::Member::CheckStats() const
         return false;
     }
 
-    if (m_class < CLASS_WARRIOR || m_class >= MAX_CLASSES)
+    if (m_class < CLASS_WARRIOR || m_class > MAX_CLASSES)
     {
         TC_LOG_ERROR("guild", "{} has a broken data in field `characters`.`class`, deleting him from guild!", m_guid.ToString());
         return false;

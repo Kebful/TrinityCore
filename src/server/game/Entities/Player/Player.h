@@ -33,6 +33,7 @@
 #include "MapReference.h"
 #include "PetDefines.h"
 #include "PlayerTaxi.h"
+#include "PlayerClassSwitch.h"
 #include "QuestDef.h"
 // @tswow-begin (Using Rochet2/Transmog)
 #include "Transmogrification.h"
@@ -67,6 +68,7 @@ class CinematicMgr;
 class Channel;
 class CharacterCreateInfo;
 class Creature;
+namespace ClassSwitch { class ClassSwitchManager; }
 class DynamicObject;
 class GameClient;
 class Group;
@@ -1367,14 +1369,14 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         static bool   LoadPositionFromDB(uint32& mapid, float& x, float& y, float& z, float& o, bool& in_flight, ObjectGuid guid);
 
         static bool IsValidGender(uint8 Gender) { return Gender <= GENDER_FEMALE; }
-        static bool ValidateAppearance(uint8 race, uint8 class_, uint8 gender, uint8 hairID, uint8 hairColor, uint8 faceID, uint8 facialHair, uint8 skinColor, bool create = false);
+        static bool ValidateAppearance(uint8 race, uint8 gender, uint8 hairID, uint8 hairColor, uint8 faceID, uint8 facialHair, uint8 skinColor, bool create = false);
 
         /*********************************************************/
         /***                   SAVE SYSTEM                     ***/
         /*********************************************************/
 
-        void SaveToDB(bool create = false);
-        void SaveToDB(CharacterDatabaseTransaction trans, bool create = false);
+        bool SaveToDB(bool create = false);
+        bool SaveToDB(CharacterDatabaseTransaction trans, bool create = false);
         void SaveInventoryAndGoldToDB(CharacterDatabaseTransaction trans);                    // fast save function for item/money cheating preventing
         void SaveGoldToDB(CharacterDatabaseTransaction trans) const;
 
@@ -1460,6 +1462,13 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         void SendProficiency(ItemClass itemClass, uint32 itemSubclassMask) const;
         void SendInitialSpells();
         void SendUnlearnSpells();
+        uint8 RequestClassSwitch(uint16 protocolVersion, uint8 requestType, uint8 classId, uint64 revision,
+            std::string* error = nullptr);
+        bool HandleClassSwitchSpellCast(uint32 spellId, std::string* error = nullptr);
+        bool IsClassSwitchSpell(uint32 spellId) const;
+        bool EnsureClassSwitchSpellKnown();
+        uint32 GetClassSwitchSpellId() const;
+        void RestoreActiveClassProfileAfterLoad();
         bool AddSpell(uint32 spellId, bool active, bool learning, bool dependent, bool disabled, bool loading = false, uint32 fromSkill = 0);
         void LearnSpell(uint32 spell_id, bool dependent, uint32 fromSkill = 0);
         void RemoveSpell(uint32 spell_id, bool disabled = false, bool learn_low_rank = true);
@@ -2174,7 +2183,7 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         DeclinedName const* GetDeclinedNames() const { return m_declinedname; }
         uint8 GetRunesState() const { return m_runes->runeState; }
         // @tswow-begin
-        bool HasRunes() const { return sObjectMgr->_classHasRunes[GetClass()-1] & (1 << (GetRace() - 1)); }
+        bool HasRunes() const { return sObjectMgr->HasRunesForRaceClass(GetRace(), GetClass()); }
         // @tswow-end
         RuneType GetBaseRune(uint8 index) const { return RuneType(m_runes->runes[index].BaseRune); }
         RuneType GetCurrentRune(uint8 index) const { return RuneType(m_runes->runes[index].CurrentRune); }
@@ -2386,6 +2395,7 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
 
         PlayerMails m_mail;
         PlayerSpellMap m_spells;
+        uint32 m_classSwitchNotificationSuppression;
         PlayerTalentMap* m_talents[MAX_TALENT_SPECS];
         uint32 m_lastPotionId;                              // last used health/mana potion in combat, that block next potion use
 
@@ -2576,6 +2586,7 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         // @tswow-begin
         friend class TSPlayer;
         // @tswow-end
+        friend class ClassSwitch::ClassSwitchManager;
 };
 
 TC_GAME_API void AddItemsSetItem(Player* player, Item* item);

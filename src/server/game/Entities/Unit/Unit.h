@@ -889,10 +889,10 @@ class TC_GAME_API Unit : public WorldObject
         void SetLevel(uint8 lvl, bool sendUpdate = true);
         uint8 GetRace() const { return GetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_RACE); }
         void SetRace(uint8 race) { SetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_RACE, race); }
-        uint32 GetRaceMask() const { return 1 << (GetRace() - 1); }
+        uint32 GetRaceMask() const { return 1u << (GetRace() - 1); }
         uint8 GetClass() const { return GetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_CLASS); }
         void SetClass(uint8 classId) { SetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_CLASS, classId); }
-        uint32 GetClassMask() const { return 1 << (GetClass() - 1); }
+        uint32 GetClassMask() const { return 1u << (GetClass() - 1); }
         Gender GetGender() const { return Gender(GetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_GENDER)); }
         void SetGender(Gender gender) { SetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_GENDER, gender); }
         virtual Gender GetNativeGender() const { return GetGender(); }

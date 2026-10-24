@@ -494,7 +494,9 @@ class TC_GAME_API WorldSession
         void SetPlayer(Player* player);
         uint8 Expansion() const { return m_expansion; }
 
+        void InitClassSwitch(SessionKey const& k);
         void InitWarden(SessionKey const& k, std::string const& os);
+        uint64 GetActiveClassSessionTag() const { return _activeClassSessionTag; }
         Warden* GetWarden() { return _warden.get(); }
         Warden const* GetWarden() const { return _warden.get(); }
 
@@ -1261,6 +1263,7 @@ class TC_GAME_API WorldSession
 
         // Warden
         std::unique_ptr<Warden> _warden;                                    // Remains NULL if Warden system is not enabled by config
+        uint64 _activeClassSessionTag = 0;
 
         time_t _logoutTime;
         bool m_inQueue;                                     // session wait in auth.queue

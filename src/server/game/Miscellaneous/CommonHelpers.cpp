@@ -182,7 +182,7 @@ static const uint8 MaximumSpecializationIconicSpells = 3u;
 // Can players deliberately trick this check? Yes.
 // Is it worth doing? No.
 // Close enough.
-static const uint32 PlayerSpecializationIconicSpells[MAX_CLASSES][MAX_TALENT_TREES][MaximumSpecializationIconicSpells] = {
+static const uint32 PlayerSpecializationIconicSpells[MAX_CLASSES + 1][MAX_TALENT_TREES][MaximumSpecializationIconicSpells] = {
     { // CLASS_NONE
         {0,0,0},
         {0,0,0},

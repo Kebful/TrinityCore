@@ -110,6 +110,13 @@ void CharacterCache::AddCharacterCacheEntry(ObjectGuid const& guid, uint32 accou
     _characterCacheByNameStore[name] = &data;
 }
 
+void CharacterCache::UpdateCharacterClass(ObjectGuid const& guid, uint8 playerClass)
+{
+    auto itr = _characterCacheStore.find(guid);
+    if (itr != _characterCacheStore.end())
+        itr->second.Class = playerClass;
+}
+
 void CharacterCache::DeleteCharacterCacheEntry(ObjectGuid const& guid, std::string const& name)
 {
     _characterCacheStore.erase(guid);

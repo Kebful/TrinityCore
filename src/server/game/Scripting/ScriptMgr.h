@@ -688,6 +688,8 @@ class TC_GAME_API PlayerScript : public ScriptObject
 
         // Called in Spell::Cast.
         virtual void OnSpellCast(Player* player, Spell* spell, bool skipCheck);
+        // Called after a non-channeled player spell has completed successfully.
+        virtual void OnSpellCastSucceeded(Player* player, Spell* spell, bool skipCheck);
 
         // Called when a player logs in.
         virtual void OnLogin(Player* player, bool firstLogin);
@@ -1043,6 +1045,7 @@ class TC_GAME_API ScriptMgr
         void OnPlayerEmote(Player* player, Emote emote);
         void OnPlayerTextEmote(Player* player, uint32 textEmote, uint32 emoteNum, ObjectGuid guid);
         void OnPlayerSpellCast(Player* player, Spell* spell, bool skipCheck);
+        void OnPlayerSpellCastSucceeded(Player* player, Spell* spell, bool skipCheck);
         void OnPlayerLogin(Player* player, bool firstLogin);
         void OnPlayerLogout(Player* player);
         void OnPlayerCreate(Player* player);

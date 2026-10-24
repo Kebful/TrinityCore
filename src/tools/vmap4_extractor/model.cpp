@@ -216,6 +216,7 @@ void Doodad::ExtractSet(WMODoodadData const& doodadData, ADT::MODF const& wmo, u
             {
                 ModelInstName[nlen - 2] = '2';
                 ModelInstName[nlen - 1] = '\0';
+                --nlen;
             }
         }
 

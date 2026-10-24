@@ -3614,6 +3614,12 @@ void Spell::_cast(bool skipCheck)
     if (Creature* caster = m_originalCaster->ToCreature())
         if (caster->IsAIEnabled())
             caster->AI()->OnSpellCast(GetSpellInfo());
+
+    // @tswow-begin
+    if (!m_spellInfo->IsChanneled())
+        if (Player* playerCaster = m_caster->ToPlayer())
+            sScriptMgr->OnPlayerSpellCastSucceeded(playerCaster, this, skipCheck);
+    // @tswow-end
 }
 
 template <class Container>

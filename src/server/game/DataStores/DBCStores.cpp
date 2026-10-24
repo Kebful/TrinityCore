@@ -195,7 +195,7 @@ std::unordered_set<uint32> sPetTalentSpells;
 DBCStorage <TalentTabEntry> sTalentTabStore(TalentTabEntryfmt);
 
 // store absolute bit position for first rank for talent inspect
-static uint32 sTalentTabPages[MAX_CLASSES][3];
+static uint32 sTalentTabPages[MAX_CLASSES + 1][3];
 
 DBCStorage <TaxiNodesEntry> sTaxiNodesStore(TaxiNodesEntryfmt);
 TaxiMask sTaxiNodesMask;
@@ -564,8 +564,8 @@ void LoadDBCStores(const std::string& dataPath)
                 continue;
 
             // store class talent tab pages
-            for (uint32 cls = 1; cls < MAX_CLASSES; ++cls)
-                if (talentTabInfo->ClassMask & (1 << (cls - 1)))
+            for (uint32 cls = 1; cls <= MAX_CLASSES; ++cls)
+                if (talentTabInfo->ClassMask & (1u << (cls - 1)))
                     sTalentTabPages[cls][talentTabInfo->OrderIndex] = talentTabInfo->ID;
         }
     }
@@ -966,9 +966,9 @@ SkillRaceClassInfoEntry const* GetSkillRaceClassInfo(uint32 skill, uint8 race, u
     SkillRaceClassInfoBounds bounds = SkillRaceClassInfoBySkill.equal_range(skill);
     for (SkillRaceClassInfoMap::iterator itr = bounds.first; itr != bounds.second; ++itr)
     {
-        if (itr->second->RaceMask && !(itr->second->RaceMask & (1 << (race - 1))))
+        if (itr->second->RaceMask && !(itr->second->RaceMask & (1u << (race - 1))))
             continue;
-        if (itr->second->ClassMask && !(itr->second->ClassMask & (1 << (class_ - 1))))
+        if (itr->second->ClassMask && !(itr->second->ClassMask & (1u << (class_ - 1))))
             continue;
 
         return itr->second;

@@ -2302,6 +2302,13 @@ void World::SetInitialWorldSettings()
 
     uint32 startupDuration = GetMSTimeDiffToNow(startupBegin);
 
+    std::string classSwitchError;
+    if (!ClassSwitch::ValidateClassSwitchRegistry(&classSwitchError))
+    {
+        TC_LOG_ERROR("server.loading", "Class-switch registry validation failed: {}", classSwitchError);
+        ABORT();
+    }
+
     TC_LOG_INFO("server.worldserver", "World initialized in {} minutes {} seconds", (startupDuration / 60000), ((startupDuration % 60000) / 1000));
 
     TC_METRIC_EVENT("events", "World initialized", "World initialized in " + std::to_string(startupDuration / 60000) + " minutes " + std::to_string((startupDuration % 60000) / 1000) + " seconds");

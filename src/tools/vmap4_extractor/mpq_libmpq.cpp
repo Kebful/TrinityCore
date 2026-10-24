@@ -17,11 +17,59 @@
 
 #include "mpq_libmpq04.h"
 #include <boost/filesystem.hpp>
+#include <boost/algorithm/string/predicate.hpp>
 #include <ios>
 #include <deque>
 #include <cstdio>
 #include <fstream>
 #include <algorithm>
+
+namespace
+{
+// MPQ names use Windows separators and case-insensitive lookup. Loose patch
+// directories must follow the same rules on Linux or newer files are silently
+// skipped in favour of an older archive (including Map.dbc and custom ADTs).
+bool ResolveLooseFile(boost::filesystem::path const& root, char const* filename,
+    boost::filesystem::path& resolved)
+{
+    std::string normalized(filename);
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+    boost::filesystem::path relative(normalized);
+    if (relative.is_absolute())
+        return false;
+
+    resolved = root;
+    for (auto const& component : relative)
+    {
+        if (component == "..")
+            return false;
+        if (component == ".")
+            continue;
+        auto exact = resolved / component;
+        if (boost::filesystem::exists(exact))
+        {
+            resolved = exact;
+            continue;
+        }
+        if (!boost::filesystem::is_directory(resolved))
+            return false;
+        boost::filesystem::path match;
+        for (boost::filesystem::directory_iterator it(resolved), end; it != end; ++it)
+        {
+            if (!boost::iequals(it->path().filename().string(), component.string()))
+                continue;
+            // Multiple case variants cannot represent one unambiguous MPQ member.
+            if (!match.empty())
+                return false;
+            match = it->path();
+        }
+        if (match.empty())
+            return false;
+        resolved = match;
+    }
+    return boost::filesystem::is_regular_file(resolved);
+}
+}
 
 ArchiveSet gOpenArchives;
 
@@ -83,8 +131,8 @@ MPQFile::MPQFile(char const* filename):
     {
         if((*i)->is_directory)
         {
-            auto fullpath = (*i)->filename / boost::filesystem::path(filename);
-            if(boost::filesystem::exists(fullpath))
+            boost::filesystem::path fullpath;
+            if (ResolveLooseFile((*i)->filename, filename, fullpath))
             {
                 std::ifstream fin;
                 fin.open(fullpath.string(),std::ios::binary);

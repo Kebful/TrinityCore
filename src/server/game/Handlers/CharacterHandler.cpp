@@ -358,7 +358,7 @@ void WorldSession::HandleCharCreateOpcode(WorldPacket& recvData)
         }
 
         uint32 raceMaskDisabled = sWorld->getIntConfig(CONFIG_CHARACTER_CREATING_DISABLED_RACEMASK);
-        if ((1 << (createInfo->Race - 1)) & raceMaskDisabled)
+        if ((1u << (createInfo->Race - 1)) & raceMaskDisabled)
         {
             SendCharCreate(CHAR_CREATE_DISABLED);
             return;
@@ -368,7 +368,7 @@ void WorldSession::HandleCharCreateOpcode(WorldPacket& recvData)
     if (!HasPermission(rbac::RBAC_PERM_SKIP_CHECK_CHARACTER_CREATION_CLASSMASK))
     {
         uint32 classMaskDisabled = sWorld->getIntConfig(CONFIG_CHARACTER_CREATING_DISABLED_CLASSMASK);
-        if ((1 << (createInfo->Class - 1)) & classMaskDisabled)
+        if ((1u << (createInfo->Class - 1)) & classMaskDisabled)
         {
             SendCharCreate(CHAR_CREATE_DISABLED);
             return;
@@ -1319,7 +1319,7 @@ void WorldSession::HandleAlterAppearance(WorldPacket& recvData)
     if (bs_skinColor && (bs_skinColor->Type != 3 || bs_skinColor->Race != _player->GetRace() || Gender(bs_skinColor->Sex) != _player->GetNativeGender()))
         return;
 
-    if (!Player::ValidateAppearance(_player->GetRace(), _player->GetClass(), _player->GetNativeGender(),
+    if (!Player::ValidateAppearance(_player->GetRace(), _player->GetNativeGender(),
         bs_hair->Data, Color, _player->GetFaceId(), bs_facialHair->Data,
         bs_skinColor ? bs_skinColor->Data : _player->GetSkinId()))
         return;
@@ -1426,11 +1426,10 @@ void WorldSession::HandleCharCustomizeCallback(std::shared_ptr<CharacterCustomiz
     Field* fields = result->Fetch();
     std::string oldName = fields[0].GetString();
     uint8 plrRace = fields[1].GetUInt8();
-    uint8 plrClass = fields[2].GetUInt8();
     uint8 plrGender = fields[3].GetUInt8();
     uint16 atLoginFlags = fields[4].GetUInt16();
 
-    if (!Player::ValidateAppearance(plrRace, plrClass, plrGender, customizeInfo->HairStyle, customizeInfo->HairColor, customizeInfo->Face, customizeInfo->FacialHair, customizeInfo->Skin, true))
+    if (!Player::ValidateAppearance(plrRace, plrGender, customizeInfo->HairStyle, customizeInfo->HairColor, customizeInfo->Face, customizeInfo->FacialHair, customizeInfo->Skin, true))
     {
         SendCharCustomize(CHAR_CREATE_ERROR, customizeInfo.get());
         return;
@@ -1733,7 +1732,7 @@ void WorldSession::HandleCharFactionOrRaceChangeCallback(std::shared_ptr<Charact
     if (!HasPermission(rbac::RBAC_PERM_SKIP_CHECK_CHARACTER_CREATION_RACEMASK))
     {
         uint32 raceMaskDisabled = sWorld->getIntConfig(CONFIG_CHARACTER_CREATING_DISABLED_RACEMASK);
-        if ((1 << (factionChangeInfo->Race - 1)) & raceMaskDisabled)
+        if ((1u << (factionChangeInfo->Race - 1)) & raceMaskDisabled)
         {
             SendCharFactionChange(CHAR_CREATE_ERROR, factionChangeInfo.get());
             return;

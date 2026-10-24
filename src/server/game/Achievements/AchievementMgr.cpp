@@ -111,13 +111,13 @@ bool AchievementCriteriaData::IsValid(AchievementCriteriaEntry const* criteria)
             }
             return true;
         case ACHIEVEMENT_CRITERIA_DATA_TYPE_T_PLAYER_CLASS_RACE:
-            if (classRace.class_id && ((1 << (classRace.class_id-1)) & CLASSMASK_ALL_PLAYABLE) == 0)
+            if (classRace.class_id && ((1u << (classRace.class_id-1)) & CLASSMASK_ALL_PLAYABLE) == 0)
             {
                 TC_LOG_ERROR("sql.sql", "Table `achievement_criteria_data` (Entry: {} Type: {}) for data type ACHIEVEMENT_CRITERIA_DATA_TYPE_T_PLAYER_CLASS_RACE ({}) contains a non-existing class in value1 ({}), ignored.",
                     criteria->ID, criteria->Type, dataType, classRace.class_id);
                 return false;
             }
-            if (classRace.race_id && ((1 << (classRace.race_id-1)) & RACEMASK_ALL_PLAYABLE) == 0)
+            if (classRace.race_id && ((1u << (classRace.race_id-1)) & RACEMASK_ALL_PLAYABLE) == 0)
             {
                 TC_LOG_ERROR("sql.sql", "Table `achievement_criteria_data` (Entry: {} Type: {}) for data type ACHIEVEMENT_CRITERIA_DATA_TYPE_T_PLAYER_CLASS_RACE ({}) contains a non-existing race in value2 ({}), ignored.",
                     criteria->ID, criteria->Type, dataType, classRace.race_id);
@@ -270,13 +270,13 @@ bool AchievementCriteriaData::IsValid(AchievementCriteriaEntry const* criteria)
                     criteria->ID, criteria->Type, dataType);
                 return false;
             }
-            if (classRace.class_id && ((1 << (classRace.class_id-1)) & CLASSMASK_ALL_PLAYABLE) == 0)
+            if (classRace.class_id && ((1u << (classRace.class_id-1)) & CLASSMASK_ALL_PLAYABLE) == 0)
             {
                 TC_LOG_ERROR("sql.sql", "Table `achievement_criteria_data` (Entry: {} Type: {}) for data type ACHIEVEMENT_CRITERIA_DATA_TYPE_S_PLAYER_CLASS_RACE ({}) contains a non-existing class entry in value1 ({}), ignored.",
                     criteria->ID, criteria->Type, dataType, classRace.class_id);
                 return false;
             }
-            if (classRace.race_id && ((1 << (classRace.race_id-1)) & RACEMASK_ALL_PLAYABLE) == 0)
+            if (classRace.race_id && ((1u << (classRace.race_id-1)) & RACEMASK_ALL_PLAYABLE) == 0)
             {
                 TC_LOG_ERROR("sql.sql", "Table `achievement_criteria_data` (Entry: {} Type: {}) for data type ACHIEVEMENT_CRITERIA_DATA_TYPE_S_PLAYER_CLASS_RACE ({}) contains a non-existing race entry in value2 ({}), ignored.",
                     criteria->ID, criteria->Type, dataType, classRace.race_id);
