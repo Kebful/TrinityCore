@@ -177,6 +177,20 @@ bool IsLanguageSpellId(uint32 spellId)
     return false;
 }
 
+std::string FormatProfileIds(std::vector<uint32> const& ids)
+{
+    if (ids.empty())
+        return "none";
+    std::ostringstream output;
+    for (size_t index = 0; index < ids.size(); ++index)
+    {
+        if (index)
+            output << ',';
+        output << ids[index];
+    }
+    return output.str();
+}
+
 bool IsDeathKnightExcludedStarterSpell(uint32 spellId)
 {
     SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
@@ -758,6 +772,7 @@ public:
             return;
 
         StoredClassProfile profile;
+        ProfileNormalizationReport normalization;
         std::string error;
         if (!EnsureDefinitions(&error))
         {
@@ -767,7 +782,8 @@ public:
             player->GetSession()->KickPlayer("Class-switch definitions are unavailable");
             return;
         }
-        ProfileLoadStatus loadStatus = LoadProfile(player, player->GetClass(), &profile, &error);
+        ProfileLoadStatus loadStatus = LoadProfile(
+            player, player->GetClass(), &profile, &error, &normalization);
         if (loadStatus != ProfileLoadStatus::Loaded)
         {
             if (loadStatus == ProfileLoadStatus::Corrupt ||
@@ -788,6 +804,31 @@ public:
                 player->GetGUID().ToString(), error);
             player->GetSession()->KickPlayer("Invalid active class profile");
             return;
+        }
+
+        if (normalization.Changed())
+        {
+            CharacterDatabaseTransaction transaction = CharacterDatabase.BeginTransaction();
+            bool assembled = AppendProfileBackingTables(
+                transaction, player, profile, &error) &&
+                AppendStoredProfileToTransaction(transaction, player, profile, &error);
+            bool committed = false;
+            if (assembled)
+            {
+                TransactionCallback callback =
+                    CharacterDatabase.AsyncCommitTransaction(transaction);
+                committed = callback.m_future.get();
+            }
+            if (!assembled || !committed)
+            {
+                TC_LOG_ERROR("entities.player.classswitch",
+                    "Player {} failed to persist normalized active class {} profile: {}",
+                    player->GetGUID().ToString(), uint32(profile.ClassId),
+                    error.empty() ? "class profile transaction failed" : error);
+                player->GetSession()->KickPlayer(
+                    "Normalized active class profile could not be persisted");
+                return;
+            }
         }
 
         if (!ApplyProfile(player, profile, &error))
@@ -1447,7 +1488,86 @@ private:
         return true;
     }
 
-    ProfileLoadStatus LoadProfile(Player* player, uint8 classId, StoredClassProfile* profile, std::string* error)
+    bool NormalizeStoredClassProfile(Player* player, StoredClassProfile* profile,
+        ProfileNormalizationReport* report, std::string* error)
+    {
+        if (!player || !profile)
+            return SetError(error, "class profile normalization context is missing");
+        if (report)
+            *report = {};
+
+        ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(profile->ClassId);
+        if (!classEntry)
+            return SetError(error, "stored profile class entry is missing");
+
+        std::set<uint32> seenSpells;
+        profile->Spells.erase(std::remove_if(profile->Spells.begin(), profile->Spells.end(),
+            [&](SpellProfile const& spell) {
+                SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.Id);
+                bool hasCoverage = false;
+                if (info && info->SpellFamilyName)
+                {
+                    SkillLineAbilityMapBounds bounds =
+                        sSpellMgr->GetSkillLineAbilityMapBounds(spell.Id);
+                    for (auto itr = bounds.first; itr != bounds.second; ++itr)
+                    {
+                        if (GetSkillRaceClassInfo(
+                            itr->second->SkillLine, player->GetRace(), profile->ClassId))
+                        {
+                            hasCoverage = true;
+                            break;
+                        }
+                    }
+                }
+                bool const excluded = profile->ClassId == CLASS_DEATH_KNIGHT &&
+                    IsDeathKnightExcludedStarterSpell(spell.Id);
+                bool const keep = !excluded &&
+                    ShouldRetainClassProfileSpell(
+                        info != nullptr,
+                        info ? info->SpellFamilyName : 0,
+                        classEntry->SpellClassSet,
+                        info && info->IsProfessionOrRiding(),
+                        hasCoverage,
+                        IsExplicitClassStarterSpell(player, profile->ClassId, spell.Id)) &&
+                    seenSpells.insert(spell.Id).second;
+                if (!keep && report)
+                    report->RemovedSpells.push_back(spell.Id);
+                return !keep;
+            }), profile->Spells.end());
+
+        std::set<uint32> seenSkills;
+        profile->Skills.erase(std::remove_if(profile->Skills.begin(), profile->Skills.end(),
+            [&](SkillProfile const& skill) {
+                bool const excluded =
+                    IsDeathKnightExcludedStarterSkill(profile->ClassId, skill.Id);
+                bool const skillExists = sSkillLineStore.LookupEntry(skill.Id) != nullptr;
+                bool const hasCoverage = skillExists &&
+                    GetSkillRaceClassInfo(
+                        skill.Id, player->GetRace(), profile->ClassId) != nullptr;
+                bool const keep = !excluded &&
+                    ShouldRetainClassProfileSkill(skillExists, hasCoverage) &&
+                    seenSkills.insert(skill.Id).second;
+                if (!keep && report)
+                    report->RemovedSkills.push_back(skill.Id);
+                return !keep;
+            }), profile->Skills.end());
+
+        if (report)
+        {
+            std::sort(report->RemovedSpells.begin(), report->RemovedSpells.end());
+            std::sort(report->RemovedSkills.begin(), report->RemovedSkills.end());
+        }
+
+        uint32 repairedActions = 0;
+        if (!RepairActionSpells(player, profile, &repairedActions, error))
+            return false;
+        if (report)
+            report->RepairedActions = repairedActions;
+        return true;
+    }
+
+    ProfileLoadStatus LoadProfile(Player* player, uint8 classId, StoredClassProfile* profile,
+        std::string* error, ProfileNormalizationReport* normalization = nullptr)
     {
         if (!profile)
         {
@@ -1507,14 +1627,20 @@ private:
             }
             profile->EquipmentMigrated = false;
         }
-        uint32 repaired = 0;
-        if (!RepairActionSpells(player, profile, &repaired, error) ||
+        ProfileNormalizationReport changes;
+        if (!NormalizeStoredClassProfile(player, profile, &changes, error) ||
             !ValidateStoredProfile(*profile, error))
             return ProfileLoadStatus::Corrupt;
-        if (repaired)
+        if (changes.Changed())
             TC_LOG_WARN("entities.player.classswitch",
-                "Player {} normalized {} class-action entries in stored class {} profile",
-                player->GetGUID().ToString(), repaired, uint32(classId));
+                "Player {} normalized stored class {} profile: removed_spells=[{}]"
+                " removed_skills=[{}] repaired_actions={}",
+                player->GetGUID().ToString(), uint32(classId),
+                FormatProfileIds(changes.RemovedSpells),
+                FormatProfileIds(changes.RemovedSkills),
+                changes.RepairedActions);
+        if (normalization)
+            *normalization = std::move(changes);
         return ProfileLoadStatus::Loaded;
     }
 
@@ -1592,7 +1718,10 @@ private:
         for (uint32 spellId : createInfo->customSpells)
         {
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-            if (!info || std::max(info->BaseLevel, info->SpellLevel) > created.Level)
+            if (!info || std::max(info->BaseLevel, info->SpellLevel) > created.Level ||
+                !IsSpellAllowedForClassProfile(
+                    info->SpellFamilyName, definition->SpellClassSet,
+                    info->IsProfessionOrRiding()))
                 continue;
             spellIds.insert(spellId);
         }
@@ -1601,8 +1730,15 @@ private:
                 info && info->SpellFamilyName == definition->SpellClassSet)
                 spellIds.insert(spellId);
         for (PlayerCreateInfoAction const& action : createInfo->action)
-            if (action.type == ACTION_BUTTON_SPELL && sSpellMgr->GetSpellInfo(action.action))
+        {
+            if (action.type != ACTION_BUTTON_SPELL)
+                continue;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(action.action);
+            if (info && IsSpellAllowedForClassProfile(
+                info->SpellFamilyName, definition->SpellClassSet,
+                info->IsProfessionOrRiding()))
                 spellIds.insert(action.action);
+        }
 
         // Shared professions and classless non-riding spells remain available.
         for (SpellProfile const& spell : source.Spells)
@@ -1682,9 +1818,8 @@ private:
                     created.Groups[0].Actions[slot] = sourceAction;
         }
 
-        RemoveDeathKnightExcludedStarterEntries(&created);
-        uint32 repaired = 0;
-        if (!RepairActionSpells(player, &created, &repaired, error))
+        ProfileNormalizationReport normalization;
+        if (!NormalizeStoredClassProfile(player, &created, &normalization, error))
             return false;
         if (!ValidateStoredProfile(created, error))
         {
@@ -1986,13 +2121,17 @@ private:
             }
         }
 
-        uint32 repaired = 0;
-        if (!RepairActionSpells(player, &captured, &repaired, error))
+        ProfileNormalizationReport normalization;
+        if (!NormalizeStoredClassProfile(player, &captured, &normalization, error))
             return false;
-        if (repaired)
+        if (normalization.Changed())
             TC_LOG_WARN("entities.player.classswitch",
-                "Player {} normalized {} class-action entries",
-                player->GetGUID().ToString(), repaired);
+                "Player {} normalized captured class {} profile:"
+                " removed_spells=[{}] removed_skills=[{}] repaired_actions={}",
+                player->GetGUID().ToString(), uint32(captured.ClassId),
+                FormatProfileIds(normalization.RemovedSpells),
+                FormatProfileIds(normalization.RemovedSkills),
+                normalization.RepairedActions);
         if (!ValidateStoredProfile(captured, error))
             return false;
         *profile = std::move(captured);
@@ -3276,6 +3415,21 @@ bool CanInheritClassProfileSkill(uint8 targetClassId, uint32 skillId, bool share
 {
     return shared && skillId != SKILL_RIDING &&
         !IsDeathKnightExcludedStarterSkill(targetClassId, skillId);
+}
+
+bool ShouldRetainClassProfileSpell(bool spellExists, uint32 spellFamily,
+    uint32 classFamily, bool professionOrRiding, bool hasRaceClassCoverage,
+    bool explicitClassStarter)
+{
+    if (!spellExists ||
+        !IsSpellAllowedForClassProfile(spellFamily, classFamily, professionOrRiding))
+        return false;
+    return !spellFamily || hasRaceClassCoverage || explicitClassStarter;
+}
+
+bool ShouldRetainClassProfileSkill(bool skillExists, bool hasRaceClassCoverage)
+{
+    return skillExists && hasRaceClassCoverage;
 }
 
 void RemoveDeathKnightExcludedStarterEntries(StoredClassProfile* profile)

@@ -301,6 +301,57 @@ TEST_CASE("Class switch skill normalization is idempotent", "[ClassSwitch]")
     REQUIRE(skills.size() == 2);
 }
 
+TEST_CASE("Stored class profiles strip stale foreign spell content idempotently", "[ClassSwitch]")
+{
+    std::vector<SpellProfile> spells{
+        { 78, 2, true, false, false },
+        { 2764, 2, true, false, false },
+        { 999999, 2, true, false, false },
+    };
+
+    auto retain = [](SpellProfile const& spell) {
+        if (spell.Id == 78)
+            return ShouldRetainClassProfileSpell(true, 4, 4, false, true, true);
+        if (spell.Id == 2764)
+            return ShouldRetainClassProfileSpell(true, 8, 4, false, false, false);
+        return ShouldRetainClassProfileSpell(false, 0, 4, false, false, false);
+    };
+
+    spells.erase(std::remove_if(spells.begin(), spells.end(),
+        [&retain](SpellProfile const& spell) { return !retain(spell); }),
+        spells.end());
+    REQUIRE(spells.size() == 1);
+    REQUIRE(spells[0].Id == 78);
+    REQUIRE(std::none_of(spells.begin(), spells.end(),
+        [](SpellProfile const& spell) { return spell.Id == 2764; }));
+
+    size_t const firstPassSize = spells.size();
+    spells.erase(std::remove_if(spells.begin(), spells.end(),
+        [&retain](SpellProfile const& spell) { return !retain(spell); }),
+        spells.end());
+    REQUIRE(spells.size() == firstPassSize);
+
+    REQUIRE_FALSE(IsSpellAllowedForClassProfile(8, 4, false));
+    REQUIRE_FALSE(IsSharedClassProfileSpell(8, false, false));
+    REQUIRE(IsSharedClassProfileSpell(8, true, false));
+    REQUIRE(IsSharedClassProfileSpell(0, false, false));
+    REQUIRE_FALSE(IsSharedClassProfileSpell(0, false, true));
+    REQUIRE(ShouldRetainClassProfileSpell(true, 0, 4, false, false, false));
+    REQUIRE(ShouldRetainClassProfileSpell(true, 8, 4, true, true, false));
+    REQUIRE_FALSE(ShouldRetainClassProfileSpell(true, 8, 4, true, false, false));
+    REQUIRE_FALSE(ShouldRetainClassProfileSpell(true, 8, 4, false, false, true));
+
+    ProfileNormalizationReport secondPass;
+    REQUIRE_FALSE(secondPass.Changed());
+}
+
+TEST_CASE("Removed spell actions are cleared by class action repair rules", "[ClassSwitch]")
+{
+    std::vector<uint32> const rogueChain{ 2764 };
+    std::set<uint32> const warriorRanks{ 78 };
+    REQUIRE(NormalizeActionSpellRank(2764, rogueChain, warriorRanks) == 0);
+}
+
 TEST_CASE("Death Knight profiles cannot retain First Aid or Riding starter grants", "[ClassSwitch]")
 {
     REQUIRE(IsDeathKnightExcludedStarterSkill(CLASS_DEATH_KNIGHT, SKILL_FIRST_AID));

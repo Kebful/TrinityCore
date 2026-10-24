@@ -238,6 +238,18 @@ struct CharacterLanguageState
     std::vector<SkillProfile> Skills;
 };
 
+struct ProfileNormalizationReport
+{
+    std::vector<uint32> RemovedSpells;
+    std::vector<uint32> RemovedSkills;
+    uint32 RepairedActions = 0;
+
+    bool Changed() const
+    {
+        return !RemovedSpells.empty() || !RemovedSkills.empty() || RepairedActions != 0;
+    }
+};
+
 struct SelectionPolicy
 {
     bool Pending = false;
@@ -460,6 +472,10 @@ bool IsSwitchOwnedAura(uint64 playerGuid, uint64 creatorGuid, uint32 classFamily
 RequestResult EvaluateSelectionPolicy(SelectionPolicy const& policy);
 bool IsSpellAllowedForClassProfile(uint32 spellFamily, uint32 classFamily, bool professionOrRiding);
 bool IsSharedClassProfileSpell(uint32 spellFamily, bool profession, bool riding);
+bool ShouldRetainClassProfileSpell(bool spellExists, uint32 spellFamily,
+    uint32 classFamily, bool professionOrRiding, bool hasRaceClassCoverage,
+    bool explicitClassStarter);
+bool ShouldRetainClassProfileSkill(bool skillExists, bool hasRaceClassCoverage);
 bool IsDeathKnightExcludedStarterSkill(uint8 classId, uint32 skillId);
 bool CanInheritClassProfileSkill(uint8 targetClassId, uint32 skillId, bool shared);
 void RemoveDeathKnightExcludedStarterEntries(StoredClassProfile* profile);
