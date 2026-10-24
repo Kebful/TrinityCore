@@ -1047,6 +1047,11 @@ void Player::Update(uint32 p_time)
     if (!IsInWorld())
         return;
 
+    ClassSwitch::UpdatePlayer(this);
+    if (ClassSwitch::IsClassSwitchGameplayBlocked(
+        ClassSwitch::IsTransitionPending(this), false))
+        return;
+
     // undelivered mail
     if (m_nextMailDelivereTime && m_nextMailDelivereTime <= GameTime::GetGameTime())
     {
@@ -19602,8 +19607,19 @@ bool Player::SaveToDB(bool create /*=false*/)
     return true;
 }
 
-bool Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false */)
+bool Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false */,
+    bool saveClassProfileBackingTables /* = true */, bool appendClassProfile /* = true */,
+    bool savePet /* = true */, bool allowWhileClassSwitchPending /* = false */)
 {
+    if (!create && !allowWhileClassSwitchPending && ClassSwitch::IsTransitionPending(this))
+    {
+        m_nextSave = 0;
+        TC_LOG_WARN("entities.player.classswitch",
+            "Deferred save for player {} while a class-switch client response is pending",
+            GetGUID().ToString());
+        return false;
+    }
+
     // delay auto save at any saves (manual, in code, or autosave)
     m_nextSave = sWorld->getIntConfig(CONFIG_INTERVAL_SAVE);
 
@@ -19896,17 +19912,24 @@ bool Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false
     _SaveWeeklyQuestStatus(trans);
     _SaveSeasonalQuestStatus(trans);
     _SaveMonthlyQuestStatus(trans);
-    _SaveTalents(trans);
-    _SaveSpells(trans);
+    if (create && saveClassProfileBackingTables)
+    {
+        _SaveTalents(trans);
+        _SaveSpells(trans);
+    }
     GetSpellHistory()->SaveToDB<Player>(trans);
-    _SaveActions(trans);
+    if (create && saveClassProfileBackingTables)
+    {
+        _SaveActions(trans);
+        _SaveSkills(trans);
+    }
     _SaveAuras(trans);
-    _SaveSkills(trans);
     m_achievementMgr->SaveToDB(trans);
     m_reputationMgr->SaveToDB(trans);
     _SaveEquipmentSets(trans);
     GetSession()->SaveTutorialsData(trans);                 // changed only while character in game
-    _SaveGlyphs(trans);
+    if (create && saveClassProfileBackingTables)
+        _SaveGlyphs(trans);
     // @tswow-begin TODO: fix transaction
     m_db_json.Save();
     // @tswow-end
@@ -19918,11 +19941,12 @@ bool Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false
         _SaveStats(trans);
 
     // save pet (hunter pet level and experience and all type pets health/mana).
-    if (Pet* pet = GetPet())
-        pet->SavePetToDB(PET_SAVE_AS_CURRENT);
+    if (savePet)
+        if (Pet* pet = GetPet())
+            pet->SavePetToDB(PET_SAVE_AS_CURRENT);
 
     std::string classSwitchError;
-    if (!create && !ClassSwitch::AppendActiveProfileToTransaction(
+    if (appendClassProfile && !create && !ClassSwitch::AppendActiveProfileToTransaction(
         trans, this, &classSwitchError))
     {
         m_nextSave = 0;
@@ -19937,6 +19961,13 @@ bool Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false
 // fast save function for item/money cheating preventing - save only inventory and money state
 void Player::SaveInventoryAndGoldToDB(CharacterDatabaseTransaction trans)
 {
+    if (ClassSwitch::IsTransitionPending(this))
+    {
+        TC_LOG_ERROR("entities.player.classswitch",
+            "Blocked inventory/gold persistence for player {} while class-switch acceptance is pending",
+            GetGUID().ToString());
+        return;
+    }
     _SaveInventory(trans);
     SaveGoldToDB(trans);
 }

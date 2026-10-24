@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -26,12 +27,16 @@ constexpr uint16 REQUEST_PROTOCOL_VERSION = 1;
 constexpr uint16 CLIENT_REQUEST_OPCODE = 0x7A30;
 constexpr uint16 SERVER_STATUS_OPCODE = 0x7A31;
 constexpr uint16 SERVER_SNAPSHOT_OPCODE = 0x7A32;
+constexpr uint16 CLIENT_RESPONSE_OPCODE = 0x7A33;
+constexpr uint16 RESPONSE_PROTOCOL_VERSION = 1;
+constexpr uint16 MAX_RESPONSE_REASON_BYTES = 512;
+constexpr uint8 MAX_CLASS_SWITCH_RECOVERY_ATTEMPTS = 1;
 
 constexpr uint32 SNAPSHOT_MAGIC = 0x32435341; // "ASC2"
 constexpr uint16 SNAPSHOT_VERSION = 2;
 constexpr uint32 SNAPSHOT_SECTION_REQUIRED = 0x3FF;
 constexpr uint32 PROFILE_MAGIC = 0x31505343; // "CSP1"
-constexpr uint16 PROFILE_VERSION = 1;
+constexpr uint16 PROFILE_VERSION = 2;
 
 constexpr uint32 MAX_SPELLS = 4096;
 constexpr uint32 MAX_MODIFIERS = 5952;
@@ -79,6 +84,58 @@ enum class StatusStage : uint8
     Rejected = 3,
     CommitBegin = 4,
     Confirmed = 5
+};
+
+enum class ClientResponseDisposition : uint8
+{
+    Accepted = 1,
+    Rejected = 2,
+    ResyncRequested = 3
+};
+
+struct ClientClassSwitchResponse
+{
+    uint16 Version = RESPONSE_PROTOCOL_VERSION;
+    ClientResponseDisposition Disposition = ClientResponseDisposition::Rejected;
+    uint8 ClassId = 0;
+    uint64 Session = 0;
+    uint64 Revision = 0;
+    uint64 SnapshotDigest = 0;
+    std::string Reason;
+};
+
+struct EquipmentBagCandidate
+{
+    uint16 Position = 0;
+    bool FreedByTargetEquip = false;
+};
+
+struct EquipmentBagDemand
+{
+    std::vector<uint16> AllowedPositions;
+};
+
+struct ClassSwitchLogoutPlan
+{
+    bool PersistPlayer = true;
+    bool RemovePet = true;
+    bool ClearRuntime = true;
+};
+
+enum class ClientResponseMatch : uint8
+{
+    Accepted,
+    Rejected,
+    ResyncRequested,
+    DuplicateAccepted,
+    StaleOrMismatched
+};
+
+enum class ClientTimeoutAction : uint8
+{
+    None,
+    RecoverSource,
+    Disconnect
 };
 
 enum class ProfileLoadStatus : uint8
@@ -147,6 +204,13 @@ struct StoredRuneProfile
     std::array<uint32, RUNE_SLOTS> LastUsed = {};
 };
 
+struct StoredEquipmentItem
+{
+    uint32 ItemId = 0;
+    std::array<uint16, 2> Enchantments = {};
+    uint64 EquippedGuid = 0;
+};
+
 struct StoredClassProfile
 {
     uint16 Version = PROFILE_VERSION;
@@ -164,6 +228,14 @@ struct StoredClassProfile
     std::vector<SpellProfile> Spells;
     std::vector<SkillProfile> Skills;
     std::array<TalentGroupProfile, TALENT_GROUPS> Groups;
+    std::array<StoredEquipmentItem, EQUIPMENT_SLOTS> Equipment;
+    bool EquipmentMigrated = false;
+};
+
+struct CharacterLanguageState
+{
+    std::vector<SpellProfile> Spells;
+    std::vector<SkillProfile> Skills;
 };
 
 struct SelectionPolicy
@@ -360,17 +432,48 @@ struct ActiveClassSnapshot
 uint32 ClassIdToMask(uint8 classId);
 bool IsSupportedClassId(uint8 classId);
 uint64 ComputeSessionTag(uint8 const* bytes, size_t size);
+uint64 ComputeFnv1a64(uint8 const* bytes, size_t size);
+uint8 ResolveClassStartLevel(uint8 classId, uint8 configuredClassInitialLevel,
+    uint8 configuredPlayerStartLevel, uint8 configuredDeathKnightStartLevel);
+uint16 ResolveClassStatusLevel(uint8 classId, bool hasPersistedProfile, uint16 persistedLevel,
+    uint8 configuredClassInitialLevel, uint8 configuredPlayerStartLevel,
+    uint8 configuredDeathKnightStartLevel);
+bool PlanEquipmentBagReservations(std::vector<EquipmentBagCandidate> const& candidates,
+    std::vector<EquipmentBagDemand> const& demands, std::vector<uint16>* destinations);
+std::vector<uint8> BuildChangedEquipmentSlots(
+    std::array<uint64, EQUIPMENT_SLOTS> const& current,
+    std::array<uint64, EQUIPMENT_SLOTS> const& target);
+ClassSwitchLogoutPlan PlanClassSwitchLogout(bool hadPendingTransition,
+    bool sourceRestoreSucceeded);
+bool IsClassSwitchGameplayBlocked(bool pendingTransition, bool controlPacket);
+bool DecodeClientClassSwitchResponse(uint8 const* data, size_t size,
+    ClientClassSwitchResponse* response, std::string* error);
+ClientResponseMatch MatchClientClassSwitchResponse(ClientClassSwitchResponse const& response,
+    uint64 expectedSession, uint8 expectedClass, uint64 expectedRevision, uint64 expectedDigest,
+    uint8 sourceClass, uint64 sourceRevision, uint8 completedClass, uint64 completedRevision,
+    uint64 completedDigest);
+ClientTimeoutAction EvaluateClassSwitchTimeout(bool pending, bool recoveringSource,
+    bool deadlineReached, uint8 recoveryAttempts);
 bool ReserveTransitionRevision(uint64 baseRevision, uint64 targetRevision, uint64* reserved);
 bool IsSwitchOwnedAura(uint64 playerGuid, uint64 creatorGuid, uint32 classFamily,
     uint32 spellFamily, bool shapeshift);
 RequestResult EvaluateSelectionPolicy(SelectionPolicy const& policy);
 bool IsSpellAllowedForClassProfile(uint32 spellFamily, uint32 classFamily, bool professionOrRiding);
+uint32 NormalizeActionSpellRank(uint32 requestedRank, std::vector<uint32> const& spellChain,
+    std::set<uint32> const& activeRanks);
+void StripClassOwnedLanguages(StoredClassProfile* profile,
+    std::set<uint32> const& languageSpellIds, std::set<uint32> const& languageSkillIds,
+    uint32* removedSpells = nullptr, uint32* removedSkills = nullptr);
+void MergeCharacterLanguages(StoredClassProfile* profile,
+    CharacterLanguageState const& languages,
+    std::set<uint32> const& languageSpellIds, std::set<uint32> const& languageSkillIds);
 bool ValidateStoredProfile(StoredClassProfile const& profile, std::string* error,
     bool validateActionSpells = true);
 std::vector<uint8> EncodeStoredProfile(StoredClassProfile const& profile);
 bool DecodeStoredProfile(uint8 const* data, size_t size, StoredClassProfile* profile, std::string* error);
 std::vector<std::string> BuildProfileBackingTableStatements(uint64 guid,
-    StoredClassProfile const& profile);
+    StoredClassProfile const& profile, std::vector<uint32> const& languageSpellIds = {},
+    std::vector<uint32> const& languageSkillIds = {});
 bool AppendStoredProfileToTransaction(CharacterDatabaseTransaction const& transaction, Player* player,
     StoredClassProfile const& profile, std::string* error);
 bool AppendActiveProfileToTransaction(CharacterDatabaseTransaction const& transaction, Player* player,
@@ -383,7 +486,11 @@ std::vector<uint8> EncodeActiveClassSnapshot(ActiveClassSnapshot const& snapshot
 
 RequestResult RequestSwitch(Player* player, uint16 protocolVersion, uint8 requestType, uint8 classId,
     uint64 revision, std::string* error);
+bool ProcessClientResponse(Player* player, uint8 const* payload, size_t size, std::string* error);
 bool HandleSwitchSpellCast(Player* player, uint32 spellId, std::string* error);
+void UpdatePlayer(Player* player);
+bool IsTransitionPending(Player* player);
+bool CancelPendingTransitionOnLogout(Player* player);
 void RestoreActiveProfileAfterLoad(Player* player);
 void ClearPlayerRuntime(Player* player);
 bool ValidateClassSwitchRegistry(std::string* error);

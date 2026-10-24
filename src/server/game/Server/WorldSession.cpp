@@ -62,11 +62,18 @@
 #include "PlayerClassSwitch.h"
 #include "WorldSocket.h"
 #include <boost/circular_buffer.hpp>
+#include <cstring>
 #include <zlib.h>
 
 namespace {
 
 std::string const DefaultPlayerName = "<none>";
+
+bool IsClassSwitchControlOpcode(OpcodeClient opcode)
+{
+    return opcode == CMSG_CUSTOM || opcode == CMSG_PLAYER_LOGOUT ||
+        opcode == CMSG_LOGOUT_CANCEL || opcode == CMSG_TIME_SYNC_RESP;
+}
 
 } // namespace
 
@@ -328,7 +335,15 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
                     }
                     else if (_player->IsInWorld())
                     {
-                        if(AntiDOS.EvaluateOpcode(*packet, currentTime))
+                        if (ClassSwitch::IsClassSwitchGameplayBlocked(
+                            ClassSwitch::IsTransitionPending(_player),
+                            IsClassSwitchControlOpcode(opcode)))
+                        {
+                            TC_LOG_DEBUG("entities.player.classswitch",
+                                "Blocked gameplay opcode {} for player {} while class-switch acceptance is pending",
+                                opHandle->Name, _player->GetGUID().ToString());
+                        }
+                        else if(AntiDOS.EvaluateOpcode(*packet, currentTime))
                         {
                             sScriptMgr->OnPacketReceive(this, *packet);
                             opHandle->Call(this, *packet);
@@ -498,10 +513,26 @@ void WorldSession::LogoutPlayer(bool save)
 
     m_playerLogout = true;
     m_playerSave = save;
+    bool classSwitchSourceSafe = true;
+    ClassSwitch::ClassSwitchLogoutPlan classSwitchLogoutPlan;
 
     if (_player)
     {
-        ClassSwitch::ClearPlayerRuntime(_player);
+        bool const hadClassSwitchPending =
+            ClassSwitch::IsTransitionPending(_player);
+        classSwitchSourceSafe = ClassSwitch::CancelPendingTransitionOnLogout(_player);
+        classSwitchLogoutPlan = ClassSwitch::PlanClassSwitchLogout(
+            hadClassSwitchPending, classSwitchSourceSafe);
+        save = save && classSwitchLogoutPlan.PersistPlayer;
+        m_playerSave = save;
+        if (classSwitchSourceSafe)
+            ClassSwitch::ClearPlayerRuntime(_player);
+        else
+        {
+            TC_LOG_ERROR("entities.player.classswitch",
+                "Player {} logout is preserving its last durable source state because in-memory restoration failed",
+                _player->GetGUID().ToString());
+        }
 
         if (ObjectGuid lguid = _player->GetLootGUID())
             DoLootRelease(lguid);
@@ -565,15 +596,16 @@ void WorldSession::LogoutPlayer(bool save)
         if (Guild* guild = sGuildMgr->GetGuildById(_player->GetGuildId()))
             guild->HandleMemberLogout(this);
 
-        ///- Remove pet
-        _player->RemovePet(nullptr, PET_SAVE_AS_CURRENT);
+        ///- Remove pet only after the source profile was restored safely.
+        if (classSwitchLogoutPlan.RemovePet)
+            _player->RemovePet(nullptr, PET_SAVE_AS_CURRENT);
 
         ///- Clear whisper whitelist
         _player->ClearWhisperWhiteList();
 
         ///- empty buyback items and save the player in the database
         // some save parts only correctly work in case player present in map/player_lists (pets, etc)
-        if (save)
+        if (save && classSwitchLogoutPlan.PersistPlayer)
         {
             uint32 eslot;
             for (int j = BUYBACK_SLOT_START; j < BUYBACK_SLOT_END; ++j)
@@ -617,6 +649,7 @@ void WorldSession::LogoutPlayer(bool save)
         // the player may not be in the world when logging out
         // e.g if he got disconnected during a transfer to another map
         // calls to GetMap in this case may cause crashes
+        ClassSwitch::ClearPlayerRuntime(_player);
         _player->CleanupsBeforeDelete();
         TC_LOG_INFO("entities.player.character", "Account: {} (IP: {}) Logout Character:[{}] {} Level: {}, XP: {}/{} ({} left)",
             GetAccountId(), GetRemoteAddress(), _player->GetName(), _player->GetGUID().ToString(), _player->GetLevel(),
@@ -1801,6 +1834,42 @@ bool WorldSession::IsRightUnitBeingMoved(ObjectGuid guid)
 // @tswow-begin
 void WorldSession::HandleCustom(WorldPacket& packet)
 {
+    if (packet.size() >= CustomHeaderSize)
+    {
+        CustomPacketHeader header;
+        std::memcpy(&header, packet.contents(), sizeof(header));
+        if (header.opcode == ClassSwitch::CLIENT_RESPONSE_OPCODE)
+        {
+            if (!_player || header.totalFrags != 1)
+            {
+                if (_player && header.fragmentId == 0)
+                    ClassSwitch::ProcessClientResponse(
+                        _player, nullptr, 0, nullptr);
+                return;
+            }
+
+            size_t const payloadSize = packet.size() - CustomHeaderSize;
+            std::string error;
+            if (!ClassSwitch::ProcessClientResponse(
+                _player, packet.contents() + CustomHeaderSize,
+                payloadSize, &error))
+            {
+                TC_LOG_WARN("entities.player.classswitch",
+                    "Class-switch client response rejected for player {}: {}",
+                    _player->GetGUID().ToString(), error);
+            }
+            return;
+        }
+    }
+
+    if (_player && ClassSwitch::IsTransitionPending(_player))
+    {
+        TC_LOG_DEBUG("entities.player.classswitch",
+            "Blocked custom gameplay packet for player {} while class-switch acceptance is pending",
+            _player->GetGUID().ToString());
+        return;
+    }
+
     GetPlayer()->m_msg_buffer
         .ReceivePacket(packet.size(),(char*)packet.contents());
 }

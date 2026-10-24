@@ -8,11 +8,14 @@
  */
 
 #include "PlayerClassSwitch.h"
+#include "SharedDefines.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <tuple>
@@ -59,6 +62,16 @@ public:
         return Read(count) && count <= maximum;
     }
 
+    bool ReadBytes(uint8* output, size_t count)
+    {
+        if (!output || !_data || _offset > _size || _size - _offset < count)
+            return false;
+
+        std::memcpy(output, _data + _offset, count);
+        _offset += count;
+        return true;
+    }
+
     bool AtEnd() const
     {
         return _offset == _size;
@@ -96,6 +109,55 @@ bool AllFinite(Container const& values)
     return true;
 }
 
+bool IsValidUtf8(uint8 const* bytes, size_t size)
+{
+    size_t offset = 0;
+    while (offset < size)
+    {
+        uint8 const first = bytes[offset++];
+        if (first <= 0x7F)
+            continue;
+
+        uint8 continuationCount = 0;
+        uint32 codePoint = 0;
+        uint32 minimum = 0;
+        if ((first & 0xE0) == 0xC0)
+        {
+            continuationCount = 1;
+            codePoint = first & 0x1F;
+            minimum = 0x80;
+        }
+        else if ((first & 0xF0) == 0xE0)
+        {
+            continuationCount = 2;
+            codePoint = first & 0x0F;
+            minimum = 0x800;
+        }
+        else if ((first & 0xF8) == 0xF0)
+        {
+            continuationCount = 3;
+            codePoint = first & 0x07;
+            minimum = 0x10000;
+        }
+        else
+            return false;
+
+        if (size - offset < continuationCount)
+            return false;
+        for (uint8 index = 0; index < continuationCount; ++index)
+        {
+            uint8 const continuation = bytes[offset++];
+            if ((continuation & 0xC0) != 0x80)
+                return false;
+            codePoint = (codePoint << 6) | (continuation & 0x3F);
+        }
+        if (codePoint < minimum || codePoint > 0x10FFFF ||
+            (codePoint >= 0xD800 && codePoint <= 0xDFFF))
+            return false;
+    }
+    return true;
+}
+
 std::string FormatActionError(uint8 spec, uint8 button, uint32 actionId)
 {
     std::ostringstream message;
@@ -120,6 +182,11 @@ bool IsSupportedClassId(uint8 classId)
 
 uint64 ComputeSessionTag(uint8 const* bytes, size_t size)
 {
+    return ComputeFnv1a64(bytes, size);
+}
+
+uint64 ComputeFnv1a64(uint8 const* bytes, size_t size)
+{
     uint64 hash = 14695981039346656037ULL;
     for (size_t i = 0; bytes && i < size; ++i)
     {
@@ -127,6 +194,89 @@ uint64 ComputeSessionTag(uint8 const* bytes, size_t size)
         hash *= 1099511628211ULL;
     }
     return hash;
+}
+
+bool DecodeClientClassSwitchResponse(uint8 const* data, size_t size,
+    ClientClassSwitchResponse* response, std::string* error)
+{
+    if (!response || !data || size > 30 + MAX_RESPONSE_REASON_BYTES)
+        return SetError(error, "client class-switch response is missing or exceeds its limit");
+
+    ByteReader reader(data, size);
+    ClientClassSwitchResponse decoded;
+    uint8 disposition = 0;
+    uint16 reasonLength = 0;
+    if (!reader.Read(decoded.Version) || !reader.Read(disposition) ||
+        !reader.Read(decoded.ClassId) || !reader.Read(decoded.Session) ||
+        !reader.Read(decoded.Revision) || !reader.Read(decoded.SnapshotDigest) ||
+        !reader.Read(reasonLength))
+        return SetError(error, "client class-switch response header is truncated");
+    if (decoded.Version != RESPONSE_PROTOCOL_VERSION)
+        return SetError(error, "client class-switch response version is unsupported");
+    if (disposition < static_cast<uint8>(ClientResponseDisposition::Accepted) ||
+        disposition > static_cast<uint8>(ClientResponseDisposition::ResyncRequested))
+        return SetError(error, "client class-switch response disposition is invalid");
+    if (!decoded.Session || !decoded.Revision || !IsSupportedClassId(decoded.ClassId))
+        return SetError(error, "client class-switch response identity is invalid");
+    if (reasonLength > MAX_RESPONSE_REASON_BYTES)
+        return SetError(error, "client class-switch response reason exceeds its limit");
+
+    decoded.Disposition = ClientResponseDisposition(disposition);
+    if (decoded.Disposition == ClientResponseDisposition::ResyncRequested)
+    {
+        if (decoded.SnapshotDigest)
+            return SetError(error, "class-switch resync responses must not carry a snapshot digest");
+    }
+    else if (!decoded.SnapshotDigest)
+        return SetError(error, "class-switch acceptance responses require a snapshot digest");
+
+    decoded.Reason.resize(reasonLength);
+    if (reasonLength &&
+        !reader.ReadBytes(reinterpret_cast<uint8*>(decoded.Reason.data()), reasonLength))
+        return SetError(error, "client class-switch response reason is truncated");
+    if (!reader.AtEnd())
+        return SetError(error, "client class-switch response has trailing bytes");
+    if (!IsValidUtf8(reinterpret_cast<uint8 const*>(decoded.Reason.data()), decoded.Reason.size()))
+        return SetError(error, "client class-switch response reason is not valid UTF-8");
+
+    *response = std::move(decoded);
+    return true;
+}
+
+ClientResponseMatch MatchClientClassSwitchResponse(ClientClassSwitchResponse const& response,
+    uint64 expectedSession, uint8 expectedClass, uint64 expectedRevision, uint64 expectedDigest,
+    uint8 sourceClass, uint64 sourceRevision, uint8 completedClass, uint64 completedRevision,
+    uint64 completedDigest)
+{
+    if (!expectedSession || response.Session != expectedSession)
+        return ClientResponseMatch::StaleOrMismatched;
+    if (response.Disposition == ClientResponseDisposition::Accepted &&
+        completedRevision && completedDigest && response.Revision == completedRevision &&
+        response.ClassId == completedClass && response.SnapshotDigest == completedDigest)
+        return ClientResponseMatch::DuplicateAccepted;
+    if (response.Disposition == ClientResponseDisposition::ResyncRequested)
+    {
+        return !response.SnapshotDigest && response.ClassId == sourceClass &&
+            response.Revision == sourceRevision
+            ? ClientResponseMatch::ResyncRequested
+            : ClientResponseMatch::StaleOrMismatched;
+    }
+    if (response.ClassId != expectedClass || response.Revision != expectedRevision ||
+        response.SnapshotDigest != expectedDigest)
+        return ClientResponseMatch::StaleOrMismatched;
+    return response.Disposition == ClientResponseDisposition::Accepted
+        ? ClientResponseMatch::Accepted : ClientResponseMatch::Rejected;
+}
+
+ClientTimeoutAction EvaluateClassSwitchTimeout(bool pending, bool recoveringSource,
+    bool deadlineReached, uint8 recoveryAttempts)
+{
+    if (!pending || !deadlineReached)
+        return ClientTimeoutAction::None;
+    if (recoveringSource ||
+        recoveryAttempts >= MAX_CLASS_SWITCH_RECOVERY_ATTEMPTS)
+        return ClientTimeoutAction::Disconnect;
+    return ClientTimeoutAction::RecoverSource;
 }
 
 bool ReserveTransitionRevision(uint64 baseRevision, uint64 targetRevision, uint64* reserved)
@@ -163,6 +313,177 @@ RequestResult EvaluateSelectionPolicy(SelectionPolicy const& policy)
 bool IsSpellAllowedForClassProfile(uint32 spellFamily, uint32 classFamily, bool professionOrRiding)
 {
     return !spellFamily || professionOrRiding || spellFamily == classFamily;
+}
+
+uint8 ResolveClassStartLevel(uint8 classId, uint8 configuredClassInitialLevel,
+    uint8 configuredPlayerStartLevel, uint8 configuredDeathKnightStartLevel)
+{
+    if (classId == CLASS_DEATH_KNIGHT)
+        return configuredDeathKnightStartLevel;
+    if (configuredClassInitialLevel)
+        return configuredClassInitialLevel;
+    return configuredPlayerStartLevel;
+}
+
+uint16 ResolveClassStatusLevel(uint8 classId, bool hasPersistedProfile, uint16 persistedLevel,
+    uint8 configuredClassInitialLevel, uint8 configuredPlayerStartLevel,
+    uint8 configuredDeathKnightStartLevel)
+{
+    if (hasPersistedProfile && persistedLevel)
+        return persistedLevel;
+    return ResolveClassStartLevel(classId, configuredClassInitialLevel,
+        configuredPlayerStartLevel, configuredDeathKnightStartLevel);
+}
+
+uint32 NormalizeActionSpellRank(uint32 requestedRank, std::vector<uint32> const& spellChain,
+    std::set<uint32> const& activeRanks)
+{
+    if (!requestedRank)
+        return 0;
+    uint32 selected = 0;
+    for (uint32 rank : spellChain)
+    {
+        if (!activeRanks.count(rank))
+            continue;
+        selected = rank;
+        if (rank == requestedRank)
+            return rank;
+    }
+    return selected;
+}
+
+void StripClassOwnedLanguages(StoredClassProfile* profile,
+    std::set<uint32> const& languageSpellIds, std::set<uint32> const& languageSkillIds,
+    uint32* removedSpells, uint32* removedSkills)
+{
+    if (removedSpells)
+        *removedSpells = 0;
+    if (removedSkills)
+        *removedSkills = 0;
+    if (!profile)
+        return;
+
+    size_t const oldSpellCount = profile->Spells.size();
+    profile->Spells.erase(std::remove_if(profile->Spells.begin(), profile->Spells.end(),
+        [&languageSpellIds](SpellProfile const& spell) {
+            return languageSpellIds.find(spell.Id) != languageSpellIds.end();
+        }), profile->Spells.end());
+    size_t const oldSkillCount = profile->Skills.size();
+    profile->Skills.erase(std::remove_if(profile->Skills.begin(), profile->Skills.end(),
+        [&languageSkillIds](SkillProfile const& skill) {
+            return languageSkillIds.find(skill.Id) != languageSkillIds.end();
+        }), profile->Skills.end());
+    if (removedSpells)
+        *removedSpells = static_cast<uint32>(oldSpellCount - profile->Spells.size());
+    if (removedSkills)
+        *removedSkills = static_cast<uint32>(oldSkillCount - profile->Skills.size());
+}
+
+void MergeCharacterLanguages(StoredClassProfile* profile,
+    CharacterLanguageState const& languages,
+    std::set<uint32> const& languageSpellIds, std::set<uint32> const& languageSkillIds)
+{
+    if (!profile)
+        return;
+    StripClassOwnedLanguages(profile, languageSpellIds, languageSkillIds);
+
+    for (SpellProfile const& language : languages.Spells)
+    {
+        if (languageSpellIds.find(language.Id) == languageSpellIds.end())
+            continue;
+        if (std::none_of(profile->Spells.begin(), profile->Spells.end(),
+            [&language](SpellProfile const& value) { return value.Id == language.Id; }))
+            profile->Spells.push_back(language);
+    }
+    for (SkillProfile const& language : languages.Skills)
+    {
+        if (languageSkillIds.find(language.Id) == languageSkillIds.end())
+            continue;
+        if (std::none_of(profile->Skills.begin(), profile->Skills.end(),
+            [&language](SkillProfile const& value) { return value.Id == language.Id; }))
+            profile->Skills.push_back(language);
+    }
+}
+
+bool PlanEquipmentBagReservations(std::vector<EquipmentBagCandidate> const& candidates,
+    std::vector<EquipmentBagDemand> const& demands, std::vector<uint16>* destinations)
+{
+    if (!destinations)
+        return false;
+    destinations->clear();
+    destinations->reserve(demands.size());
+
+    std::map<uint16, size_t> candidateIndexes;
+    for (size_t index = 0; index < candidates.size(); ++index)
+        if (!candidates[index].Position ||
+            !candidateIndexes.emplace(candidates[index].Position, index).second)
+            return false;
+
+    std::vector<size_t> demandForPosition(candidates.size(), std::numeric_limits<size_t>::max());
+    std::vector<size_t> positionForDemand(demands.size(), std::numeric_limits<size_t>::max());
+
+    std::function<bool(size_t, std::set<size_t>&)> assign = [&](size_t demandIndex,
+        std::set<size_t>& seen) {
+        for (uint16 position : demands[demandIndex].AllowedPositions)
+        {
+            auto candidate = candidateIndexes.find(position);
+            if (candidate == candidateIndexes.end())
+                continue;
+            size_t const candidateIndex = candidate->second;
+            if (!seen.insert(candidateIndex).second)
+                continue;
+            if (demandForPosition[candidateIndex] == std::numeric_limits<size_t>::max() ||
+                assign(demandForPosition[candidateIndex], seen))
+            {
+                demandForPosition[candidateIndex] = demandIndex;
+                positionForDemand[demandIndex] = candidateIndex;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (size_t demandIndex = 0; demandIndex < demands.size(); ++demandIndex)
+    {
+        std::set<size_t> seen;
+        if (!assign(demandIndex, seen))
+        {
+            destinations->clear();
+            return false;
+        }
+    }
+
+    for (size_t candidateIndex : positionForDemand)
+        destinations->push_back(candidates[candidateIndex].Position);
+    return true;
+}
+
+std::vector<uint8> BuildChangedEquipmentSlots(
+    std::array<uint64, EQUIPMENT_SLOTS> const& current,
+    std::array<uint64, EQUIPMENT_SLOTS> const& target)
+{
+    std::vector<uint8> changed;
+    for (uint8 slot = 0; slot < EQUIPMENT_SLOTS; ++slot)
+        if (current[slot] != target[slot])
+            changed.push_back(slot);
+    return changed;
+}
+
+ClassSwitchLogoutPlan PlanClassSwitchLogout(bool hadPendingTransition,
+    bool sourceRestoreSucceeded)
+{
+    ClassSwitchLogoutPlan plan;
+    if (hadPendingTransition && !sourceRestoreSucceeded)
+    {
+        plan.PersistPlayer = false;
+        plan.RemovePet = false;
+    }
+    return plan;
+}
+
+bool IsClassSwitchGameplayBlocked(bool pendingTransition, bool controlPacket)
+{
+    return pendingTransition && !controlPacket;
 }
 
 bool ValidateStoredProfile(StoredClassProfile const& profile, std::string* error,
@@ -253,6 +574,22 @@ bool ValidateStoredProfile(StoredClassProfile const& profile, std::string* error
         }
     }
 
+    std::set<uint64> equipmentGuids;
+    for (uint8 slot = 0; slot < EQUIPMENT_SLOTS; ++slot)
+    {
+        StoredEquipmentItem const& item = profile.Equipment[slot];
+        if ((item.ItemId != 0) != (item.EquippedGuid != 0) ||
+            (!item.EquippedGuid &&
+             (item.Enchantments[0] || item.Enchantments[1])) ||
+            (item.EquippedGuid && !equipmentGuids.insert(item.EquippedGuid).second))
+        {
+            if (error)
+                *error = "stored profile equipment slot " + std::to_string(slot)
+                    + " is invalid or duplicated";
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -323,6 +660,13 @@ std::vector<uint8> EncodeStoredProfile(StoredClassProfile const& profile)
         for (uint32 action : spec.Actions)
             writer.Write(action);
     }
+    for (StoredEquipmentItem const& item : profile.Equipment)
+    {
+        writer.Write(item.ItemId);
+        writer.Write(item.Enchantments[0]);
+        writer.Write(item.Enchantments[1]);
+        writer.Write(item.EquippedGuid);
+    }
 
     return data;
 }
@@ -335,8 +679,9 @@ bool DecodeStoredProfile(uint8 const* data, size_t size, StoredClassProfile* pro
     ByteReader reader(data, size);
     uint32 magic = 0;
     StoredClassProfile decoded;
+    uint16 encodedVersion = 0;
     if (!reader.Read(magic) || magic != PROFILE_MAGIC ||
-        !reader.Read(decoded.Version) || decoded.Version != PROFILE_VERSION ||
+        !reader.Read(encodedVersion) || (encodedVersion != 1 && encodedVersion != PROFILE_VERSION) ||
         !reader.Read(decoded.Revision) ||
         !reader.Read(decoded.ClassId) ||
         !reader.Read(decoded.Level) ||
@@ -347,6 +692,7 @@ bool DecodeStoredProfile(uint8 const* data, size_t size, StoredClassProfile* pro
         !reader.Read(decoded.FreeTalentPoints) ||
         !reader.Read(decoded.HealthPercent))
         return SetError(error, "stored profile header is invalid");
+    decoded.Version = PROFILE_VERSION;
 
     for (float& value : decoded.PowerPercent)
         if (!reader.Read(value))
@@ -411,6 +757,21 @@ bool DecodeStoredProfile(uint8 const* data, size_t size, StoredClassProfile* pro
                 return SetError(error, "stored profile action is truncated");
     }
 
+    // v1 did not carry class-owned equipment. Its explicit migration is an
+    // empty loadout; the active class captures its real equipment on the next
+    // profile write, while target classes never inherit the source gear.
+    if (encodedVersion == PROFILE_VERSION)
+    {
+        for (StoredEquipmentItem& item : decoded.Equipment)
+            if (!reader.Read(item.ItemId) ||
+                !reader.Read(item.Enchantments[0]) ||
+                !reader.Read(item.Enchantments[1]) ||
+                !reader.Read(item.EquippedGuid))
+                return SetError(error, "stored profile equipment is truncated");
+    }
+    else
+        decoded.EquipmentMigrated = true;
+
     if (!reader.AtEnd() || !ValidateStoredProfile(decoded, error, false))
         return false;
 
@@ -419,24 +780,86 @@ bool DecodeStoredProfile(uint8 const* data, size_t size, StoredClassProfile* pro
 }
 
 std::vector<std::string> BuildProfileBackingTableStatements(uint64 guid,
-    StoredClassProfile const& profile)
+    StoredClassProfile const& profile, std::vector<uint32> const& languageSpellIds,
+    std::vector<uint32> const& languageSkillIds)
 {
     std::vector<std::string> statements;
     std::ostringstream sql;
-    sql << "DELETE FROM character_action WHERE guid = " << guid;
-    statements.push_back(sql.str());
-    for (uint8 button = 0; button < ACTION_SLOTS; ++button)
+    sql << "DELETE FROM character_spell WHERE guid = " << guid;
+    if (!languageSpellIds.empty())
     {
-        uint32 const packed = profile.Groups[profile.ActiveSpec].Actions[button];
-        if (!packed)
+        sql << " AND spell NOT IN (";
+        for (size_t index = 0; index < languageSpellIds.size(); ++index)
+        {
+            if (index)
+                sql << ", ";
+            sql << languageSpellIds[index];
+        }
+        sql << ')';
+    }
+    statements.push_back(sql.str());
+    for (SpellProfile const& spell : profile.Spells)
+    {
+        if (std::find(languageSpellIds.begin(), languageSpellIds.end(), spell.Id)
+            != languageSpellIds.end())
+            continue;
+        if (spell.Dependent)
             continue;
         sql.str("");
         sql.clear();
-        sql << "INSERT INTO character_action (guid, spec, button, action, type) VALUES ("
-            << guid << ", " << uint32(profile.ActiveSpec) << ", " << uint32(button)
-            << ", " << (packed & 0x00FFFFFFu) << ", "
-            << uint32(uint8(packed >> 24)) << ")";
+        sql << "INSERT INTO character_spell (guid, spell, active, disabled) VALUES ("
+            << guid << ", " << spell.Id << ", " << uint32(spell.Active ? 1 : 0)
+            << ", " << uint32(spell.Disabled ? 1 : 0) << ")";
         statements.push_back(sql.str());
+    }
+
+    sql.str("");
+    sql.clear();
+    sql << "DELETE FROM character_skills WHERE guid = " << guid;
+    if (!languageSkillIds.empty())
+    {
+        sql << " AND skill NOT IN (";
+        for (size_t index = 0; index < languageSkillIds.size(); ++index)
+        {
+            if (index)
+                sql << ", ";
+            sql << languageSkillIds[index];
+        }
+        sql << ')';
+    }
+    statements.push_back(sql.str());
+    for (SkillProfile const& skill : profile.Skills)
+    {
+        if (std::find(languageSkillIds.begin(), languageSkillIds.end(), skill.Id)
+            != languageSkillIds.end())
+            continue;
+        sql.str("");
+        sql.clear();
+        sql << "INSERT INTO character_skills (guid, skill, value, max) VALUES ("
+            << guid << ", " << skill.Id << ", " << skill.Value << ", "
+            << skill.Max << ")";
+        statements.push_back(sql.str());
+    }
+
+    sql.str("");
+    sql.clear();
+    sql << "DELETE FROM character_action WHERE guid = " << guid;
+    statements.push_back(sql.str());
+    for (uint8 spec = 0; spec < profile.SpecCount; ++spec)
+    {
+        for (uint8 button = 0; button < ACTION_SLOTS; ++button)
+        {
+            uint32 const packed = profile.Groups[spec].Actions[button];
+            if (!packed)
+                continue;
+            sql.str("");
+            sql.clear();
+            sql << "INSERT INTO character_action (guid, spec, button, action, type) VALUES ("
+                << guid << ", " << uint32(spec) << ", " << uint32(button)
+                << ", " << (packed & 0x00FFFFFFu) << ", "
+                << uint32(uint8(packed >> 24)) << ")";
+            statements.push_back(sql.str());
+        }
     }
 
     sql.str("");
@@ -486,6 +909,7 @@ std::vector<uint8> EncodeActiveClassStatus(StatusStage stage, RequestResult resu
         if (!IsSupportedClassId(entry.ClassId) || !entry.Level || entry.Level > 80 ||
             (entry.Flags & ~(CLASS_FLAG_ACTIVE | CLASS_FLAG_PENDING | CLASS_FLAG_AVAILABLE)) ||
             entry.Name.empty() || entry.Name.size() > std::numeric_limits<uint16>::max() ||
+            !IsValidUtf8(reinterpret_cast<uint8 const*>(entry.Name.data()), entry.Name.size()) ||
             !classIds.insert(entry.ClassId).second)
             return {};
     }

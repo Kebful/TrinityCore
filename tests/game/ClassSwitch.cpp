@@ -10,6 +10,7 @@
 #include "tc_catch2.h"
 
 #include "PlayerClassSwitch.h"
+#include "SharedDefines.h"
 
 #include <algorithm>
 #include <cstring>
@@ -73,6 +74,150 @@ TEST_CASE("Class switch class IDs and masks cover the uint32 boundary", "[ClassS
     REQUIRE(ComputeSessionTag(sessionKey, sizeof(sessionKey)) == 0x40d69e0cf0f65c45ULL);
 }
 
+TEST_CASE("Class switch response decoder matches the frozen client vector", "[ClassSwitch]")
+{
+    uint8 const vector[] = {
+        0x01, 0x00,             // version
+        0x02,                   // rejected
+        0x07,                   // class
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+        0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
+        0x03, 0x00,             // reason length
+        'b', 'a', 'd'
+    };
+
+    ClientClassSwitchResponse response;
+    std::string error;
+    REQUIRE(DecodeClientClassSwitchResponse(vector, sizeof(vector), &response, &error));
+    REQUIRE(response.Version == RESPONSE_PROTOCOL_VERSION);
+    REQUIRE(response.Disposition == ClientResponseDisposition::Rejected);
+    REQUIRE(response.ClassId == 7);
+    REQUIRE(response.Session == 0x0102030405060708ULL);
+    REQUIRE(response.Revision == 0x1112131415161718ULL);
+    REQUIRE(response.SnapshotDigest == 0x2122232425262728ULL);
+    REQUIRE(response.Reason == "bad");
+
+    REQUIRE_FALSE(DecodeClientClassSwitchResponse(vector, sizeof(vector) - 1, &response, &error));
+    REQUIRE(error.find("truncated") != std::string::npos);
+
+    uint8 trailing[sizeof(vector) + 1] = {};
+    std::memcpy(trailing, vector, sizeof(vector));
+    REQUIRE_FALSE(DecodeClientClassSwitchResponse(trailing, sizeof(trailing), &response, &error));
+    REQUIRE(error.find("trailing") != std::string::npos);
+
+    uint8 zeroDigest[sizeof(vector)];
+    std::memcpy(zeroDigest, vector, sizeof(vector));
+    std::fill(zeroDigest + 20, zeroDigest + 28, 0);
+    REQUIRE_FALSE(DecodeClientClassSwitchResponse(zeroDigest, sizeof(zeroDigest), &response, &error));
+    REQUIRE(error.find("digest") != std::string::npos);
+
+    uint8 invalidUtf8[sizeof(vector)];
+    std::memcpy(invalidUtf8, vector, sizeof(vector));
+    invalidUtf8[30] = 0x80;
+    REQUIRE_FALSE(DecodeClientClassSwitchResponse(
+        invalidUtf8, sizeof(invalidUtf8), &response, &error));
+    REQUIRE(error.find("UTF-8") != std::string::npos);
+}
+
+TEST_CASE("Class switch response digest is FNV-1a 64", "[ClassSwitch]")
+{
+    uint8 const empty[] = {};
+    uint8 const abc[] = { 'a', 'b', 'c' };
+    REQUIRE(ComputeFnv1a64(empty, 0) == 14695981039346656037ULL);
+    REQUIRE(ComputeFnv1a64(abc, sizeof(abc)) == 0xe71fa2190541574bULL);
+}
+
+TEST_CASE("Class switch response matching rejects stale and wrong-session acknowledgements", "[ClassSwitch]")
+{
+    ClientClassSwitchResponse response;
+    response.Version = RESPONSE_PROTOCOL_VERSION;
+    response.Disposition = ClientResponseDisposition::Accepted;
+    response.ClassId = 7;
+    response.Session = 11;
+    response.Revision = 9;
+    response.SnapshotDigest = 33;
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 11, 7, 9, 33, 8, 5, 0, 0, 0) == ClientResponseMatch::Accepted);
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 12, 7, 9, 33, 8, 5, 0, 0, 0) == ClientResponseMatch::StaleOrMismatched);
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 11, 7, 10, 33, 8, 5, 0, 0, 0) == ClientResponseMatch::StaleOrMismatched);
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 11, 7, 9, 34, 8, 5, 0, 0, 0) == ClientResponseMatch::StaleOrMismatched);
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 11, 7, 9, 33, 8, 5, 7, 9, 33) == ClientResponseMatch::DuplicateAccepted);
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 11, 8, 10, 44, 8, 5, 7, 9, 99) == ClientResponseMatch::StaleOrMismatched);
+
+    response.Disposition = ClientResponseDisposition::ResyncRequested;
+    response.ClassId = 8;
+    response.Revision = 5;
+    response.SnapshotDigest = 0;
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 11, 7, 9, 33, 8, 5, 0, 0, 0) == ClientResponseMatch::ResyncRequested);
+    response.Revision = 6;
+    REQUIRE(MatchClientClassSwitchResponse(
+        response, 11, 7, 9, 33, 8, 5, 0, 0, 0) == ClientResponseMatch::StaleOrMismatched);
+}
+
+TEST_CASE("Class switch timeout recovery is bounded", "[ClassSwitch]")
+{
+    REQUIRE(EvaluateClassSwitchTimeout(false, false, true, 0)
+        == ClientTimeoutAction::None);
+    REQUIRE(EvaluateClassSwitchTimeout(true, false, false, 0)
+        == ClientTimeoutAction::None);
+    REQUIRE(EvaluateClassSwitchTimeout(true, false, true, 0)
+        == ClientTimeoutAction::RecoverSource);
+    REQUIRE(EvaluateClassSwitchTimeout(true, true, true, 1)
+        == ClientTimeoutAction::Disconnect);
+}
+
+TEST_CASE("Class switch logout cannot persist staged state after restore failure", "[ClassSwitch]")
+{
+    ClassSwitchLogoutPlan plan = PlanClassSwitchLogout(false, false);
+    REQUIRE(plan.PersistPlayer);
+    REQUIRE(plan.RemovePet);
+    REQUIRE(plan.ClearRuntime);
+
+    plan = PlanClassSwitchLogout(true, true);
+    REQUIRE(plan.PersistPlayer);
+    REQUIRE(plan.RemovePet);
+    REQUIRE(plan.ClearRuntime);
+
+    plan = PlanClassSwitchLogout(true, false);
+    REQUIRE_FALSE(plan.PersistPlayer);
+    REQUIRE_FALSE(plan.RemovePet);
+    REQUIRE(plan.ClearRuntime);
+
+    REQUIRE_FALSE(IsClassSwitchGameplayBlocked(false, false));
+    REQUIRE(IsClassSwitchGameplayBlocked(true, false));
+    REQUIRE_FALSE(IsClassSwitchGameplayBlocked(true, true));
+}
+
+TEST_CASE("Class switch resync response requires a zero digest", "[ClassSwitch]")
+{
+    uint8 const vector[] = {
+        0x01, 0x00,             // version
+        0x03,                   // resync requested
+        0x08,                   // current class
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00
+    };
+    ClientClassSwitchResponse response;
+    std::string error;
+    REQUIRE(DecodeClientClassSwitchResponse(vector, sizeof(vector), &response, &error));
+    REQUIRE(response.Disposition == ClientResponseDisposition::ResyncRequested);
+    REQUIRE(response.SnapshotDigest == 0);
+
+    uint8 badDigest[sizeof(vector)];
+    std::memcpy(badDigest, vector, sizeof(vector));
+    badDigest[20] = 1;
+    REQUIRE_FALSE(DecodeClientClassSwitchResponse(badDigest, sizeof(badDigest), &response, &error));
+}
+
 TEST_CASE("Class switch selection policy rejects stale and unsafe requests", "[ClassSwitch]")
 {
     SelectionPolicy policy;
@@ -99,6 +244,146 @@ TEST_CASE("Class switch only admits target-family or shared spells", "[ClassSwit
     REQUIRE(IsSpellAllowedForClassProfile(0, 7, false));
     REQUIRE(IsSpellAllowedForClassProfile(10, 7, false) == false);
     REQUIRE(IsSpellAllowedForClassProfile(10, 7, true));
+}
+
+TEST_CASE("Class switch start levels follow config without resetting existing profiles", "[ClassSwitch]")
+{
+    REQUIRE(ResolveClassStartLevel(CLASS_DEATH_KNIGHT, 55, 1, 1) == 1);
+    REQUIRE(ResolveClassStartLevel(CLASS_WARRIOR, 7, 1, 1) == 7);
+    REQUIRE(ResolveClassStartLevel(CLASS_MAGE, 0, 4, 1) == 4);
+
+    REQUIRE(ResolveClassStatusLevel(
+        CLASS_DEATH_KNIGHT, false, 55, 55, 1, 1) == 1);
+    REQUIRE(ResolveClassStatusLevel(
+        CLASS_DEATH_KNIGHT, true, 55, 55, 1, 1) == 55);
+    REQUIRE(ResolveClassStatusLevel(
+        CLASS_WARRIOR, true, 12, 1, 1, 1) == 12);
+    REQUIRE(ResolveClassStatusLevel(
+        CLASS_WARRIOR, false, 0, 1, 1, 1) == 1);
+}
+
+TEST_CASE("Character languages survive repeated class-profile application", "[ClassSwitch]")
+{
+    std::set<uint32> const languageSpells{ 669, 815, 7340 };
+    std::set<uint32> const languageSkills{ 669, 815, 7340 };
+    CharacterLanguageState const characterLanguages{
+        { { 669, 0, true, false, false },
+          { 7340, 0, true, false, false } },
+        { { 669, 0, 300, 300, 0, 0, true },
+          { 7340, 0, 300, 300, 0, 0, true } }
+    };
+
+    StoredClassProfile warrior = MinimalProfile();
+    warrior.ClassId = CLASS_WARRIOR;
+    warrior.Spells = { { 78, 0, true, false, false },
+        { 815, 0, true, false, false } };
+    warrior.Skills = { { 43, 0, 20, 100, 0, 0, false },
+        { 815, 0, 300, 300, 0, 0, true } };
+
+    StoredClassProfile mage = MinimalProfile();
+    mage.ClassId = CLASS_MAGE;
+    mage.Spells = { { 133, 0, true, false, false },
+        { 815, 0, true, false, false } };
+    mage.Skills = { { 6, 0, 20, 100, 0, 0, false },
+        { 669, 0, 300, 300, 0, 0, true } };
+
+    for (uint32 iteration = 0; iteration < 8; ++iteration)
+    {
+        StoredClassProfile applied = iteration % 2 ? warrior : mage;
+        uint32 removedSpells = 0;
+        uint32 removedSkills = 0;
+        StripClassOwnedLanguages(&applied, languageSpells, languageSkills,
+            &removedSpells, &removedSkills);
+        REQUIRE(removedSpells == 1);
+        REQUIRE(removedSkills == 1);
+        MergeCharacterLanguages(&applied, characterLanguages, languageSpells, languageSkills);
+
+        std::vector<uint32> appliedLanguageSpells;
+        for (SpellProfile const& spell : applied.Spells)
+            if (languageSpells.count(spell.Id))
+                appliedLanguageSpells.push_back(spell.Id);
+        REQUIRE(appliedLanguageSpells == std::vector<uint32>{ 669, 7340 });
+
+        REQUIRE(std::any_of(applied.Spells.begin(), applied.Spells.end(),
+            [&applied](SpellProfile const& spell) {
+                return spell.Id == (applied.ClassId == CLASS_WARRIOR ? 78u : 133u);
+            }));
+
+        uint32 capturedLanguages = 0;
+        StoredClassProfile captured = applied;
+        StripClassOwnedLanguages(&captured, languageSpells, languageSkills,
+            &capturedLanguages, nullptr);
+        REQUIRE(capturedLanguages == 2);
+        REQUIRE(std::none_of(captured.Spells.begin(), captured.Spells.end(),
+            [&languageSpells](SpellProfile const& spell) {
+                return languageSpells.count(spell.Id) != 0;
+            }));
+    }
+}
+
+TEST_CASE("Inactive action ranks normalize only to known active ranks", "[ClassSwitch]")
+{
+    std::vector<uint32> const chain{ 100, 200, 300, 400 };
+    std::set<uint32> active{ 100, 300 };
+    REQUIRE(NormalizeActionSpellRank(300, chain, active) == 300);
+    REQUIRE(NormalizeActionSpellRank(400, chain, active) == 300);
+    REQUIRE(NormalizeActionSpellRank(200, chain, active) == 300);
+    active.clear();
+    REQUIRE(NormalizeActionSpellRank(200, chain, active) == 0);
+}
+
+TEST_CASE("Equipment planning reserves permutations, freed target positions, and rollback slots", "[ClassSwitch]")
+{
+    std::vector<EquipmentBagCandidate> const candidates{
+        { uint16(0) << 8 | 19, false },
+        { uint16(0) << 8 | 20, false },
+        { uint16(0) << 8 | 21, true }
+    };
+    std::vector<EquipmentBagDemand> const demands{
+        { { candidates[0].Position, candidates[1].Position, candidates[2].Position } },
+        { { candidates[0].Position, candidates[1].Position, candidates[2].Position } },
+        { { candidates[2].Position } }
+    };
+    std::vector<uint16> reservations;
+    REQUIRE(PlanEquipmentBagReservations(candidates, demands, &reservations));
+    REQUIRE(reservations.size() == 3);
+    REQUIRE(std::set<uint16>(reservations.begin(), reservations.end()).size() == 3);
+    REQUIRE(reservations[2] == candidates[2].Position);
+
+    std::vector<EquipmentBagDemand> const constrained{
+        { { candidates[0].Position, candidates[1].Position } },
+        { { candidates[0].Position } }
+    };
+    REQUIRE(PlanEquipmentBagReservations(candidates, constrained, &reservations));
+    REQUIRE(reservations[0] == candidates[1].Position);
+    REQUIRE(reservations[1] == candidates[0].Position);
+
+    EquipmentBagDemand const pressureDemand{
+        { candidates[0].Position, candidates[1].Position }
+    };
+    std::vector<EquipmentBagDemand> const overCapacity(3, pressureDemand);
+    REQUIRE_FALSE(PlanEquipmentBagReservations(candidates, overCapacity, &reservations));
+    REQUIRE(reservations.empty());
+}
+
+TEST_CASE("Equipment changes include both slots in two-hand transitions", "[ClassSwitch]")
+{
+    constexpr uint8 mainhand = 15;
+    constexpr uint8 offhand = 16;
+    std::array<uint64, EQUIPMENT_SLOTS> current{};
+    std::array<uint64, EQUIPMENT_SLOTS> target{};
+    current[mainhand] = 101;
+    current[offhand] = 102;
+    target[mainhand] = 201;
+    target[offhand] = 202;
+    std::vector<uint8> changed = BuildChangedEquipmentSlots(current, target);
+    REQUIRE(changed == std::vector<uint8>{ mainhand, offhand });
+
+    current = target;
+    target[mainhand] = 301;
+    target[offhand] = 0;
+    changed = BuildChangedEquipmentSlots(current, target);
+    REQUIRE(changed == std::vector<uint8>{ mainhand, offhand });
 }
 
 TEST_CASE("Class switch reserves one target revision above both profiles", "[ClassSwitch]")
@@ -133,6 +418,11 @@ TEST_CASE("Stored class profile round trips through its bounded wire form", "[Cl
     profile.Groups[0].Talents.push_back({ 120, 0 });
     profile.Groups[0].Glyphs[0] = 42;
     profile.Groups[0].Actions[0] = 133;
+    profile.Equipment[1].ItemId = 40403;
+    profile.Equipment[1].Enchantments[0] = 3150;
+    profile.Equipment[1].EquippedGuid = 0x4000000000000123ULL;
+    profile.Equipment[15].ItemId = 40000;
+    profile.Equipment[15].EquippedGuid = 0x4000000000000124ULL;
     profile.Runes.Count = 6;
     profile.Runes.Types[0] = 1;
     profile.Runes.BaseTypes[0] = 1;
@@ -157,6 +447,19 @@ TEST_CASE("Stored class profile round trips through its bounded wire form", "[Cl
     REQUIRE(decoded.Groups[0].Actions[1] == 116);
     REQUIRE(decoded.Runes.Count == 6);
     REQUIRE(decoded.Runes.Cooldowns[0] == 2500);
+    REQUIRE(decoded.Equipment[1].ItemId == 40403);
+    REQUIRE(decoded.Equipment[1].Enchantments[0] == 3150);
+    REQUIRE(decoded.Equipment[1].EquippedGuid == 0x4000000000000123ULL);
+    REQUIRE(decoded.Equipment[15].ItemId == 40000);
+
+    std::vector<uint8> legacy(encoded.begin(), encoded.end() - EQUIPMENT_SLOTS * 16);
+    uint16 const legacyVersion = 1;
+    std::memcpy(legacy.data() + sizeof(uint32), &legacyVersion, sizeof(legacyVersion));
+    StoredClassProfile migrated;
+    REQUIRE(DecodeStoredProfile(legacy.data(), legacy.size(), &migrated, &error));
+    REQUIRE(migrated.Version == PROFILE_VERSION);
+    for (StoredEquipmentItem const& item : migrated.Equipment)
+        REQUIRE(item.EquippedGuid == 0);
 }
 
 TEST_CASE("Druid profile preserves its starter action and reports a missing spell precisely", "[ClassSwitch]")
@@ -212,17 +515,51 @@ TEST_CASE("Class profile actions may reference a known inactive spell rank", "[C
 TEST_CASE("Class profile backing-table writes are ordered and non-destructive", "[ClassSwitch]")
 {
     StoredClassProfile profile = MinimalProfile();
+    profile.SpecCount = 2;
     profile.Groups[0].Talents.push_back({ 120, 0 });
     profile.Groups[0].Glyphs[0] = 42;
     profile.Groups[0].Actions[0] = 133;
     profile.Groups[0].Actions[1] = 0x80000001u;
+    profile.Groups[1].Actions[2] = 116;
+    profile.Skills.push_back({ 333, 1, 50, 100, 0, 0, true });
+    profile.Spells.push_back({ 669, 0, true, false, false });
+    profile.Skills.push_back({ 669, 0, 300, 300, 0, 0, true });
 
-    std::vector<std::string> statements = BuildProfileBackingTableStatements(77, profile);
+    std::vector<std::string> statements = BuildProfileBackingTableStatements(
+        77, profile, { 669, 815 }, { 669, 815 });
     REQUIRE_FALSE(statements.empty());
-    REQUIRE(statements.front().find("DELETE FROM character_action WHERE guid = 77") == 0);
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("DELETE FROM character_spell WHERE guid = 77 AND spell NOT IN (669, 815)") == 0;
+    }));
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("DELETE FROM character_skills WHERE guid = 77 AND skill NOT IN (669, 815)") == 0;
+    }));
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("DELETE FROM character_action WHERE guid = 77") == 0;
+    }));
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("INSERT INTO character_spell") != std::string::npos
+            && sql.find(", 133, 1, 0)") != std::string::npos;
+    }));
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("INSERT INTO character_skills") != std::string::npos
+            && sql.find(", 333, 50, 100)") != std::string::npos;
+    }));
+    REQUIRE(std::none_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("INSERT INTO character_spell") != std::string::npos
+            && sql.find(", 669, ") != std::string::npos;
+    }));
+    REQUIRE(std::none_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("INSERT INTO character_skills") != std::string::npos
+            && sql.find(", 669, ") != std::string::npos;
+    }));
     REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
         return sql.find("INSERT INTO character_action") != std::string::npos
             && sql.find(", 0, 0, 133, 0)") != std::string::npos;
+    }));
+    REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
+        return sql.find("INSERT INTO character_action") != std::string::npos
+            && sql.find(", 1, 2, 116, 0)") != std::string::npos;
     }));
     REQUIRE(std::any_of(statements.begin(), statements.end(), [](std::string const& sql) {
         return sql.find("character_talent") != std::string::npos
@@ -239,6 +576,21 @@ TEST_CASE("Stored class profile rejects duplicate spell references", "[ClassSwit
     std::string error;
     REQUIRE_FALSE(ValidateStoredProfile(profile, &error));
     REQUIRE_FALSE(error.empty());
+}
+
+TEST_CASE("Stored class profile rejects incomplete or duplicate equipment", "[ClassSwitch]")
+{
+    StoredClassProfile profile = MinimalProfile();
+    profile.Equipment[0].ItemId = 123;
+    std::string error;
+    REQUIRE_FALSE(ValidateStoredProfile(profile, &error));
+    REQUIRE(error.find("equipment slot 0") != std::string::npos);
+
+    profile.Equipment[0].EquippedGuid = 0x4000000000000001ULL;
+    REQUIRE(ValidateStoredProfile(profile, &error));
+    profile.Equipment[1] = profile.Equipment[0];
+    REQUIRE_FALSE(ValidateStoredProfile(profile, &error));
+    REQUIRE(error.find("duplicated") != std::string::npos);
 }
 
 TEST_CASE("Stored class profile rejects rune state outside its active slots", "[ClassSwitch]")
@@ -306,6 +658,12 @@ TEST_CASE("Class switch status encodes the final client field order", "[ClassSwi
     classes.push_back(classes.front());
     REQUIRE(EncodeActiveClassStatus(StatusStage::State, RequestResult::Ok,
         8, 0, 1, 2, classes).empty());
+
+    std::vector<ActiveClassStatusDescriptor> invalidUtf8{
+        { 8, 23, CLASS_FLAG_ACTIVE, std::string("\xFF", 1) }
+    };
+    REQUIRE(EncodeActiveClassStatus(StatusStage::State, RequestResult::Ok,
+        8, 0, 1, 2, invalidUtf8).empty());
 }
 
 TEST_CASE("Active class snapshot rejects class-family action leakage", "[ClassSwitch]")

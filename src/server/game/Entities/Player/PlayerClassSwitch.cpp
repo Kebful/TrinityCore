@@ -10,6 +10,7 @@
 #include "PlayerClassSwitch.h"
 
 #include "ArenaTeam.h"
+#include "Bag.h"
 #include "CharacterCache.h"
 #include "CustomPacketDefines.h"
 #include "CustomPacketWrite.h"
@@ -48,6 +49,7 @@ namespace
 {
 constexpr std::chrono::milliseconds MIN_REQUEST_INTERVAL(500);
 constexpr size_t MAX_REQUESTS_PER_MINUTE = 6;
+constexpr std::chrono::seconds CLIENT_RESPONSE_TIMEOUT(10);
 
 struct RuntimeClassDefinition
 {
@@ -56,12 +58,45 @@ struct RuntimeClassDefinition
     uint8 DisplayPower = 0;
 };
 
+enum class TransitionPhase : uint8
+{
+    None,
+    AwaitingSpellCast,
+    AwaitingInitialAcceptance,
+    RecoveringSource,
+    RecoveryFailed
+};
+
+struct EquipmentRollbackPlan
+{
+    std::array<uint16, EQUIPMENT_SLOTS> TargetBagDestinations = {};
+    bool Prepared = false;
+};
+
+struct LanguageEntryIds
+{
+    std::set<uint32> Spells;
+    std::set<uint32> Skills;
+};
+
 struct PendingSwitch
 {
+    TransitionPhase Phase = TransitionPhase::None;
+    uint8 SourceClass = 0;
     uint8 TargetClass = 0;
+    uint8 ExpectedClass = 0;
     uint64 BaseRevision = 0;
     uint64 TargetRevision = 0;
-    SystemTimePoint RequestedAt = SystemTimePoint::clock::now();
+    uint64 RecoveryRevision = 0;
+    uint64 SnapshotDigest = 0;
+    uint8 RecoveryAttempts = 0;
+    StoredClassProfile SourceProfile;
+    StoredClassProfile TargetProfile;
+    PetStable SourcePetStable;
+    bool SourcePetCaptured = false;
+    EquipmentRollbackPlan EquipmentRollback;
+    std::vector<uint8> SnapshotPayload;
+    SystemTimePoint Deadline = SystemTimePoint::clock::now();
 };
 
 struct PlayerRuntime
@@ -71,6 +106,10 @@ struct PlayerRuntime
     bool PersistSwitchTarget = false;
     StoredClassProfile PersistTargetProfile;
     PendingSwitch Pending;
+    uint64 LastCompletedRevision = 0;
+    uint64 LastCompletedDigest = 0;
+    uint8 LastCompletedClass = 0;
+    uint8 LastRequestedClass = 0;
     std::deque<SystemTimePoint> RequestTimes;
     std::vector<ActiveClassCooldown> SharedCooldowns;
 };
@@ -122,6 +161,21 @@ uint32 SkillBonusIndex(uint8 position)
 {
     return SkillInfoIndex(position) + 2;
 }
+
+bool IsLanguageSkillId(uint32 skillId)
+{
+    SkillLineEntry const* skill = sSkillLineStore.LookupEntry(skillId);
+    return skill && skill->CategoryID == SKILL_CATEGORY_LANGUAGES;
+}
+
+bool IsLanguageSpellId(uint32 spellId)
+{
+    SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+    for (auto itr = bounds.first; itr != bounds.second; ++itr)
+        if (IsLanguageSkillId(itr->second->SkillLine))
+            return true;
+    return false;
+}
 }
 
 class ClassSwitchManager
@@ -162,6 +216,7 @@ public:
         if (runtime.Session != session)
             runtime = {};
         runtime.Session = session;
+        runtime.LastRequestedClass = classId;
         if (protocolVersion != REQUEST_PROTOCOL_VERSION)
             return Reject(player, runtime, RequestResult::UnsupportedProtocol,
                 "unsupported class-switch protocol version", error);
@@ -169,8 +224,8 @@ public:
         {
             if (error && error->empty())
                 *error = "class-switch definitions are unavailable";
-            SendState(player, StatusStage::Rejected, RequestResult::StorageFailure, runtime);
-            return RequestResult::StorageFailure;
+            return Reject(player, runtime, RequestResult::StorageFailure,
+                error ? *error : "class-switch definitions are unavailable", error);
         }
         if (requestType == static_cast<uint8>(RequestType::State))
         {
@@ -249,9 +304,12 @@ public:
             return Reject(player, runtime, RequestResult::StorageFailure,
                 "class-switch revision space is exhausted", error);
         runtime.ActiveRevision = active.Revision;
+        runtime.Pending.Phase = TransitionPhase::AwaitingSpellCast;
+        runtime.Pending.SourceClass = active.ClassId;
         runtime.Pending.TargetClass = classId;
         runtime.Pending.BaseRevision = revision;
         runtime.Pending.TargetRevision = reservedRevision;
+        runtime.Pending.Deadline = SystemTimePoint::clock::now() + CLIENT_RESPONSE_TIMEOUT;
         SendState(player, StatusStage::Accepted, RequestResult::Ok, runtime,
             false, runtime.Pending.TargetRevision);
         return RequestResult::Ok;
@@ -273,7 +331,6 @@ public:
             SetError(error, "class switch has no selected target");
             return false;
         }
-        PlayerRuntime const rollbackRuntime = runtime;
         char const* readinessError = nullptr;
         if (!IsReady(player, true, &readinessError))
             return RejectSpell(player, runtime, RequestResult::NotReady,
@@ -331,25 +388,29 @@ public:
         target.Revision = targetRevision;
         target.NextLevelXp = sObjectMgr->GetXPForLevel(target.Level);
 
+        CaptureSourcePet(player, runtime.Pending);
+        runtime.Pending.SourceProfile = source;
+        runtime.Pending.TargetProfile = target;
+        runtime.Pending.ExpectedClass = target.ClassId;
+        player->m_classSwitchTransitionPending.store(true, std::memory_order_release);
         SendState(player, StatusStage::CommitBegin, RequestResult::Ok, runtime,
             false, targetRevision, source.ClassId);
-        if (!ApplyProfile(player, target, error))
+
+        auto recoverPreSnapshotFailure = [&](std::string const& message) {
+            if (error)
+                *error = message;
+            TC_LOG_ERROR("entities.player.classswitch",
+                "Player {} class-switch failed after CommitBegin; entering authoritative source recovery: {}",
+                player->GetGUID().ToString(), message);
+            BeginSourceRecovery(player, runtime, message);
+            return false;
+        };
+        if (!ApplyProfile(player, target, error, true,
+            &runtime.Pending.EquipmentRollback))
         {
-            if (error && error->empty())
-                *error = "failed to apply the target class profile";
-            std::string restoreError;
-            if (!ApplyProfile(player, source, &restoreError))
-            {
-                TC_LOG_ERROR("entities.player.classswitch",
-                    "Player {} could not restore source profile after target application failure: {}",
-                    player->GetGUID().ToString(), restoreError);
-                player->GetSession()->KickPlayer("Class-switch rollback failed");
-                return false;
-            }
-            NormalizeInMemoryAfterRollback(player);
-            runtime = rollbackRuntime;
-            return RejectSpell(player, runtime, RequestResult::StorageFailure,
-                error ? *error : "failed to apply the target class profile", error);
+            return recoverPreSnapshotFailure(
+                error && !error->empty()
+                    ? *error : "failed to apply the target class profile");
         }
 
         runtime.ActiveRevision = targetRevision;
@@ -359,39 +420,15 @@ public:
         StoredClassProfile appliedTarget;
         if (!CaptureProfile(player, &appliedTarget, error, targetRevision, false, &target))
         {
-            if (error && error->empty())
-                *error = "failed to capture the applied class profile";
-            std::string restoreError;
-            if (!ApplyProfile(player, source, &restoreError))
-            {
-                TC_LOG_ERROR("entities.player.classswitch",
-                    "Player {} could not restore source profile after preflight failure: {}",
-                    player->GetGUID().ToString(), restoreError);
-                player->GetSession()->KickPlayer("Class-switch rollback failed");
-                return false;
-            }
-            NormalizeInMemoryAfterRollback(player);
-            runtime = rollbackRuntime;
-            return RejectSpell(player, runtime, RequestResult::StorageFailure,
-                error ? *error : "failed to capture the applied class profile", error);
+            return recoverPreSnapshotFailure(
+                error && !error->empty()
+                    ? *error : "failed to capture the applied class profile");
         }
         if (!ValidateTargetProfile(player, *definition, appliedTarget, error))
         {
-            if (error && error->empty())
-                *error = "the applied class profile is not valid for the target class";
-            std::string restoreError;
-            if (!ApplyProfile(player, source, &restoreError))
-            {
-                TC_LOG_ERROR("entities.player.classswitch",
-                    "Player {} could not restore source profile after applied-profile validation failure: {}",
-                    player->GetGUID().ToString(), restoreError);
-                player->GetSession()->KickPlayer("Class-switch rollback failed");
-                return false;
-            }
-            NormalizeInMemoryAfterRollback(player);
-            runtime = rollbackRuntime;
-            return RejectSpell(player, runtime, RequestResult::StorageFailure,
-                error ? *error : "the applied class profile is not valid for the target class", error);
+            return recoverPreSnapshotFailure(
+                error && !error->empty()
+                    ? *error : "the applied class profile is not valid for the target class");
         }
         appliedTarget.Revision = targetRevision;
         runtime.PersistTargetProfile = appliedTarget;
@@ -401,53 +438,23 @@ public:
         if (!BuildSnapshot(player, appliedTarget, runtime, &snapshot, error) ||
             (encodedSnapshot = EncodeActiveClassSnapshot(snapshot)).empty())
         {
-            if (error && error->empty())
-                *error = "the target class snapshot is not representable";
-            std::string restoreError;
-            if (!ApplyProfile(player, source, &restoreError))
-            {
-                TC_LOG_ERROR("entities.player.classswitch",
-                    "Player {} could not restore source profile after snapshot preflight failure: {}",
-                    player->GetGUID().ToString(), restoreError);
-                player->GetSession()->KickPlayer("Class-switch rollback failed");
-                return false;
-            }
-            NormalizeInMemoryAfterRollback(player);
-            runtime = rollbackRuntime;
-            return RejectSpell(player, runtime, RequestResult::StorageFailure,
-                error ? *error : "the target class snapshot is not representable", error);
+            return recoverPreSnapshotFailure(
+                error && !error->empty()
+                    ? *error : "the target class snapshot is not representable");
         }
 
-        CharacterDatabaseTransaction transaction = CharacterDatabase.BeginTransaction();
-        bool assembled = AppendStoredProfileToTransaction(transaction, player, source, error) &&
-            player->SaveToDB(transaction, false);
         runtime.PersistSwitchTarget = false;
-        bool committed = false;
-        if (assembled)
-        {
-            TransactionCallback callback = CharacterDatabase.AsyncCommitTransaction(transaction);
-            committed = callback.m_future.get();
-        }
-        if (!assembled || !committed)
-        {
-            if (error && error->empty())
-                *error = "the class-switch transaction could not be committed";
-            std::string restoreError;
-            if (!ApplyProfile(player, source, &restoreError))
-            {
-                TC_LOG_ERROR("entities.player.classswitch",
-                    "Player {} could not restore source profile after transaction failure: {}",
-                    player->GetGUID().ToString(), restoreError);
-                player->GetSession()->KickPlayer("Class-switch rollback failed");
-                return false;
-            }
-            NormalizeInMemoryAfterRollback(player);
-            runtime = rollbackRuntime;
-            return RejectSpell(player, runtime, RequestResult::StorageFailure,
-                error ? *error : "the class-switch transaction could not be committed", error);
-        }
+        runtime.Pending.Phase = TransitionPhase::AwaitingInitialAcceptance;
+        runtime.Pending.SourceClass = source.ClassId;
+        runtime.Pending.ExpectedClass = appliedTarget.ClassId;
+        runtime.Pending.TargetRevision = targetRevision;
+        runtime.Pending.SourceProfile = source;
+        runtime.Pending.TargetProfile = appliedTarget;
+        runtime.Pending.SnapshotPayload = encodedSnapshot;
+        runtime.Pending.SnapshotDigest =
+            ComputeFnv1a64(encodedSnapshot.data(), encodedSnapshot.size());
+        runtime.Pending.Deadline = SystemTimePoint::clock::now() + CLIENT_RESPONSE_TIMEOUT;
 
-        runtime.ActiveRevision = targetRevision;
         player->SendProficiency(ITEM_CLASS_WEAPON, player->m_WeaponProficiency);
         player->SendProficiency(ITEM_CLASS_ARMOR, player->m_ArmorProficiency);
         player->SendInitialSpells();
@@ -455,24 +462,187 @@ public:
         player->SendInitialActionButtons();
         player->UpdateObjectVisibility();
         player->SendUpdateToPlayer(player);
-        sCharacterCache->UpdateCharacterClass(player->GetGUID(), player->GetClass());
-        sCharacterCache->UpdateCharacterLevel(player->GetGUID(), player->GetLevel());
         SendCustomPacket(player, SERVER_SNAPSHOT_OPCODE, encodedSnapshot);
-        runtime.Pending = {};
-        SendState(player, StatusStage::Confirmed, RequestResult::Ok, runtime,
-            false, targetRevision, player->GetClass());
+        return true;
+    }
+
+    bool HandleClientResponse(Player* player, uint8 const* payload, size_t size,
+        std::string* error)
+    {
+        ClientClassSwitchResponse response;
+        std::string decodeError;
+        if (!DecodeClientClassSwitchResponse(payload, size, &response, &decodeError))
+        {
+            if (error)
+                *error = decodeError;
+            if (player && player->GetSession())
+            {
+                PlayerRuntime& runtime = _players[player->GetGUID().GetCounter()];
+                if (runtime.Pending.Phase == TransitionPhase::AwaitingInitialAcceptance ||
+                    runtime.Pending.Phase == TransitionPhase::RecoveringSource)
+                    BeginSourceRecovery(player, runtime,
+                        "malformed client class-switch response: " + decodeError);
+            }
+            return false;
+        }
+
+        if (!player || !player->GetSession())
+            return SetError(error, "client response has no active player session");
+        uint64 const session = player->GetSession()->GetActiveClassSessionTag();
+        if (!session || response.Session != session)
+        {
+            TC_LOG_WARN("entities.player.classswitch",
+                "Ignoring class-switch client response with a stale session for player {}",
+                player->GetGUID().ToString());
+            return SetError(error, "client response session is stale");
+        }
+
+        PlayerRuntime& runtime = _players[player->GetGUID().GetCounter()];
+        if (response.Disposition == ClientResponseDisposition::Accepted &&
+            response.Revision == runtime.LastCompletedRevision &&
+            response.ClassId == runtime.LastCompletedClass &&
+            response.SnapshotDigest == runtime.LastCompletedDigest)
+        {
+            SendState(player, StatusStage::Confirmed, RequestResult::Ok, runtime,
+                false, response.Revision, response.ClassId);
+            return true;
+        }
+
+        PendingSwitch& pending = runtime.Pending;
+        if (pending.Phase != TransitionPhase::AwaitingInitialAcceptance &&
+            pending.Phase != TransitionPhase::RecoveringSource)
+            return SetError(error, "no class-switch snapshot is awaiting a client response");
+
+        ClientResponseMatch const match = MatchClientClassSwitchResponse(
+            response, session, pending.ExpectedClass, pending.TargetRevision,
+            pending.SnapshotDigest, pending.SourceClass,
+            pending.SourceProfile.Revision, runtime.LastCompletedClass,
+            runtime.LastCompletedRevision, runtime.LastCompletedDigest);
+        if (match == ClientResponseMatch::StaleOrMismatched)
+        {
+            TC_LOG_WARN("entities.player.classswitch",
+                "Ignoring stale class-switch response for player {}: class={} revision={} digest={} expected_class={} expected_revision={} expected_digest={}",
+                player->GetGUID().ToString(), uint32(response.ClassId), response.Revision,
+                response.SnapshotDigest, uint32(pending.ExpectedClass), pending.TargetRevision,
+                pending.SnapshotDigest);
+            return SetError(error, "client response does not match the pending class-switch snapshot");
+        }
+
+        if (match == ClientResponseMatch::DuplicateAccepted)
+        {
+            SendState(player, StatusStage::Confirmed, RequestResult::Ok, runtime,
+                false, response.Revision, response.ClassId);
+            return true;
+        }
+        if (match == ClientResponseMatch::ResyncRequested)
+        {
+            BeginSourceRecovery(player, runtime,
+                response.Reason.empty() ? "client requested class state resync" : response.Reason);
+            return true;
+        }
+        if (match == ClientResponseMatch::Accepted)
+        {
+            if (pending.Phase == TransitionPhase::AwaitingInitialAcceptance)
+                return CommitAcceptedTarget(player, runtime, error);
+            return CompleteSourceRecovery(player, runtime, error);
+        }
+
+        std::string const rejection = response.Reason.empty()
+            ? "client rejected the class-switch snapshot without a reason"
+            : "client rejected the class-switch snapshot: " + response.Reason;
+        if (error)
+            *error = rejection;
+        BeginSourceRecovery(player, runtime, rejection);
+        return false;
+    }
+
+    void Update(Player* player)
+    {
+        if (!player || !player->GetSession())
+            return;
+        auto runtimeItr = _players.find(player->GetGUID().GetCounter());
+        if (runtimeItr == _players.end())
+            return;
+        PlayerRuntime& runtime = runtimeItr->second;
+        PendingSwitch& pending = runtime.Pending;
+        if (pending.Phase == TransitionPhase::AwaitingSpellCast &&
+            SystemTimePoint::clock::now() >= pending.Deadline)
+        {
+            runtime.Pending = {};
+            SendState(player, StatusStage::Rejected, RequestResult::NotReady, runtime);
+            TC_LOG_WARN("entities.player.classswitch",
+                "Player {} class-switch cast was not started before the pending deadline",
+                player->GetGUID().ToString());
+            return;
+        }
+        if ((pending.Phase != TransitionPhase::AwaitingInitialAcceptance &&
+             pending.Phase != TransitionPhase::RecoveringSource) ||
+            SystemTimePoint::clock::now() < pending.Deadline)
+            return;
+
+        ClientTimeoutAction const action = EvaluateClassSwitchTimeout(
+            true, pending.Phase == TransitionPhase::RecoveringSource, true,
+            pending.RecoveryAttempts);
+        if (action == ClientTimeoutAction::RecoverSource)
+            BeginSourceRecovery(player, runtime,
+                "client did not acknowledge the class-switch snapshot within 10 seconds");
+        else if (action == ClientTimeoutAction::Disconnect)
+            player->GetSession()->KickPlayer(
+                "Class-switch source recovery was not acknowledged within 10 seconds; durable source state was preserved");
+    }
+
+    bool IsPending(Player* player)
+    {
+        return player && player->m_classSwitchTransitionPending.load(std::memory_order_acquire);
+    }
+
+    bool CancelOnLogout(Player* player)
+    {
+        if (!player)
+            return false;
+        auto itr = _players.find(player->GetGUID().GetCounter());
+        if (itr == _players.end())
+        {
+            player->m_classSwitchTransitionPending.store(false, std::memory_order_release);
+            return true;
+        }
+        PlayerRuntime& runtime = itr->second;
+        if (runtime.Pending.Phase == TransitionPhase::AwaitingInitialAcceptance ||
+            runtime.Pending.Phase == TransitionPhase::RecoveringSource)
+        {
+            std::string restoreError;
+            if (!ApplyProfile(player, runtime.Pending.SourceProfile, &restoreError,
+                false, nullptr, runtime.Pending.EquipmentRollback.Prepared
+                    ? &runtime.Pending.EquipmentRollback : nullptr))
+            {
+                TC_LOG_ERROR("entities.player.classswitch",
+                    "Player {} could not restore source state during logout: {}",
+                    player->GetGUID().ToString(), restoreError);
+                runtime.Pending.Phase = TransitionPhase::RecoveryFailed;
+                player->m_classSwitchTransitionPending.store(true, std::memory_order_release);
+                return false;
+            }
+            else
+            {
+                RestoreSourcePet(player, runtime.Pending);
+                NormalizeInMemoryAfterProfileWrite(player);
+            }
+        }
+        player->m_classSwitchTransitionPending.store(false, std::memory_order_release);
+        _players.erase(itr);
         return true;
     }
 
     bool ValidateSnapshotActionPreflight(StoredClassProfile const& source,
-        StoredClassProfile const& target, std::string* error)
+        StoredClassProfile& target, std::string* error)
     {
+        (void)error;
         std::set<uint32> provenClientActions;
         for (uint32 action : source.Groups[source.ActiveSpec].Actions)
             if (action)
                 provenClientActions.insert(action);
 
-        for (uint32 action : target.Groups[target.ActiveSpec].Actions)
+        for (uint32& action : target.Groups[target.ActiveSpec].Actions)
         {
             if (!action)
                 continue;
@@ -483,21 +653,21 @@ public:
                 case ACTION_BUTTON_SPELL:
                     break;
                 case ACTION_BUTTON_C:
-                    return SetError(error,
-                        "target bar contains a pet/command action while class-switch snapshots are no-pet");
+                    action = 0;
+                    break;
                 case ACTION_BUTTON_EQSET:
                 case ACTION_BUTTON_MACRO:
                 case ACTION_BUTTON_CMACRO:
                     if (provenClientActions.find(action) == provenClientActions.end())
-                        return SetError(error,
-                            "target bar contains a client-managed macro or equipment set not proven by the current bar");
+                        action = 0;
                     break;
                 case ACTION_BUTTON_ITEM:
                     if (!sObjectMgr->GetItemTemplate(actionId))
-                        return SetError(error, "target bar references an unknown item");
+                        action = 0;
                     break;
                 default:
-                    return SetError(error, "target bar contains an unsupported action type");
+                    action = 0;
+                    break;
             }
         }
         return true;
@@ -512,6 +682,8 @@ public:
             targetSpells.insert(spell.Id);
         for (SpellProfile const& spell : source.Spells)
         {
+            if (IsLanguageSpellId(spell.Id))
+                continue;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.Id);
             if (!info || !IsSpellAllowedForClassProfile(
                 info->SpellFamilyName, targetFamily, info->IsProfessionOrRiding()))
@@ -538,6 +710,8 @@ public:
 
         for (SkillProfile const& sourceSkill : source.Skills)
         {
+            if (IsLanguageSkillId(sourceSkill.Id))
+                continue;
             if (!sourceSkill.Shared)
                 continue;
             auto targetSkill = std::find_if(target.Skills.begin(), target.Skills.end(),
@@ -672,13 +846,195 @@ public:
     }
 
 private:
+    bool CommitAcceptedTarget(Player* player, PlayerRuntime& runtime, std::string* error)
+    {
+        PendingSwitch const& pending = runtime.Pending;
+        CharacterDatabaseTransaction transaction = CharacterDatabase.BeginTransaction();
+        bool assembled = AppendProfileBackingTables(
+            transaction, player, pending.TargetProfile, error) &&
+            AppendStoredProfileToTransaction(
+                transaction, player, pending.SourceProfile, error) &&
+            AppendStoredProfileToTransaction(
+                transaction, player, pending.TargetProfile, error);
+        if (assembled)
+            AppendSourcePetDetachment(transaction, player, pending);
+        if (assembled)
+            assembled = player->SaveToDB(
+                transaction, false, false, false, false, true);
+
+        bool committed = false;
+        if (assembled)
+        {
+            TransactionCallback callback = CharacterDatabase.AsyncCommitTransaction(transaction);
+            committed = callback.m_future.get();
+        }
+        if (!assembled || !committed)
+        {
+            std::string persistenceError = error && !error->empty()
+                ? *error : "the class-switch transaction could not be committed";
+            BeginSourceRecovery(player, runtime, persistenceError);
+            if (error)
+                *error = persistenceError;
+            return false;
+        }
+
+        FinalizeSourcePetDetachment(player, pending);
+        uint64 const revision = pending.TargetRevision;
+        uint8 const classId = pending.ExpectedClass;
+        uint64 const digest = pending.SnapshotDigest;
+        NormalizeInMemoryAfterProfileWrite(player);
+        runtime.ActiveRevision = revision;
+        runtime.LastCompletedRevision = revision;
+        runtime.LastCompletedDigest = digest;
+        runtime.LastCompletedClass = classId;
+        runtime.Pending = {};
+        player->m_classSwitchTransitionPending.store(false, std::memory_order_release);
+        sCharacterCache->UpdateCharacterClass(player->GetGUID(), classId);
+        sCharacterCache->UpdateCharacterLevel(player->GetGUID(), player->GetLevel());
+        SendState(player, StatusStage::Confirmed, RequestResult::Ok, runtime,
+            false, revision, classId);
+        TC_LOG_INFO("entities.player.classswitch",
+            "Player {} class-switch committed after client acceptance: class={} revision={} digest={}",
+            player->GetGUID().ToString(), uint32(classId), revision, digest);
+        return true;
+    }
+
+    void BeginSourceRecovery(Player* player, PlayerRuntime& runtime,
+        std::string const& reason)
+    {
+        PendingSwitch& pending = runtime.Pending;
+        if (pending.RecoveryAttempts >= MAX_CLASS_SWITCH_RECOVERY_ATTEMPTS)
+        {
+            TC_LOG_ERROR("entities.player.classswitch",
+                "Player {} exhausted class-switch recovery attempts: {}",
+                player->GetGUID().ToString(), reason);
+            player->GetSession()->KickPlayer(
+                "Class-switch source recovery failed: " + reason
+                + "; durable source state was preserved");
+            return;
+        }
+        ++pending.RecoveryAttempts;
+        pending.Phase = TransitionPhase::RecoveringSource;
+        runtime.PersistSwitchTarget = false;
+        runtime.PersistTargetProfile = {};
+
+        StoredClassProfile source = pending.SourceProfile;
+        std::string recoveryError;
+        if (!ApplyProfile(player, source, &recoveryError, false, nullptr,
+            pending.EquipmentRollback.Prepared
+                ? &pending.EquipmentRollback : nullptr))
+        {
+            TC_LOG_ERROR("entities.player.classswitch",
+                "Player {} could not restore source profile after {}: {}",
+                player->GetGUID().ToString(), reason, recoveryError);
+            player->GetSession()->KickPlayer(
+                "Class-switch source restore failed: " + recoveryError);
+            return;
+        }
+        RestoreSourcePet(player, pending);
+        NormalizeInMemoryAfterProfileWrite(player);
+
+        uint64 recoveryRevision = 0;
+        if (!ReserveTransitionRevision(
+            pending.TargetRevision, source.Revision, &recoveryRevision))
+        {
+            player->GetSession()->KickPlayer(
+                "Class-switch recovery revision space is exhausted");
+            return;
+        }
+        source.Revision = recoveryRevision;
+        runtime.ActiveRevision = recoveryRevision;
+
+        ActiveClassSnapshot snapshot;
+        std::vector<uint8> encodedSnapshot;
+        if (!BuildSnapshot(player, source, runtime, &snapshot, &recoveryError) ||
+            (encodedSnapshot = EncodeActiveClassSnapshot(snapshot)).empty())
+        {
+            player->GetSession()->KickPlayer(
+                "Class-switch source recovery snapshot could not be built: " + recoveryError);
+            return;
+        }
+
+        CharacterDatabaseTransaction transaction = CharacterDatabase.BeginTransaction();
+        bool assembled = AppendProfileBackingTables(
+            transaction, player, source, &recoveryError) &&
+            AppendStoredProfileToTransaction(transaction, player, source, &recoveryError);
+        if (assembled)
+            assembled = player->SaveToDB(
+                transaction, false, false, false, false, true);
+        bool committed = false;
+        if (assembled)
+        {
+            TransactionCallback callback = CharacterDatabase.AsyncCommitTransaction(transaction);
+            committed = callback.m_future.get();
+        }
+        if (!assembled || !committed)
+        {
+            player->GetSession()->KickPlayer(
+                "Class-switch source recovery persistence failed: " + recoveryError);
+            return;
+        }
+
+        pending.SourceProfile = source;
+        pending.ExpectedClass = source.ClassId;
+        pending.TargetRevision = recoveryRevision;
+        pending.RecoveryRevision = recoveryRevision;
+        pending.SnapshotPayload = encodedSnapshot;
+        pending.SnapshotDigest =
+            ComputeFnv1a64(encodedSnapshot.data(), encodedSnapshot.size());
+        pending.Deadline = SystemTimePoint::clock::now() + CLIENT_RESPONSE_TIMEOUT;
+
+        TC_LOG_ERROR("entities.player.classswitch",
+            "Player {} entered bounded source recovery after {}; recovery_revision={} digest={}",
+            player->GetGUID().ToString(), reason, recoveryRevision, pending.SnapshotDigest);
+        SendState(player, StatusStage::CommitBegin, RequestResult::Ok, runtime,
+            false, recoveryRevision, source.ClassId);
+        player->SendProficiency(ITEM_CLASS_WEAPON, player->m_WeaponProficiency);
+        player->SendProficiency(ITEM_CLASS_ARMOR, player->m_ArmorProficiency);
+        player->SendInitialSpells();
+        player->SendUnlearnSpells();
+        player->SendInitialActionButtons();
+        player->UpdateObjectVisibility();
+        player->SendUpdateToPlayer(player);
+        SendCustomPacket(player, SERVER_SNAPSHOT_OPCODE, encodedSnapshot);
+    }
+
+    bool CompleteSourceRecovery(Player* player, PlayerRuntime& runtime, std::string* error)
+    {
+        PendingSwitch const& pending = runtime.Pending;
+        if (pending.Phase != TransitionPhase::RecoveringSource)
+            return SetError(error, "class-switch response is not for source recovery");
+
+        uint64 const revision = pending.RecoveryRevision;
+        uint8 const classId = pending.ExpectedClass;
+        runtime.ActiveRevision = revision;
+        runtime.LastCompletedRevision = revision;
+        runtime.LastCompletedDigest = pending.SnapshotDigest;
+        runtime.LastCompletedClass = classId;
+        runtime.Pending = {};
+        player->m_classSwitchTransitionPending.store(false, std::memory_order_release);
+        sCharacterCache->UpdateCharacterClass(player->GetGUID(), classId);
+        sCharacterCache->UpdateCharacterLevel(player->GetGUID(), player->GetLevel());
+        SendState(player, StatusStage::Confirmed, RequestResult::Ok, runtime,
+            false, revision, classId);
+        TC_LOG_INFO("entities.player.classswitch",
+            "Player {} source recovery confirmed by client: class={} revision={}",
+            player->GetGUID().ToString(), uint32(classId), revision);
+        return true;
+    }
+
     bool AppendProfileBackingTables(CharacterDatabaseTransaction const& transaction, Player* player,
         StoredClassProfile const& profile, std::string* error)
     {
         if (!transaction)
             return SetError(error, "class profile transaction is missing");
+        LanguageEntryIds const languageIds = CollectLanguageEntryIds(player, &profile);
+        std::vector<uint32> languageSpells(
+            languageIds.Spells.begin(), languageIds.Spells.end());
+        std::vector<uint32> languageSkills(
+            languageIds.Skills.begin(), languageIds.Skills.end());
         for (std::string const& statement : BuildProfileBackingTableStatements(
-            player->GetGUID().GetCounter(), profile))
+            player->GetGUID().GetCounter(), profile, languageSpells, languageSkills))
             transaction->Append(statement.c_str());
         return true;
     }
@@ -701,6 +1057,11 @@ private:
         std::string* output)
     {
         SetError(output, result, error.c_str());
+        TC_LOG_WARN("entities.player.classswitch",
+            "Player {} class-switch selection rejected: requested_class={} result={} error={}",
+            player ? player->GetGUID().ToString() : std::string("unknown"),
+            uint32(runtime.LastRequestedClass),
+            uint32(result), error);
         SendState(player, StatusStage::Rejected, result, runtime);
         return result;
     }
@@ -709,6 +1070,8 @@ private:
         std::string const& message, std::string* output)
     {
         runtime.Pending = {};
+        if (player)
+            player->m_classSwitchTransitionPending.store(false, std::memory_order_release);
         SendState(player, StatusStage::Rejected, result, runtime);
         TC_LOG_ERROR("entities.player.classswitch",
             "Player {} class-switch spell rejected: result={} error={}",
@@ -723,6 +1086,71 @@ private:
     {
         auto itr = _definitions.find(classId);
         return itr == _definitions.end() ? nullptr : &itr->second;
+    }
+
+    LanguageEntryIds CollectLanguageEntryIds(Player* player,
+        StoredClassProfile const* profile = nullptr) const
+    {
+        LanguageEntryIds ids;
+        GetLanguageDescByID(LANG_UNIVERSAL);
+        for (LanguageDesc const& language : lang_description)
+        {
+            if (language.spell_id)
+                ids.Spells.insert(language.spell_id);
+            if (language.skill_id)
+                ids.Skills.insert(language.skill_id);
+        }
+        if (player)
+        {
+            for (auto const& [spellId, spell] : player->m_spells)
+                if (spell.state != PLAYERSPELL_REMOVED && IsLanguageSpellId(spellId))
+                    ids.Spells.insert(spellId);
+            for (auto const& [skillId, status] : player->mSkillStatus)
+                if (status.uState != SKILL_DELETED && IsLanguageSkillId(skillId))
+                    ids.Skills.insert(skillId);
+        }
+        if (profile)
+        {
+            for (SpellProfile const& spell : profile->Spells)
+                if (IsLanguageSpellId(spell.Id))
+                    ids.Spells.insert(spell.Id);
+            for (SkillProfile const& skill : profile->Skills)
+                if (IsLanguageSkillId(skill.Id))
+                    ids.Skills.insert(skill.Id);
+        }
+        return ids;
+    }
+
+    CharacterLanguageState CaptureCharacterLanguages(Player* player) const
+    {
+        CharacterLanguageState captured;
+        LanguageEntryIds const languageIds = CollectLanguageEntryIds(player);
+        for (auto const& [spellId, spell] : player->m_spells)
+        {
+            if (spell.state == PLAYERSPELL_REMOVED ||
+                languageIds.Spells.find(spellId) == languageIds.Spells.end())
+                continue;
+            captured.Spells.push_back({ spellId, spell.state, spell.active,
+                spell.dependent, spell.disabled });
+        }
+        for (auto const& [skillId, status] : player->mSkillStatus)
+        {
+            if (status.uState == SKILL_DELETED ||
+                languageIds.Skills.find(skillId) == languageIds.Skills.end())
+                continue;
+            uint32 const valueData = player->GetUInt32Value(SkillValueIndex(status.pos));
+            uint32 const bonusData = player->GetUInt32Value(SkillBonusIndex(status.pos));
+            captured.Skills.push_back({
+                skillId,
+                uint16(PAIR32_HIPART(player->GetUInt32Value(SkillInfoIndex(status.pos)))),
+                uint16(PAIR32_LOPART(valueData)),
+                uint16(PAIR32_HIPART(valueData)),
+                int16(PAIR32_LOPART(bonusData)),
+                int16(PAIR32_HIPART(bonusData)),
+                true
+            });
+        }
+        return captured;
     }
 
     bool EnsureDefinitions(std::string* error = nullptr)
@@ -793,6 +1221,10 @@ private:
 
     bool ValidateDefinition(RuntimeClassDefinition& definition, std::string* error)
     {
+        definition.Definition.InitialLevel = ResolveClassStartLevel(
+            definition.Definition.ClassId, definition.Definition.InitialLevel,
+            uint8(sWorld->getIntConfig(CONFIG_START_PLAYER_LEVEL)),
+            uint8(sWorld->getIntConfig(CONFIG_START_DEATH_KNIGHT_PLAYER_LEVEL)));
         ClassDefinition const& def = definition.Definition;
         if (!IsSupportedClassId(def.ClassId))
             return SetError(error, "class ID must be between 1 and 32");
@@ -1031,6 +1463,33 @@ private:
             SetError(error, "class profile row contains a different class ID");
             return ProfileLoadStatus::Corrupt;
         }
+        LanguageEntryIds const languageIds = CollectLanguageEntryIds(player, profile);
+        uint32 removedLanguageSpells = 0;
+        uint32 removedLanguageSkills = 0;
+        StripClassOwnedLanguages(profile, languageIds.Spells, languageIds.Skills,
+            &removedLanguageSpells, &removedLanguageSkills);
+        if (removedLanguageSpells || removedLanguageSkills)
+        {
+            TC_LOG_WARN("entities.player.classswitch",
+                "Player {} ignored {} language spells and {} language skills stored in class {} profile; character language state remains authoritative",
+                player->GetGUID().ToString(), removedLanguageSpells,
+                removedLanguageSkills, uint32(classId));
+        }
+        if (profile->EquipmentMigrated && classId == player->GetClass())
+        {
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            {
+                if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                {
+                    StoredEquipmentItem& equipment = profile->Equipment[slot];
+                    equipment.ItemId = item->GetEntry();
+                    equipment.Enchantments[0] = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);
+                    equipment.Enchantments[1] = item->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+                    equipment.EquippedGuid = item->GetGUID().GetRawValue();
+                }
+            }
+            profile->EquipmentMigrated = false;
+        }
         uint32 repaired = 0;
         if (!RepairActionSpells(player, profile, &repaired, error) ||
             !ValidateStoredProfile(*profile, error))
@@ -1047,7 +1506,18 @@ private:
     {
         ProfileLoadStatus loadStatus = LoadProfile(player, classId, profile, error);
         if (loadStatus == ProfileLoadStatus::Loaded)
+        {
+            if (profile->EquipmentMigrated)
+            {
+                // Legacy profiles did not store a loadout. Treat the visible
+                // source gear as the migration candidate so selecting an old
+                // class does not silently strip gear. Target compatibility is
+                // validated immediately after loading.
+                profile->Equipment = sharedSource.Equipment;
+                profile->EquipmentMigrated = false;
+            }
             return true;
+        }
         if (loadStatus != ProfileLoadStatus::Missing)
             return false;
         if (classId != player->GetClass())
@@ -1120,6 +1590,8 @@ private:
         // Shared classless spells, professions, riding, and known mounts remain available.
         for (SpellProfile const& spell : source.Spells)
         {
+            if (IsLanguageSpellId(spell.Id))
+                continue;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.Id);
             if (info && (!info->SpellFamilyName || info->IsProfessionOrRiding()))
                 spellIds.insert(spell.Id);
@@ -1147,6 +1619,8 @@ private:
         }
         for (SkillProfile const& skill : source.Skills)
         {
+            if (IsLanguageSkillId(skill.Id))
+                continue;
             if (!skill.Shared)
                 continue;
             auto itr = std::find_if(created.Skills.begin(), created.Skills.end(),
@@ -1185,6 +1659,13 @@ private:
         uint32 repaired = 0;
         if (!RepairActionSpells(player, &created, &repaired, error))
             return false;
+        if (!ValidateStoredProfile(created, error))
+        {
+            if (error)
+                *error = "starter profile for class " + std::to_string(classId)
+                    + " is invalid: " + *error;
+            return false;
+        }
         *profile = std::move(created);
         return true;
     }
@@ -1219,6 +1700,21 @@ private:
         }
     }
 
+    bool IsExplicitClassStarterSpell(Player* player, uint8 classId, uint32 spellId)
+    {
+        PlayerInfo const* createInfo = sObjectMgr->GetPlayerInfo(player->GetRace(), classId);
+        if (!createInfo)
+            return false;
+        if (std::find(createInfo->customSpells.begin(), createInfo->customSpells.end(), spellId)
+            != createInfo->customSpells.end())
+            return true;
+        for (PlayerCreateInfoAction const& action : createInfo->action)
+            if (action.type == ACTION_BUTTON_SPELL && action.action == spellId)
+                return true;
+        std::vector<uint32> classActions = sObjectMgr->GetClassCreateActionSpells(classId);
+        return std::find(classActions.begin(), classActions.end(), spellId) != classActions.end();
+    }
+
     bool RepairActionSpells(Player* player, StoredClassProfile* profile,
         uint32* repaired, std::string* error)
     {
@@ -1228,9 +1724,10 @@ private:
         if (!classEntry)
             return SetError(error, "stored profile class entry is missing");
 
-        std::set<uint32> spellIds;
-        for (SpellProfile const& spell : profile->Spells)
-            spellIds.insert(spell.Id);
+        std::set<uint32> activeActionRanks;
+        for (SpellProfile const& known : profile->Spells)
+            if (known.Active && !known.Disabled)
+                activeActionRanks.insert(known.Id);
 
         for (uint8 group = 0; group < profile->SpecCount; ++group)
         {
@@ -1238,12 +1735,17 @@ private:
             {
                 uint32 const spellId = packed & 0x00FFFFFFu;
                 uint8 const type = uint8(packed >> 24);
-                if (!spellId || type != ACTION_BUTTON_SPELL || spellIds.count(spellId))
+                if (!spellId || type != ACTION_BUTTON_SPELL)
                     continue;
 
                 SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
                 if (!spell)
-                    return SetError(error, "stored action references a missing spell");
+                {
+                    packed = 0;
+                    if (repaired)
+                        ++*repaired;
+                    continue;
+                }
                 if (spell->SpellFamilyName &&
                     spell->SpellFamilyName != classEntry->SpellClassSet)
                 {
@@ -1252,10 +1754,37 @@ private:
                         ++*repaired;
                     continue;
                 }
+
+                std::vector<uint32> spellChain;
+                uint32 const firstRank = sSpellMgr->GetFirstSpellInChain(spellId);
+                for (uint32 candidate = firstRank; candidate; candidate =
+                    sSpellMgr->GetNextSpellInChain(candidate))
+                    spellChain.push_back(candidate);
+                uint32 const activeRank =
+                    NormalizeActionSpellRank(spellId, spellChain, activeActionRanks);
+                if (!activeRank)
+                {
+                    packed = 0;
+                    if (repaired)
+                        ++*repaired;
+                    continue;
+                }
+                if (activeRank != spellId)
+                {
+                    packed = (packed & 0xFF000000u) | activeRank;
+                    if (repaired)
+                        ++*repaired;
+                }
+                spell = sSpellMgr->GetSpellInfo(activeRank);
+                if (!spell)
+                {
+                    packed = 0;
+                    continue;
+                }
                 if (spell->SpellFamilyName)
                 {
                     SkillLineAbilityMapBounds bounds =
-                        sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+                        sSpellMgr->GetSkillLineAbilityMapBounds(activeRank);
                     bool covered = false;
                     for (auto itr = bounds.first; itr != bounds.second; ++itr)
                     {
@@ -1266,30 +1795,14 @@ private:
                             break;
                         }
                     }
-                    if (!covered)
-                        return SetError(error,
-                            "stored action spell lacks class-aware skill-line coverage");
+                    if (!covered &&
+                        !IsExplicitClassStarterSpell(player, profile->ClassId, activeRank))
+                    {
+                        packed = 0;
+                        if (repaired)
+                            ++*repaired;
+                    }
                 }
-
-                bool hasHigherActiveRank = false;
-                for (uint32 next = sSpellMgr->GetNextSpellInChain(spellId);
-                    next && !hasHigherActiveRank;
-                    next = sSpellMgr->GetNextSpellInChain(next))
-                {
-                    auto known = std::find_if(profile->Spells.begin(), profile->Spells.end(),
-                        [next](SpellProfile const& value) { return value.Id == next; });
-                    hasHigherActiveRank = known != profile->Spells.end()
-                        && known->Active && !known->Disabled;
-                }
-
-                SpellProfile repairedSpell;
-                repairedSpell.Id = spellId;
-                repairedSpell.State = PLAYERSPELL_NEW;
-                repairedSpell.Active = !hasHigherActiveRank;
-                profile->Spells.push_back(repairedSpell);
-                spellIds.insert(spellId);
-                if (repaired)
-                    ++*repaired;
             }
         }
         return true;
@@ -1300,6 +1813,7 @@ private:
         StoredClassProfile const* profileSeed = nullptr)
     {
         StoredClassProfile captured;
+        LanguageEntryIds const languageIds = CollectLanguageEntryIds(player);
         captured.Revision = revision ? revision : 1;
         captured.ClassId = player->GetClass();
         captured.Level = player->GetLevel();
@@ -1332,7 +1846,8 @@ private:
 
         for (auto const& [spellId, spell] : player->m_spells)
         {
-            if (spell.state == PLAYERSPELL_REMOVED)
+            if (spell.state == PLAYERSPELL_REMOVED ||
+                languageIds.Spells.find(spellId) != languageIds.Spells.end())
                 continue;
             SpellProfile& saved = captured.Spells.emplace_back();
             saved.Id = spellId;
@@ -1344,7 +1859,8 @@ private:
 
         for (auto const& [skillId, status] : player->mSkillStatus)
         {
-            if (status.uState == SKILL_DELETED)
+            if (status.uState == SKILL_DELETED ||
+                languageIds.Skills.find(skillId) != languageIds.Skills.end())
                 continue;
             uint32 const valueData = player->GetUInt32Value(SkillValueIndex(status.pos));
             uint32 const bonusData = player->GetUInt32Value(SkillBonusIndex(status.pos));
@@ -1375,6 +1891,17 @@ private:
         }
         for (auto const& [button, action] : player->m_actionButtons)
             captured.Groups[captured.ActiveSpec].Actions[button] = action.packedData;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            {
+                StoredEquipmentItem& equipment = captured.Equipment[slot];
+                equipment.ItemId = item->GetEntry();
+                equipment.Enchantments[0] = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);
+                equipment.Enchantments[1] = item->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT);
+                equipment.EquippedGuid = item->GetGUID().GetRawValue();
+            }
+        }
 
         if (loadInactiveActions)
         {
@@ -1456,7 +1983,8 @@ private:
                         covered = true;
                         break;
                     }
-                if (!covered)
+                if (!covered &&
+                    !IsExplicitClassStarterSpell(player, definition.Definition.ClassId, spell.Id))
                     return SetError(error, "target spell lacks class-aware skill-line coverage");
             }
         }
@@ -1534,14 +2062,23 @@ private:
                 armorProficiency |= uint32(spell->EquippedItemSubClassMask);
         }
 
+        Item* mainhand = nullptr;
+        Item* offhand = nullptr;
         for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
         {
-            Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-            if (!item)
+            StoredEquipmentItem const& stored = profile.Equipment[slot];
+            if (!stored.EquippedGuid)
                 continue;
+            Item* item = player->GetItemByGuid(ObjectGuid(stored.EquippedGuid));
+            if (!item || item->GetEntry() != stored.ItemId ||
+                item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT) != stored.Enchantments[0] ||
+                item->GetEnchantmentId(TEMP_ENCHANTMENT_SLOT) != stored.Enchantments[1])
+                return SetError(error, "a class-owned equipment item is missing or no longer matches its profile");
             ItemTemplate const* proto = item->GetTemplate();
             if (!proto)
                 return SetError(error, "an equipped item has no template");
+            if (player->FindEquipSlot(proto, slot, false) != slot)
+                return SetError(error, "a class-owned equipment item does not fit its stored slot");
             if (proto->AllowableClass && !(proto->AllowableClass & classMask))
                 return SetError(error, "an equipped item is restricted to another class");
             if (proto->AllowableRace && !(proto->AllowableRace & raceMask))
@@ -1564,9 +2101,11 @@ private:
                 if (proto->Class == ITEM_CLASS_ARMOR && !(armorProficiency & (1u << proto->SubClass)))
                     return SetError(error, "an equipped armor item is incompatible with target class proficiencies");
             }
+            if (slot == EQUIPMENT_SLOT_MAINHAND)
+                mainhand = item;
+            else if (slot == EQUIPMENT_SLOT_OFFHAND)
+                offhand = item;
         }
-        Item* mainhand = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
-        Item* offhand = player->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND);
         if (offhand && offhand->GetTemplate())
         {
             uint32 const offhandType = offhand->GetTemplate()->InventoryType;
@@ -1582,8 +2121,381 @@ private:
         return true;
     }
 
-    bool ApplyProfileData(Player* player, StoredClassProfile const& target, std::string* error)
+    bool ApplyEquipmentProfile(Player* player, StoredClassProfile const& target,
+        std::string* error, EquipmentRollbackPlan* rollbackPlan = nullptr)
     {
+        struct StoredItemMove
+        {
+            uint8 Slot = 0;
+            Item* Item = nullptr;
+            uint16 Destination = 0;
+        };
+        std::vector<StoredItemMove> outgoing;
+        std::map<uint8, uint16> outgoingDestinations;
+        if (rollbackPlan)
+            *rollbackPlan = {};
+
+        std::array<uint64, EQUIPMENT_SLOTS> currentEquipment{};
+        std::array<uint64, EQUIPMENT_SLOTS> targetEquipment{};
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                currentEquipment[slot] = item->GetGUID().GetRawValue();
+            targetEquipment[slot] = target.Equipment[slot].EquippedGuid;
+        }
+        for (uint8 slot : BuildChangedEquipmentSlots(currentEquipment, targetEquipment))
+        {
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!current)
+                continue;
+
+            outgoing.push_back({ slot, current, 0 });
+        }
+
+        std::vector<EquipmentBagCandidate> candidates;
+        std::set<uint16> candidatePositions;
+        auto addCandidate = [&](uint16 position, bool freedByTargetEquip) {
+            if (position && candidatePositions.insert(position).second)
+                candidates.push_back({ position, freedByTargetEquip });
+        };
+
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (!player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                addCandidate(uint16(INVENTORY_SLOT_BAG_0) << 8 | slot, false);
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            if (Bag* bag = player->GetBagByPos(bagSlot))
+            {
+                for (uint8 slot = 0; slot < bag->GetBagSize(); ++slot)
+                    if (!player->GetItemByPos(bagSlot, slot))
+                        addCandidate(uint16(bagSlot) << 8 | slot, false);
+            }
+        }
+
+        // Bag slots occupied by target gear become valid destinations once that
+        // gear is detached for equipping. Include them in the complete matching.
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            StoredEquipmentItem const& desired = target.Equipment[slot];
+            if (!desired.EquippedGuid)
+                continue;
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (current && current->GetGUID().GetRawValue() == desired.EquippedGuid)
+                continue;
+            Item* item = player->GetItemByGuid(ObjectGuid(desired.EquippedGuid));
+            if (!item || item->GetEntry() != desired.ItemId)
+                return SetError(error, "a class-owned equipment item is missing or no longer matches its profile");
+            if (player->FindEquipSlot(item->GetTemplate(), slot, false) != slot)
+                return SetError(error, "a class-owned equipment item does not fit its stored slot");
+            if (!item->IsEquipped())
+                addCandidate(item->GetPos(), true);
+        }
+
+        std::vector<EquipmentBagDemand> demands;
+        demands.reserve(outgoing.size());
+        for (StoredItemMove const& move : outgoing)
+        {
+            EquipmentBagDemand demand;
+            for (EquipmentBagCandidate const& candidate : candidates)
+            {
+                uint8 const bag = uint8(candidate.Position >> 8);
+                uint8 const slot = uint8(candidate.Position & 0xFF);
+                ItemPosCountVec destination;
+                InventoryResult const result = player->CanStoreItem(
+                    bag, slot, destination, move.Item, candidate.FreedByTargetEquip);
+                if (result == EQUIP_ERR_OK && destination.size() == 1 &&
+                    destination.front().count == 1)
+                    demand.AllowedPositions.push_back(candidate.Position);
+            }
+            demands.push_back(std::move(demand));
+        }
+
+        std::vector<uint16> reservedDestinations;
+        if (!PlanEquipmentBagReservations(candidates, demands, &reservedDestinations))
+            return SetError(error,
+                "the target class loadout needs a complete free bag destination for each unequipped item");
+        for (size_t index = 0; index < outgoing.size(); ++index)
+        {
+            outgoing[index].Destination = reservedDestinations[index];
+            outgoingDestinations[outgoing[index].Slot] = reservedDestinations[index];
+        }
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            StoredEquipmentItem const& desired = target.Equipment[slot];
+            if (!desired.EquippedGuid)
+                continue;
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (current && current->GetGUID().GetRawValue() == desired.EquippedGuid)
+                continue;
+            Item* item = player->GetItemByGuid(ObjectGuid(desired.EquippedGuid));
+            if (rollbackPlan)
+            {
+                if (item->IsEquipped())
+                {
+                    auto destination = outgoingDestinations.find(item->GetSlot());
+                    if (destination == outgoingDestinations.end())
+                        return SetError(error, "the equipment rollback plan is incomplete");
+                    rollbackPlan->TargetBagDestinations[slot] = destination->second;
+                }
+                else
+                    rollbackPlan->TargetBagDestinations[slot] = item->GetPos();
+            }
+        }
+        if (rollbackPlan)
+            rollbackPlan->Prepared = true;
+
+        std::set<uint16> usedDestinations(
+            reservedDestinations.begin(), reservedDestinations.end());
+        std::map<uint64, Item*> detachedTargets;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            StoredEquipmentItem const& desired = target.Equipment[slot];
+            if (!desired.EquippedGuid)
+                continue;
+            Item* item = player->GetItemByGuid(ObjectGuid(desired.EquippedGuid));
+            if (!item || item->IsEquipped() || !usedDestinations.count(item->GetPos()))
+                continue;
+            uint64 const guid = item->GetGUID().GetRawValue();
+            player->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+            detachedTargets[guid] = item;
+        }
+
+        for (StoredItemMove const& move : outgoing)
+        {
+            player->RemoveItem(INVENTORY_SLOT_BAG_0, move.Slot, false);
+            ItemPosCountVec destination{ ItemPosCount(move.Destination, 1) };
+            if (player->StoreItem(destination, move.Item, true) != move.Item)
+                return SetError(error, "an unequipped class item could not be stored in its reserved bag slot");
+        }
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            StoredEquipmentItem const& desired = target.Equipment[slot];
+            if (!desired.EquippedGuid)
+                continue;
+            Item* item = player->GetItemByGuid(ObjectGuid(desired.EquippedGuid));
+            auto detached = detachedTargets.find(desired.EquippedGuid);
+            if (detached != detachedTargets.end())
+                item = detached->second;
+            if (!item)
+                return SetError(error, "a class-owned equipment item disappeared during application");
+            if (item->GetBagSlot() != NULL_BAG || item->GetSlot() != NULL_SLOT)
+                player->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+            player->EquipItem(uint16(INVENTORY_SLOT_BAG_0) << 8 | slot, item, true);
+        }
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            uint64 const actual = current ? current->GetGUID().GetRawValue() : 0;
+            if (actual != target.Equipment[slot].EquippedGuid)
+                return SetError(error, "the applied equipment loadout does not match its class profile");
+        }
+        return true;
+    }
+
+    bool RestoreEquipmentFromRollback(Player* player, StoredClassProfile const& source,
+        EquipmentRollbackPlan const& rollback, std::string* error)
+    {
+        if (!rollback.Prepared)
+            return SetError(error, "the class-switch equipment rollback plan is unavailable");
+
+        struct RollbackMove
+        {
+            uint8 Slot = 0;
+            Item* Item = nullptr;
+            uint16 Destination = 0;
+        };
+        std::vector<RollbackMove> moves;
+        std::vector<EquipmentBagCandidate> rollbackCandidates;
+        std::vector<EquipmentBagDemand> rollbackDemands;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            uint64 const sourceGuid = source.Equipment[slot].EquippedGuid;
+            if (!current || current->GetGUID().GetRawValue() == sourceGuid)
+                continue;
+            uint16 const destination = rollback.TargetBagDestinations[slot];
+            if (!destination)
+                return SetError(error, "the class-switch equipment rollback plan is incomplete");
+            moves.push_back({ slot, current, destination });
+            rollbackCandidates.push_back({ destination, false });
+            rollbackDemands.push_back({ { destination } });
+        }
+        std::vector<uint16> rollbackReservations;
+        if (!PlanEquipmentBagReservations(
+            rollbackCandidates, rollbackDemands, &rollbackReservations))
+            return SetError(error, "the class-switch rollback bag destinations are not unique");
+
+        std::map<uint64, Item*> detachedSources;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            StoredEquipmentItem const& desired = source.Equipment[slot];
+            if (!desired.EquippedGuid)
+                continue;
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (current && current->GetGUID().GetRawValue() == desired.EquippedGuid)
+                continue;
+            Item* item = player->GetItemByGuid(ObjectGuid(desired.EquippedGuid));
+            if (!item)
+                return SetError(error, "a source equipment item is missing during rollback");
+            if (!item->IsEquipped())
+            {
+                uint64 const guid = item->GetGUID().GetRawValue();
+                player->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+                detachedSources[guid] = item;
+            }
+        }
+
+        for (RollbackMove const& move : moves)
+        {
+            if (player->GetItemByPos(
+                uint8(move.Destination >> 8), uint8(move.Destination & 0xFF)))
+                return SetError(error, "the class-switch equipment rollback destination is unavailable");
+            player->RemoveItem(INVENTORY_SLOT_BAG_0, move.Slot, false);
+            ItemPosCountVec stored{ ItemPosCount(move.Destination, 1) };
+            if (player->StoreItem(stored, move.Item, true) != move.Item)
+                return SetError(error, "the target equipment could not be staged for rollback");
+        }
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            StoredEquipmentItem const& desired = source.Equipment[slot];
+            if (!desired.EquippedGuid)
+                continue;
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (current && current->GetGUID().GetRawValue() == desired.EquippedGuid)
+                continue;
+            Item* item = player->GetItemByGuid(ObjectGuid(desired.EquippedGuid));
+            auto detached = detachedSources.find(desired.EquippedGuid);
+            if (detached != detachedSources.end())
+                item = detached->second;
+            if (!item)
+                return SetError(error, "a source equipment item is missing during rollback");
+            if (item->GetBagSlot() != NULL_BAG || item->GetSlot() != NULL_SLOT)
+                player->RemoveItem(item->GetBagSlot(), item->GetSlot(), true);
+            player->EquipItem(uint16(INVENTORY_SLOT_BAG_0) << 8 | slot, item, true);
+        }
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item* current = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            uint64 const actual = current ? current->GetGUID().GetRawValue() : 0;
+            if (actual != source.Equipment[slot].EquippedGuid)
+                return SetError(error, "the restored equipment loadout does not match the source profile");
+        }
+        return true;
+    }
+
+    void CaptureSourcePet(Player* player, PendingSwitch& pending)
+    {
+        pending.SourcePetCaptured = false;
+        pending.SourcePetStable = {};
+        if (!player->m_petStable || !player->m_petStable->CurrentPet)
+            return;
+
+        if (Pet* pet = player->GetPet())
+            pet->FillPetInfo(&player->m_petStable->CurrentPet.value());
+        pending.SourcePetStable = *player->m_petStable;
+        pending.SourcePetCaptured = true;
+    }
+
+    void DetachPetForStaging(Player* player)
+    {
+        if (Pet* pet = player->GetPet())
+        {
+            pet->CombatStop();
+            player->SetMinion(pet, false);
+            pet->AddObjectToRemoveList();
+            pet->m_removed = true;
+            if (pet->isControlled())
+            {
+                WorldPacket packet(SMSG_PET_SPELLS, 8);
+                packet << uint64(0);
+                player->SendDirectMessage(&packet);
+            }
+        }
+        if (player->m_petStable)
+            player->m_petStable->CurrentPet.reset();
+    }
+
+    void RestoreSourcePet(Player* player, PendingSwitch const& pending)
+    {
+        if (!pending.SourcePetCaptured || !player->m_petStable)
+            return;
+        *player->m_petStable = pending.SourcePetStable;
+        if (player->m_petStable->CurrentPet && !player->GetPet())
+            player->LoadPet();
+    }
+
+    void AppendSourcePetDetachment(CharacterDatabaseTransaction const& transaction,
+        Player* player, PendingSwitch const& pending)
+    {
+        if (!transaction || !pending.SourcePetCaptured ||
+            !pending.SourcePetStable.CurrentPet)
+            return;
+
+        PetStable::PetInfo const& pet = pending.SourcePetStable.CurrentPet.value();
+        std::ostringstream sql;
+        if (pet.Type == HUNTER_PET)
+        {
+            sql << "DELETE FROM character_pet WHERE owner = "
+                << player->GetGUID().GetCounter() << " AND slot = "
+                << uint32(PET_SAVE_AS_CURRENT) << " AND id <> " << pet.PetNumber;
+            transaction->Append(sql.str().c_str());
+            sql.str("");
+            sql.clear();
+            sql << "UPDATE character_pet SET slot = " << uint32(PET_SAVE_NOT_IN_SLOT)
+                << ", savetime = UNIX_TIMESTAMP() WHERE owner = "
+                << player->GetGUID().GetCounter() << " AND id = " << pet.PetNumber;
+            transaction->Append(sql.str().c_str());
+        }
+        else
+        {
+            sql << "DELETE FROM character_pet WHERE id = " << pet.PetNumber;
+            transaction->Append(sql.str().c_str());
+            sql.str("");
+            sql.clear();
+            sql << "DELETE FROM character_pet_declinedname WHERE id = " << pet.PetNumber;
+            transaction->Append(sql.str().c_str());
+            sql.str("");
+            sql.clear();
+            sql << "DELETE FROM pet_aura WHERE guid = " << pet.PetNumber;
+            transaction->Append(sql.str().c_str());
+            sql.str("");
+            sql.clear();
+            sql << "DELETE FROM pet_spell WHERE guid = " << pet.PetNumber;
+            transaction->Append(sql.str().c_str());
+            sql.str("");
+            sql.clear();
+            sql << "DELETE FROM pet_spell_cooldown WHERE guid = " << pet.PetNumber;
+            transaction->Append(sql.str().c_str());
+        }
+    }
+
+    void FinalizeSourcePetDetachment(Player* player, PendingSwitch const& pending)
+    {
+        if (!pending.SourcePetCaptured || !player->m_petStable ||
+            !pending.SourcePetStable.CurrentPet)
+            return;
+
+        PetStable::PetInfo pet = pending.SourcePetStable.CurrentPet.value();
+        player->m_petStable->CurrentPet.reset();
+        if (pet.Type == HUNTER_PET)
+            player->m_petStable->UnslottedPets.push_back(std::move(pet));
+    }
+
+    bool ApplyProfileData(Player* player, StoredClassProfile const& target, std::string* error,
+        bool detachPet, EquipmentRollbackPlan* rollbackPlan,
+        EquipmentRollbackPlan const* restorePlan)
+    {
+        CharacterLanguageState const characterLanguages = CaptureCharacterLanguages(player);
+        LanguageEntryIds const languageIds = CollectLanguageEntryIds(player, &target);
+        StoredClassProfile runtimeProfile = target;
+        MergeCharacterLanguages(
+            &runtimeProfile, characterLanguages, languageIds.Spells, languageIds.Skills);
+
         ChrClassesEntry const* oldClass = sChrClassesStore.LookupEntry(player->GetClass());
         uint32 const oldFamily = oldClass ? oldClass->SpellClassSet : 0;
         ObjectGuid const playerGuid = player->GetGUID();
@@ -1596,56 +2508,46 @@ private:
                 oldFamily, info->SpellFamilyName,
                 info->HasAura(SPELL_AURA_MOD_SHAPESHIFT));
         });
-        if (player->GetPet())
-            player->RemovePet(nullptr, PET_SAVE_AS_DELETED, true);
-        CharacterDatabase.PExecute(
-            "DELETE FROM character_pet WHERE owner = {} "
-            "AND (slot = {} OR slot = {} OR slot > {})",
-            playerGuid.GetCounter(), uint8(PET_SAVE_AS_CURRENT),
-            uint8(PET_SAVE_NOT_IN_SLOT), uint8(PET_SAVE_LAST_STABLE_SLOT));
-        if (PetStable* petStable = player->GetPetStable())
-        {
-            petStable->CurrentPet.reset();
-            petStable->UnslottedPets.clear();
-        }
+        if (detachPet)
+            DetachPetForStaging(player);
         player->RemoveAllControlled();
         player->RemoveAllDynObjects();
         player->ClearComboPoints();
         delete player->m_runes;
         player->m_runes = nullptr;
 
-        ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(target.ClassId);
+        ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(runtimeProfile.ClassId);
         if (!classEntry)
             return SetError(error, "target class DBC entry disappeared");
-        player->SetClass(target.ClassId);
+        player->SetClass(runtimeProfile.ClassId);
         player->SetPowerType(Powers(classEntry->DisplayPower), false);
-        player->SetLevel(target.Level, false);
-        player->SetXP(target.Xp);
+        player->SetLevel(runtimeProfile.Level, false);
+        player->SetXP(runtimeProfile.Xp);
         player->InitRunes();
         player->InitStatsForLevel();
         player->InitGlyphsForLevel();
-        if (target.Runes.Count)
+        if (runtimeProfile.Runes.Count)
         {
             if (!player->m_runes || !player->HasRunes())
                 return SetError(error, "target class rune capability disappeared");
             player->m_runes->runeState = 0;
-            for (uint8 rune = 0; rune < target.Runes.Count; ++rune)
+            for (uint8 rune = 0; rune < runtimeProfile.Runes.Count; ++rune)
             {
                 player->m_runes->runes[rune].CurrentRune =
-                    RuneType(target.Runes.Types[rune]);
+                    RuneType(runtimeProfile.Runes.Types[rune]);
                 player->m_runes->runes[rune].BaseRune =
-                    RuneType(target.Runes.BaseTypes[rune]);
-                player->m_runes->runes[rune].Cooldown = target.Runes.Cooldowns[rune];
+                    RuneType(runtimeProfile.Runes.BaseTypes[rune]);
+                player->m_runes->runes[rune].Cooldown = runtimeProfile.Runes.Cooldowns[rune];
                 player->m_runes->SetRuneState(rune,
-                    target.Runes.Cooldowns[rune] == 0);
+                    runtimeProfile.Runes.Cooldowns[rune] == 0);
             }
             player->m_runes->lastUsedRune =
-                RuneType(target.Runes.LastUsed[0]);
+                RuneType(runtimeProfile.Runes.LastUsed[0]);
             player->ResyncRunes();
         }
 
         std::set<uint32> retainedSharedSkills;
-        for (SkillProfile const& skill : target.Skills)
+        for (SkillProfile const& skill : runtimeProfile.Skills)
             if (skill.Shared && player->mSkillStatus.find(skill.Id) != player->mSkillStatus.end())
                 retainedSharedSkills.insert(skill.Id);
 
@@ -1664,7 +2566,7 @@ private:
             player->SetUInt32Value(SkillBonusIndex(status.pos), 0);
             status.uState = SKILL_DELETED;
         }
-        for (SkillProfile const& skill : target.Skills)
+        for (SkillProfile const& skill : runtimeProfile.Skills)
         {
             if (retainedSharedSkills.count(skill.Id))
                 continue;
@@ -1698,7 +2600,7 @@ private:
         }
 
         PlayerSpellMap replacement;
-        for (SpellProfile const& profile : target.Spells)
+        for (SpellProfile const& profile : runtimeProfile.Spells)
         {
             PlayerSpell spell;
             spell.state = PLAYERSPELL_NEW;
@@ -1736,7 +2638,7 @@ private:
             player->m_spells[_switchSpellId] = switchSpell;
         }
 
-        for (SpellProfile const& learned : target.Spells)
+        for (SpellProfile const& learned : runtimeProfile.Spells)
         {
             SpellInfo const* spell = sSpellMgr->GetSpellInfo(learned.Id);
             if (!spell || !learned.Active || learned.Disabled || !spell->IsPassive() || player->HasAura(learned.Id))
@@ -1745,9 +2647,9 @@ private:
                 player->AddAura(learned.Id, player);
         }
 
-        player->m_activeSpec = target.ActiveSpec;
-        player->m_specsCount = target.SpecCount;
-        player->SetFreeTalentPoints(target.FreeTalentPoints);
+        player->m_activeSpec = runtimeProfile.ActiveSpec;
+        player->m_specsCount = runtimeProfile.SpecCount;
+        player->SetFreeTalentPoints(runtimeProfile.FreeTalentPoints);
         for (uint8 spec = 0; spec < TALENT_GROUPS; ++spec)
         {
             for (auto& [spellId, talent] : *player->m_talents[spec])
@@ -1760,15 +2662,15 @@ private:
                 player->m_Glyphs[spec][glyph] = 0;
         }
         uint32 spentTalents = 0;
-        for (uint8 spec = 0; spec < target.SpecCount; ++spec)
+        for (uint8 spec = 0; spec < runtimeProfile.SpecCount; ++spec)
         {
-            for (TalentProfile const& talent : target.Groups[spec].Talents)
+            for (TalentProfile const& talent : runtimeProfile.Groups[spec].Talents)
             {
                 PlayerTalent* stored = new PlayerTalent();
                 stored->state = PLAYERSPELL_NEW;
                 stored->spec = spec;
                 (*player->m_talents[spec])[talent.SpellId] = stored;
-                if (spec == target.ActiveSpec)
+                if (spec == runtimeProfile.ActiveSpec)
                 {
                     for (uint32 talentId = 0; talentId < sTalentStore.GetNumRows(); ++talentId)
                     {
@@ -1789,12 +2691,12 @@ private:
                 }
             }
             for (uint8 glyph = 0; glyph < GLYPH_SLOTS; ++glyph)
-                player->m_Glyphs[spec][glyph] = target.Groups[spec].Glyphs[glyph];
+                player->m_Glyphs[spec][glyph] = runtimeProfile.Groups[spec].Glyphs[glyph];
         }
         player->m_usedTalentCount = spentTalents;
         for (uint8 glyph = 0; glyph < GLYPH_SLOTS; ++glyph)
-            player->SetGlyph(glyph, target.Groups[target.ActiveSpec].Glyphs[glyph]);
-        for (uint32 glyphId : target.Groups[target.ActiveSpec].Glyphs)
+            player->SetGlyph(glyph, runtimeProfile.Groups[runtimeProfile.ActiveSpec].Glyphs[glyph]);
+        for (uint32 glyphId : runtimeProfile.Groups[runtimeProfile.ActiveSpec].Glyphs)
         {
             GlyphPropertiesEntry const* glyph = glyphId ? sGlyphPropertiesStore.LookupEntry(glyphId) : nullptr;
             if (glyph && glyph->SpellID && !player->HasAura(glyph->SpellID))
@@ -1808,7 +2710,8 @@ private:
         }
         for (uint8 button = 0; button < ACTION_SLOTS; ++button)
         {
-            uint32 const packed = target.Groups[target.ActiveSpec].Actions[button];
+            uint32 const packed =
+                runtimeProfile.Groups[runtimeProfile.ActiveSpec].Actions[button];
             if (!packed)
                 continue;
             ActionButton& action = player->m_actionButtons[button];
@@ -1818,7 +2721,7 @@ private:
 
         player->m_WeaponProficiency = 0;
         player->m_ArmorProficiency = 0;
-        for (SpellProfile const& known : target.Spells)
+        for (SpellProfile const& known : runtimeProfile.Spells)
         {
             SpellInfo const* spell = sSpellMgr->GetSpellInfo(known.Id);
             if (!spell || spell->EquippedItemSubClassMask <= 0)
@@ -1828,23 +2731,34 @@ private:
             else if (spell->EquippedItemClass == ITEM_CLASS_ARMOR)
                 player->m_ArmorProficiency |= uint32(spell->EquippedItemSubClassMask);
         }
+        if (restorePlan)
+        {
+            if (!RestoreEquipmentFromRollback(player, runtimeProfile, *restorePlan, error))
+                return false;
+        }
+        else if (!ApplyEquipmentProfile(player, runtimeProfile, error, rollbackPlan))
+            return false;
         player->UpdateAllStats();
         player->UpdateAllCritPercentages();
         player->SetHealth(std::max<uint32>(1,
-            uint32(player->GetMaxHealth() * target.HealthPercent / 100.0f)));
+            uint32(player->GetMaxHealth() * runtimeProfile.HealthPercent / 100.0f)));
         for (uint8 power = 0; power < POWER_TYPES; ++power)
             player->SetPower(Powers(power),
-                uint32(player->GetMaxPower(Powers(power)) * ClampPercent(target.PowerPercent[power]) / 100.0f));
-        return ValidateStoredProfile(target, error);
+                uint32(player->GetMaxPower(Powers(power)) *
+                    ClampPercent(runtimeProfile.PowerPercent[power]) / 100.0f));
+        return ValidateStoredProfile(runtimeProfile, error);
     }
 
-    bool ApplyProfile(Player* player, StoredClassProfile const& target, std::string* error)
+    bool ApplyProfile(Player* player, StoredClassProfile const& target, std::string* error,
+        bool detachPet = false, EquipmentRollbackPlan* rollbackPlan = nullptr,
+        EquipmentRollbackPlan const* restorePlan = nullptr)
     {
         ++player->m_classSwitchNotificationSuppression;
         bool result = false;
         try
         {
-            result = ApplyProfileData(player, target, error);
+            result = ApplyProfileData(
+                player, target, error, detachPet, rollbackPlan, restorePlan);
         }
         catch (...)
         {
@@ -1855,7 +2769,7 @@ private:
         return result;
     }
 
-    void NormalizeInMemoryAfterRollback(Player* player)
+    void NormalizeInMemoryAfterProfileWrite(Player* player)
     {
         for (auto itr = player->m_spells.begin(); itr != player->m_spells.end();)
         {
@@ -2167,6 +3081,21 @@ private:
                 uint16(std::max<int16>(skill.TemporaryBonus, 0)),
                 uint16(std::max<int16>(skill.PermanentBonus, 0)), skill.Shared
             });
+        CharacterLanguageState const characterLanguages = CaptureCharacterLanguages(player);
+        for (SkillProfile const& language : characterLanguages.Skills)
+        {
+            bool const present = std::any_of(built.Skills.begin(), built.Skills.end(),
+                [&language](ActiveClassSkill const& skill) {
+                    return skill.Id == int32(language.Id);
+                });
+            if (present)
+                continue;
+            built.Skills.push_back({
+                int32(language.Id), language.Step, language.Value, language.Max,
+                uint16(std::max<int16>(language.TemporaryBonus, 0)),
+                uint16(std::max<int16>(language.PermanentBonus, 0)), true
+            });
+        }
         built.Proficiencies[ITEM_CLASS_WEAPON] = player->m_WeaponProficiency;
         built.Proficiencies[ITEM_CLASS_ARMOR] = player->m_ArmorProficiency;
 
@@ -2232,6 +3161,8 @@ private:
             return;
         }
         uint8 const activeClassId = activeClassOverride ? activeClassOverride : player->GetClass();
+        uint8 const pendingClassId = runtime.Pending.Phase == TransitionPhase::RecoveringSource
+            ? runtime.Pending.ExpectedClass : runtime.Pending.TargetClass;
         std::vector<ActiveClassStatusDescriptor> available;
         available.reserve(_definitions.size());
         for (auto const& [classId, definition] : _definitions)
@@ -2239,14 +3170,17 @@ private:
             uint8 flags = 0;
             if (classId == activeClassId)
                 flags |= CLASS_FLAG_ACTIVE;
-            if (classId == runtime.Pending.TargetClass)
+            if (classId == pendingClassId)
                 flags |= CLASS_FLAG_PENDING;
             if (definition.Definition.Enabled && (definition.Definition.RaceMask & ClassIdToMask(player->GetRace())))
                 flags |= CLASS_FLAG_AVAILABLE;
             if (!(flags & (CLASS_FLAG_AVAILABLE | CLASS_FLAG_ACTIVE | CLASS_FLAG_PENDING)))
                 continue;
 
-            uint16 level = definition.Definition.InitialLevel;
+            uint16 level = ResolveClassStatusLevel(
+                classId, false, 0, definition.Definition.InitialLevel,
+                uint8(sWorld->getIntConfig(CONFIG_START_PLAYER_LEVEL)),
+                uint8(sWorld->getIntConfig(CONFIG_START_DEATH_KNIGHT_PLAYER_LEVEL)));
             auto profileLevel = levels.find(classId);
             if (profileLevel != levels.end() && profileLevel->second.first)
                 level = profileLevel->second.first;
@@ -2256,7 +3190,7 @@ private:
         }
 
         std::vector<uint8> payload = EncodeActiveClassStatus(stage, result, activeClassId,
-            runtime.Pending.TargetClass, revision,
+            pendingClassId, revision,
             player->GetSession()->GetActiveClassSessionTag(), available);
         if (payload.empty())
         {
@@ -2285,9 +3219,29 @@ RequestResult RequestSwitch(Player* player, uint16 protocolVersion, uint8 reques
     return Manager().Request(player, protocolVersion, requestType, classId, revision, error);
 }
 
+bool ProcessClientResponse(Player* player, uint8 const* payload, size_t size, std::string* error)
+{
+    return Manager().HandleClientResponse(player, payload, size, error);
+}
+
 bool HandleSwitchSpellCast(Player* player, uint32 spellId, std::string* error)
 {
     return Manager().HandleSpell(player, spellId, error);
+}
+
+void UpdatePlayer(Player* player)
+{
+    Manager().Update(player);
+}
+
+bool IsTransitionPending(Player* player)
+{
+    return Manager().IsPending(player);
+}
+
+bool CancelPendingTransitionOnLogout(Player* player)
+{
+    return Manager().CancelOnLogout(player);
 }
 
 void RestoreActiveProfileAfterLoad(Player* player)
@@ -2373,6 +3327,17 @@ bool Player::HandleClassSwitchSpellCast(uint32 spellId, std::string* error)
             "Player {} class-switch spell failed: {}",
             GetGUID().ToString(), localError);
     return result;
+}
+
+bool Player::ProcessClassSwitchClientResponse(uint8 const* payload, size_t size,
+    std::string* error)
+{
+    return ClassSwitch::ProcessClientResponse(this, payload, size, error);
+}
+
+bool Player::IsClassSwitchTransitionPending() const
+{
+    return m_classSwitchTransitionPending.load(std::memory_order_acquire);
 }
 
 bool Player::IsClassSwitchSpell(uint32 spellId) const

@@ -34,6 +34,7 @@
 #include "PetDefines.h"
 #include "PlayerTaxi.h"
 #include "PlayerClassSwitch.h"
+#include <atomic>
 #include "QuestDef.h"
 // @tswow-begin (Using Rochet2/Transmog)
 #include "Transmogrification.h"
@@ -1376,7 +1377,9 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         /*********************************************************/
 
         bool SaveToDB(bool create = false);
-        bool SaveToDB(CharacterDatabaseTransaction trans, bool create = false);
+        bool SaveToDB(CharacterDatabaseTransaction trans, bool create = false,
+            bool saveClassProfileBackingTables = true, bool appendClassProfile = true,
+            bool savePet = true, bool allowWhileClassSwitchPending = false);
         void SaveInventoryAndGoldToDB(CharacterDatabaseTransaction trans);                    // fast save function for item/money cheating preventing
         void SaveGoldToDB(CharacterDatabaseTransaction trans) const;
 
@@ -1464,6 +1467,9 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         void SendUnlearnSpells();
         uint8 RequestClassSwitch(uint16 protocolVersion, uint8 requestType, uint8 classId, uint64 revision,
             std::string* error = nullptr);
+        bool ProcessClassSwitchClientResponse(uint8 const* payload, size_t size,
+            std::string* error = nullptr);
+        bool IsClassSwitchTransitionPending() const;
         bool HandleClassSwitchSpellCast(uint32 spellId, std::string* error = nullptr);
         bool IsClassSwitchSpell(uint32 spellId) const;
         bool EnsureClassSwitchSpellKnown();
@@ -2396,6 +2402,7 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         PlayerMails m_mail;
         PlayerSpellMap m_spells;
         uint32 m_classSwitchNotificationSuppression;
+        std::atomic<bool> m_classSwitchTransitionPending{ false };
         PlayerTalentMap* m_talents[MAX_TALENT_SPECS];
         uint32 m_lastPotionId;                              // last used health/mana potion in combat, that block next potion use
 
