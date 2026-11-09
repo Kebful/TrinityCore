@@ -94,16 +94,18 @@ enum Races
     RACE_TROLL              = 8,  // TITLE Troll
     //RACE_GOBLIN             = 9,
     RACE_BLOODELF           = 10, // TITLE Blood Elf
-    RACE_DRAENEI            = 11 //, TITLE Draenei
-    //RACE_FEL_ORC            = 12,
-    //RACE_NAGA               = 13,
-    //RACE_BROKEN             = 14,
-    //RACE_SKELETON           = 15,
-    //RACE_VRYKUL             = 16,
-    //RACE_TUSKARR            = 17,
-    //RACE_FOREST_TROLL       = 18,
-    //RACE_TAUNKA             = 19,
-    //RACE_NORTHREND_SKELETON = 20,
+    RACE_DRAENEI            = 11, // TITLE Draenei
+    // FFXIV playable bodies, added by the ffxivhaven module as ChrRaces ids 12-20. Each id pairs
+    // one male and one female body (see datascripts/characters/ffxiv-playable-races.ts).
+    RACE_FFXIV_HYUR_MIDLANDER   = 12,
+    RACE_FFXIV_HYUR_HIGHLANDER  = 13,
+    RACE_FFXIV_ELEZEN           = 14,
+    RACE_FFXIV_MIQOTE           = 15,
+    RACE_FFXIV_ROEGADYN         = 16,
+    RACE_FFXIV_LALAFELL         = 17,
+    RACE_FFXIV_AURA             = 18,
+    RACE_FFXIV_HROTHGAR         = 19,
+    RACE_FFXIV_VIERA            = 20
     //RACE_ICE_TROLL          = 21
 };
 
@@ -113,11 +115,12 @@ enum Races
 #define RACEMASK_ALL_PLAYABLE 4294967295
 // @tswow-end
 
-#define RACEMASK_ALLIANCE \
-    ((1<<(RACE_HUMAN-1)) | (1<<(RACE_DWARF-1)) | (1<<(RACE_NIGHTELF-1)) | \
-     (1<<(RACE_GNOME-1)) | (1<<(RACE_DRAENEI-1)))
+// Every playable race is available to both factions on this server. Race-to-team is still decided
+// by the character's creation choice, but race masks (race changes, race-gated content) no longer
+// split the roster.
+#define RACEMASK_ALLIANCE RACEMASK_ALL_PLAYABLE
 
-#define RACEMASK_HORDE RACEMASK_ALL_PLAYABLE & ~RACEMASK_ALLIANCE
+#define RACEMASK_HORDE RACEMASK_ALL_PLAYABLE
 
 // Class value is index in ChrClasses.dbc
 // EnumUtils: DESCRIBE THIS
