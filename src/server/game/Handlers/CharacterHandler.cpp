@@ -47,6 +47,7 @@
 #include "Pet.h"
 #include "Player.h"
 #include "PlayerDump.h"
+#include "FFXIV/CFXIVCreation.h"
 #include "RBAC.h"
 #include "Realm.h"
 #include "ReputationMgr.h"
@@ -845,6 +846,7 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     //TC_LOG_DEBUG("Player {} added to Map.", pCurrChar->GetName());
 
     pCurrChar->SendInitialPacketsAfterAddToMap();
+    FFXIV::Creation::OnPlayerLogin(pCurrChar);
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
 

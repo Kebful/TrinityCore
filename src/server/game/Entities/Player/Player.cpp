@@ -16,6 +16,7 @@
  */
 
 #include "Player.h"
+#include "FFXIV/CFXIVCreation.h"
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
 #include "ArenaTeam.h"
@@ -4262,6 +4263,7 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             trans->Append(stmt);
             trans->PAppend(
                 "DELETE FROM `ffxiv_class_switch_profiles` WHERE `guid` = {}", guid);
+            FFXIV::Creation::AppendDelete(trans, guid);
 // @tswow-begin (Using Rochet2/Transmog)
 #ifdef PRESETS
             trans->PAppend("DELETE FROM `custom_transmogrification_sets` WHERE `Owner` = {}", guid);
@@ -27334,6 +27336,16 @@ void Player::SendSupercededSpell(uint32 oldSpell, uint32 newSpell) const
 
 bool Player::ValidateAppearance(uint8 race, uint8 gender, uint8 hairID, uint8 hairColor, uint8 faceID, uint8 facialHair, uint8 skinColor, bool create /*=false*/)
 {
+    // FFXIV-bridged races (12-20) store FFXIV CharaMake option ids in the stock
+    // skin/face/hair/facial fields. The stock CharSections and
+    // CharacterFacialHairStyles ranges only describe the WotLK races (and the
+    // cloned rows do not cover every FFXIV option), so validating them here
+    // would reject valid FFXIV creations and refuse to load existing characters.
+    // The authoritative check for these races is the FFXIV customize tuple
+    // (FFXIV::Creation::ValidateTuple) and its per-field menu limits.
+    if (race >= 12 && race <= 20)
+        return true;
+
     auto validateCharSection = [create](CharSectionsEntry const* entry) -> bool
     {
         if (!entry)

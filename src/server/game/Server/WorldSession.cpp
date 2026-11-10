@@ -60,6 +60,7 @@
 #include "World.h"
 #include "WorldPacket.h"
 #include "PlayerClassSwitch.h"
+#include "FFXIV/CFXIVCreation.h"
 #include "WorldSocket.h"
 #include <boost/circular_buffer.hpp>
 #include <cstring>
@@ -1838,6 +1839,13 @@ void WorldSession::HandleCustom(WorldPacket& packet)
     {
         CustomPacketHeader header;
         std::memcpy(&header, packet.contents(), sizeof(header));
+        if (header.opcode == FFXIV::Creation::UPDATE_OPCODE)
+        {
+            if (_player && header.totalFrags == 1)
+                FFXIV::Creation::HandleUpdate(_player, packet.contents() + CustomHeaderSize, packet.size() - CustomHeaderSize);
+            return;
+        }
+
         if (header.opcode == ClassSwitch::CLIENT_RESPONSE_OPCODE)
         {
             if (!_player || header.totalFrags != 1)

@@ -46,6 +46,7 @@
 // @tswow-begin
 #include "TSUnit.h"
 #include "TSCreature.h"
+#include "FFXIVVoiceStore.h"
 // @tswow-end
 
 inline bool isNasty(uint8 c)
@@ -673,6 +674,18 @@ void WorldSession::HandleTextEmoteOpcode(WorldPacket& recvData)
 
     Cell cell(p);
     cell.SetNoCreate();
+
+    // @tswow-begin
+    // Server-authoritative FFXIV voice: mark the rebroadcast emote number with the
+    // sender's selected voice so nearby clients play the matching FFXIV sound row.
+    // EmoteNumFor returns 0 (leave the client's value) when no voice is stored or
+    // the sender is not one of the ported FFXIV races.
+    {
+        uint32 voiceEmoteNum = FFXIV::VoiceStore::EmoteNumFor(GetPlayer());
+        if (voiceEmoteNum != 0)
+            emoteNum = voiceEmoteNum;
+    }
+    // @tswow-end
 
     Trinity::EmoteChatBuilder emote_builder(*GetPlayer(), text_emote, emoteNum, unit);
     Trinity::LocalizedPacketDo<Trinity::EmoteChatBuilder > emote_do(emote_builder);
