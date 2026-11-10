@@ -143,7 +143,11 @@ char const* ValidateTuple(CustomizeTuple const& tuple)
     };
     for (Check const& check : checks)
     {
-        if (check.value > MenuMax(*row, check.option))
+        std::uint16_t const max = MenuMax(*row, check.option);
+        // Lip and face-paint colours are a dark run (0..) and a light run (128..) of the same
+        // human.cmp table; the creation screen's Light toggle picks the second.
+        bool const lightRun = check.option == OptionId::LipColor || check.option == OptionId::FacePaintColor;
+        if (check.value > max && !(lightRun && check.value >= 128 && check.value - 128 <= max))
             return check.field;
     }
     if (tuple.clan != clan)
