@@ -34,6 +34,10 @@ namespace FFXIV::Creation
     // Handles one UPDATE payload (protocol version, echoed GUID, tuple). Ignores bad input.
     void HandleUpdate(Player* player, uint8 const* data, std::size_t size);
 
+    // Sends `subject`'s stored tuple to `observer` (UNIT_TUPLE_OPCODE: protocol version, the subject's raw GUID,
+    // tuple) so the observer's client draws the subject in its own look. Called when the subject becomes visible.
+    void SendUnitTupleTo(Player const* observer, Player const* subject);
+
     // Appends the appearance-row delete to a character delete transaction.
     void AppendDelete(CharacterDatabaseTransaction const& trans, ObjectGuid::LowType guid);
 }

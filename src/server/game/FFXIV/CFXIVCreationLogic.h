@@ -14,6 +14,7 @@ namespace FFXIV::Creation {
 constexpr std::uint16_t SNAPSHOT_OPCODE = 0x7A34;  // server -> client: stored tuple
 constexpr std::uint16_t REQUEST_OPCODE = 0x7A35;   // server -> client: please send your tuple
 constexpr std::uint16_t UPDATE_OPCODE = 0x7A36;    // client -> server: save this tuple
+constexpr std::uint16_t UNIT_TUPLE_OPCODE = 0x7A37;  // server -> client: another unit's stored tuple
 
 // Version 2 appended nameday and guardian (the retired ffxivcharacterprofile row).
 constexpr std::uint8_t PROTOCOL_VERSION = 2;

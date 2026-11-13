@@ -22922,6 +22922,9 @@ void Player::UpdateTriggerVisibility()
 void Player::SendInitialVisiblePackets(Unit* target) const
 {
     SendAurasForTarget(target);
+    // FFXIV races: the observer's client draws the target in the target's own stored appearance.
+    if (Player const* targetPlayer = target->ToPlayer())
+        FFXIV::Creation::SendUnitTupleTo(this, targetPlayer);
     if (target->IsAlive())
     {
         if (target->HasUnitState(UNIT_STATE_MELEE_ATTACKING) && target->GetVictim())

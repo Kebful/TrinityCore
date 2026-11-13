@@ -26,7 +26,10 @@
 #include "WorldPacket.h"
 
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace FFXIV::Creation
@@ -41,9 +44,11 @@ namespace
         "jaw", "eyeShape", "irisSize", "raceFeature", "flags", "namedayMoon", "namedayDay", "guardian",
     };
 
-    void SendCustomPacket(Player* player, uint16 opcode, std::vector<uint8> const& payload)
+    // Splits a custom packet into its world packets and hands each to `send`.
+    template <class Send>
+    void ForEachCustomPacket(uint16 opcode, std::vector<uint8> const& payload, Send send)
     {
-        if (!player || payload.size() > std::numeric_limits<totalSize_t>::max())
+        if (payload.size() > std::numeric_limits<totalSize_t>::max())
             return;
 
         CustomPacketWrite writer(opcode, MAX_FRAGMENT_SIZE, 0);
@@ -54,9 +59,40 @@ namespace
         {
             WorldPacket packet(SERVER_TO_CLIENT_OPCODE, chunk.FullSize());
             packet.append(reinterpret_cast<uint8 const*>(chunk.Data()), chunk.FullSize());
-            player->SendDirectMessage(&packet);
+            send(packet);
         }
         writer.Destroy();
+    }
+
+    void SendCustomPacket(Player const* player, uint16 opcode, std::vector<uint8> const& payload)
+    {
+        if (!player)
+            return;
+        ForEachCustomPacket(opcode, payload, [player](WorldPacket const& packet) { player->SendDirectMessage(&packet); });
+    }
+
+    // UNIT_TUPLE_OPCODE payload for `subject`: protocol version, the subject's raw GUID (the client looks the unit up
+    // by it), the tuple.
+    std::vector<uint8> UnitTuplePayload(Player const* subject, CustomizeTuple const& tuple)
+    {
+        std::vector<uint8> payload;
+        payload.push_back(PROTOCOL_VERSION);
+        uint64 const guid = subject->GetGUID().GetRawValue();
+        for (int shift = 0; shift < 64; shift += 8)
+            payload.push_back(static_cast<uint8>(guid >> shift));
+        WriteTuple(tuple, payload);
+        return payload;
+    }
+
+    // Stored tuples of FFXIV characters, so a visibility event never waits on the database. std::nullopt records a
+    // character with no valid row. Filled at login and on update, loaded on first use otherwise.
+    std::mutex s_tupleMutex;
+    std::unordered_map<ObjectGuid::LowType, std::optional<CustomizeTuple>> s_tuples;
+
+    void RememberTuple(ObjectGuid::LowType guid, std::optional<CustomizeTuple> const& tuple)
+    {
+        std::lock_guard<std::mutex> lock(s_tupleMutex);
+        s_tuples[guid] = tuple;
     }
 
     // Protocol version and the echoed GUID, the prefix of every server-to-client creation packet.
@@ -105,6 +141,32 @@ namespace
         return ReadTuple(bytes, TUPLE_BYTES, tuple);
     }
 
+    // True when the tuple is valid and belongs to the subject's current race and sex (a race change at login
+    // leaves the old row behind, so a cached tuple must be checked against the live character too).
+    bool Matches(CustomizeTuple const& tuple, Player const* subject)
+    {
+        return tuple.race == subject->GetRace() && tuple.sex == static_cast<uint8>(subject->GetGender()) &&
+            *ValidateTuple(tuple) == '\0';
+    }
+
+    // The subject's stored tuple when it is valid for the subject's race and sex.
+    std::optional<CustomizeTuple> StoredTupleFor(Player const* subject)
+    {
+        ObjectGuid::LowType const guid = subject->GetGUID().GetCounter();
+        {
+            std::lock_guard<std::mutex> lock(s_tupleMutex);
+            auto found = s_tuples.find(guid);
+            if (found != s_tuples.end() && (!found->second || Matches(*found->second, subject)))
+                return found->second;
+        }
+        CustomizeTuple tuple;
+        std::optional<CustomizeTuple> result;
+        if (LoadStored(guid, tuple) && Matches(tuple, subject))
+            result = tuple;
+        RememberTuple(guid, result);
+        return result;
+    }
+
     void SaveStored(ObjectGuid::LowType guid, CustomizeTuple const& tuple)
     {
         std::vector<uint8> bytes;
@@ -131,8 +193,13 @@ void OnPlayerLogin(Player* player)
     if (!player)
         return;
 
+    if (player->GetRace() < FIRST_PLAYABLE_RACE || player->GetRace() > LAST_PLAYABLE_RACE)
+        return;
+
     CustomizeTuple tuple;
     ObjectGuid::LowType const guid = player->GetGUID().GetCounter();
+    // Drop whatever an earlier login cached: a race or sex change leaves the old tuple behind.
+    RememberTuple(guid, std::nullopt);
     if (!LoadStored(guid, tuple))
     {
         SendRequest(player);
@@ -150,7 +217,20 @@ void OnPlayerLogin(Player* player)
         SendRequest(player);
         return;
     }
+    RememberTuple(guid, tuple);
     SendSnapshot(player, tuple);
+}
+
+void SendUnitTupleTo(Player const* observer, Player const* subject)
+{
+    if (!observer || !subject || observer == subject)
+        return;
+    if (subject->GetRace() < FIRST_PLAYABLE_RACE || subject->GetRace() > LAST_PLAYABLE_RACE)
+        return;
+    std::optional<CustomizeTuple> const tuple = StoredTupleFor(subject);
+    if (!tuple)
+        return;
+    SendCustomPacket(observer, UNIT_TUPLE_OPCODE, UnitTuplePayload(subject, *tuple));
 }
 
 void HandleUpdate(Player* player, uint8 const* data, std::size_t size)
@@ -176,6 +256,9 @@ void HandleUpdate(Player* player, uint8 const* data, std::size_t size)
     {
         TC_LOG_DEBUG("entities.player.creation", "Rejected update for race {}/{} sex {}/{}",
             tuple.race, player->GetRace(), tuple.sex, static_cast<uint8>(player->GetGender()));
+        // The client's copy is for another race or sex: forget it and ask again, so it re-derives from the live character.
+        RememberTuple(player->GetGUID().GetCounter(), std::nullopt);
+        SendRequest(player);
         return;
     }
     if (char const* error = ValidateTuple(tuple); *error != '\0')
@@ -185,14 +268,22 @@ void HandleUpdate(Player* player, uint8 const* data, std::size_t size)
     }
 
     SaveStored(player->GetGUID().GetCounter(), tuple);
+    RememberTuple(player->GetGUID().GetCounter(), tuple);
     // Echo the stored row so the client can mark its cached copy confirmed.
     SendSnapshot(player, tuple);
+    // Everyone who can see the player gets the new look without relogging.
+    ForEachCustomPacket(UNIT_TUPLE_OPCODE, UnitTuplePayload(player, tuple),
+        [player](WorldPacket const& packet) { player->SendMessageToSet(&packet, false); });
     TC_LOG_DEBUG("entities.player.creation", "Saved race {} clan {} sex {} face {} for {}",
         tuple.race, tuple.clan, tuple.sex, tuple.face, player->GetName());
 }
 
 void AppendDelete(CharacterDatabaseTransaction const& trans, ObjectGuid::LowType guid)
 {
+    {
+        std::lock_guard<std::mutex> lock(s_tupleMutex);
+        s_tuples.erase(guid);
+    }
     trans->PAppend("DELETE FROM `ffxivcharactercustomize` WHERE `guid` = {}", guid);
 }
 

@@ -57,7 +57,8 @@ bool HasValidShape(CustomizeTuple const& tuple)
         && tuple.sex <= 1
         && tuple.clan >= 1
         && tuple.clan <= 2
-        && tuple.flags <= 7;
+        // flags: highlights 0x01, lipstick 0x02, reverse 0x04, mouth menu index bits 3..4
+        && (tuple.flags & ~0x1Fu) == 0;
 }
 
 std::uint8_t ResolveClan(std::uint8_t playableRace, std::uint8_t clan)
@@ -152,8 +153,11 @@ char const* ValidateTuple(CustomizeTuple const& tuple)
     }
     if (tuple.clan != clan)
         return "clan";
-    if (tuple.flags > 7)
+    // flags: highlights 0x01, lipstick 0x02, face paint reversed 0x04, mouth menu index in bits 3..4.
+    if (tuple.flags & ~0x1F)
         return "flags";
+    if (((tuple.flags >> 3) & 0x03) > MenuMax(*row, OptionId::Mouth))
+        return "mouth";
     // Nameday (12 moons of 32 suns, Lobby row 37) and guardian (GuardianDeity rows 1..12)
     // are optional; when set, both nameday parts must be.
     if (tuple.namedayMoon > 12 || tuple.namedayDay > 32 || (tuple.namedayMoon == 0) != (tuple.namedayDay == 0))
