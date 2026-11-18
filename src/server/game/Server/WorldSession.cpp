@@ -23,6 +23,7 @@
 #include "TSPlayer.h"
 #include "TSEvents.h"
 #include "TSCustomPacket.h"
+#include "TSGlobal.h"
 // @tswow-end
 #include "WorldSession.h"
 #include "AccountMgr.h"
@@ -328,6 +329,13 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
                         //! the client to be in world yet. We will re-add the packets to the bottom of the queue and process them later.
                         if (!m_playerRecentlyLogout)
                         {
+                            //@tswow-begin
+                            if (packet->GetOpcode() == 0x51f)
+                            {
+                                if(HandleCustomNotInWorld(*packet))
+                                    break;
+                            }
+                            //@tswow-end
                             requeuePackets.push_back(packet);
                             deletePacket = false;
                             TC_LOG_DEBUG("network", "Re-enqueueing packet with opcode {} with with status STATUS_LOGGEDIN. "
@@ -1880,5 +1888,22 @@ void WorldSession::HandleCustom(WorldPacket& packet)
 
     GetPlayer()->m_msg_buffer
         .ReceivePacket(packet.size(),(char*)packet.contents());
+}
+
+bool WorldSession::HandleCustomNotInWorld(WorldPacket& packet)
+{
+    TSServerBuffer buffer = TSServerBuffer(GetAccountId());
+    if (buffer.ReceivePacket(packet.size(), (char*)packet.contents(), true) == CustomPacketResult::HANDLED_MESSAGE)
+    {
+        opcode_t opcode = buffer.GetOpcode();
+        auto it = notInWorldCustomOpcodeMap.find(opcode);
+        if (it != notInWorldCustomOpcodeMap.end() && it->second)
+        {
+            buffer.callOnSuccess();
+            return true;
+        }
+    }
+    buffer.ClearPacket();
+    return false;
 }
 // @tswow-end

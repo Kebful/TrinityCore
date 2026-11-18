@@ -15,6 +15,8 @@ constexpr std::uint16_t SNAPSHOT_OPCODE = 0x7A34;  // server -> client: stored t
 constexpr std::uint16_t REQUEST_OPCODE = 0x7A35;   // server -> client: please send your tuple
 constexpr std::uint16_t UPDATE_OPCODE = 0x7A36;    // client -> server: save this tuple
 constexpr std::uint16_t UNIT_TUPLE_OPCODE = 0x7A37;  // server -> client: another unit's stored tuple
+constexpr std::uint16_t CREATE_OPCODE = 0x7A38;      // client -> server before the world: name + the tuple chosen at creation
+constexpr std::uint16_t CHAR_LIST_OPCODE = 0x7A39;   // server -> client with the character list: stored tuple per character
 
 // Version 2 appended nameday and guardian (the retired ffxivcharacterprofile row).
 constexpr std::uint8_t PROTOCOL_VERSION = 2;

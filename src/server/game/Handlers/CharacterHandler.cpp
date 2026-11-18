@@ -230,6 +230,7 @@ void WorldSession::HandleCharEnum(PreparedQueryResult result)
     WorldPacket data(SMSG_CHAR_ENUM, 100);                  // we guess size
 
     uint8 num = 0;
+    std::vector<FFXIV::Creation::ListedCharacter> ffxivListed;
 
     data << num;
 
@@ -249,6 +250,7 @@ void WorldSession::HandleCharEnum(PreparedQueryResult result)
                 if (!sCharacterCache->HasCharacterCacheEntry(guid)) // This can happen if characters are inserted into the database manually. Core hasn't loaded name data yet.
                     sCharacterCache->AddCharacterCacheEntry(guid, GetAccountId(), (*result)[1].GetString(), (*result)[4].GetUInt8(), (*result)[2].GetUInt8(), (*result)[3].GetUInt8(), (*result)[10].GetUInt8());
                 ++num;
+                ffxivListed.push_back({guid.GetCounter(), (*result)[2].GetUInt8(), (*result)[4].GetUInt8()});
             }
         }
         while (result->NextRow() && num < MAX_CHARACTERS_PER_REALM); // client shows an error if more than 10 characters are listed
@@ -257,6 +259,9 @@ void WorldSession::HandleCharEnum(PreparedQueryResult result)
     data.put<uint8>(0, num);
 
     SendPacket(&data);
+
+    // The stored FFXIV look of every listed character, so the select screen draws what the server holds.
+    FFXIV::Creation::SendCharacterList(this, ffxivListed);
 }
 
 void WorldSession::HandleCharEnumOpcode(WorldPacket& /*recvData*/)
@@ -599,6 +604,9 @@ void WorldSession::HandleCharCreateOpcode(WorldPacket& recvData)
 
                                                                   // Player created, save it now
             newChar->SaveToDB(characterTransaction, true);
+            // The look the client announced before creating (CREATE_OPCODE) is saved in the same transaction.
+            FFXIV::Creation::AppendCreate(characterTransaction, GetAccountId(), newChar->GetGUID().GetCounter(),
+                newChar->GetName(), newChar->GetRace(), static_cast<uint8>(newChar->GetNativeGender()));
             createInfo->CharCount += 1;
 
             LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_REP_REALM_CHARACTERS);
@@ -1490,6 +1498,7 @@ void WorldSession::HandleCharCustomizeCallback(std::shared_ptr<CharacterCustomiz
 
     /// Customize
     Player::Customize(customizeInfo.get(), trans);
+    FFXIV::Creation::AppendCreate(trans, GetAccountId(), lowGuid, customizeInfo->Name, plrRace, plrGender);
 
     /// Name Change and update atLogin flags
     {

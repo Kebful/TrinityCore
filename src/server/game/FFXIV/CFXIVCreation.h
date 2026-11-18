@@ -22,7 +22,11 @@
 #include "DatabaseEnvFwd.h"
 #include "ObjectGuid.h"
 
+#include <string>
+#include <vector>
+
 class Player;
+class WorldSession;
 
 // Server glue for character creation: login snapshot/request, UPDATE persistence and
 // the delete cleanup. The rules themselves live in CFXIVCreationLogic.h.
@@ -37,6 +41,31 @@ namespace FFXIV::Creation
     // Sends `subject`'s stored tuple to `observer` (UNIT_TUPLE_OPCODE: protocol version, the subject's raw GUID,
     // tuple) so the observer's client draws the subject in its own look. Called when the subject becomes visible.
     void SendUnitTupleTo(Player const* observer, Player const* subject);
+
+    // CREATE_OPCODE, received before the player is in the world (Create, Customize): remembers the tuple the
+    // client chose for `name` on this account until the character is saved. False for malformed or invalid input.
+    bool HandleCreate(uint32 accountId, std::vector<uint8> const& payload);
+
+    // Registers CREATE_OPCODE with the not-in-world custom packet path (RegisterPacketForNotInWorld +
+    // events.CustomPacket.OnReceiveNotInWorld). Safe to call repeatedly; the character list calls it before any client
+    // can create a character.
+    void RegisterPackets();
+
+    // Adds the tuple remembered for this account to the transaction that saves a new or customized character, so the
+    // row exists the moment the character does. Used only when the name, race and sex match the remembered one.
+    bool AppendCreate(CharacterDatabaseTransaction const& trans, uint32 accountId, ObjectGuid::LowType guid,
+                      std::string const& name, uint8 race, uint8 sex);
+
+    struct ListedCharacter
+    {
+        ObjectGuid::LowType guid;
+        uint8 race;
+        uint8 sex;
+    };
+
+    // Sends the stored tuple of every listed FFXIV character with the character list (CHAR_LIST_OPCODE), so the
+    // select screen draws what the server holds instead of a local copy.
+    void SendCharacterList(WorldSession* session, std::vector<ListedCharacter> const& characters);
 
     // Appends the appearance-row delete to a character delete transaction.
     void AppendDelete(CharacterDatabaseTransaction const& trans, ObjectGuid::LowType guid);

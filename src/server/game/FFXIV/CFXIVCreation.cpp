@@ -17,6 +17,9 @@
 
 #include "CFXIVCreation.h"
 #include "TSPlayer.h"
+#include "TSCustomPacket.h"
+#include "TSEvents.h"
+#include "TSGlobal.h"
 #include "CustomPacketDefines.h"
 #include "DatabaseEnv.h"
 #include "Log.h"
@@ -24,7 +27,11 @@
 #include "Player.h"
 #include "CustomPacketWrite.h"
 #include "WorldPacket.h"
+#include "WorldSession.h"
 
+#include <chrono>
+
+#include <algorithm>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -167,7 +174,7 @@ namespace
         return result;
     }
 
-    void SaveStored(ObjectGuid::LowType guid, CustomizeTuple const& tuple)
+    std::string StoreSql(ObjectGuid::LowType guid, CustomizeTuple const& tuple)
     {
         std::vector<uint8> bytes;
         WriteTuple(tuple, bytes);
@@ -183,8 +190,31 @@ namespace
         for (std::uint8_t value : bytes)
             sql += ", " + std::to_string(value);
         sql += ")";
+        return sql;
+    }
 
-        CharacterDatabase.Execute(sql.c_str());
+    void SaveStored(ObjectGuid::LowType guid, CustomizeTuple const& tuple)
+    {
+        CharacterDatabase.Execute(StoreSql(guid, tuple).c_str());
+    }
+
+    // The tuple a client announced for a character it is about to create or customize. The packet arrives before the
+    // character exists, so it waits here, per account, until the save that carries the matching name.
+    struct PendingCreate
+    {
+        std::string name;
+        CustomizeTuple tuple;
+        std::chrono::steady_clock::time_point received;
+    };
+    std::mutex s_pendingMutex;
+    std::unordered_map<uint32, PendingCreate> s_pending;
+    constexpr std::chrono::minutes PENDING_LIFETIME{10};
+
+    void SendToSession(WorldSession* session, uint16 opcode, std::vector<uint8> const& payload)
+    {
+        if (!session)
+            return;
+        ForEachCustomPacket(opcode, payload, [session](WorldPacket const& packet) { session->SendPacket(&packet); });
     }
 }
 
@@ -276,6 +306,147 @@ void HandleUpdate(Player* player, uint8 const* data, std::size_t size)
         [player](WorldPacket const& packet) { player->SendMessageToSet(&packet, false); });
     TC_LOG_DEBUG("entities.player.creation", "Saved race {} clan {} sex {} face {} for {}",
         tuple.race, tuple.clan, tuple.sex, tuple.face, player->GetName());
+}
+
+bool HandleCreate(uint32 accountId, std::vector<uint8> const& payload)
+{
+    // protocol version (1) + name length (1) + name + tuple
+    if (payload.size() < 2 || payload[0] != PROTOCOL_VERSION)
+        return false;
+    std::size_t const nameLength = payload[1];
+    if (nameLength == 0 || payload.size() != 2 + nameLength + TUPLE_BYTES)
+        return false;
+
+    PendingCreate pending;
+    pending.name.assign(reinterpret_cast<char const*>(payload.data()) + 2, nameLength);
+    if (!normalizePlayerName(pending.name))
+        return false;
+    if (!ReadTuple(payload.data() + 2 + nameLength, TUPLE_BYTES, pending.tuple))
+        return false;
+    if (*ValidateTuple(pending.tuple) != '\0')
+    {
+        TC_LOG_DEBUG("entities.player.creation", "Rejected create tuple for {} ({})", pending.name, ValidateTuple(pending.tuple));
+        return false;
+    }
+    pending.received = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(s_pendingMutex);
+    s_pending[accountId] = std::move(pending);
+    return true;
+}
+
+void RegisterPackets()
+{
+    static std::once_flag once;
+    std::call_once(once, []
+    {
+        RegisterPacketForNotInWorld(CREATE_OPCODE, true);
+        ts_events.CustomPacket.OnReceiveNotInWorld(CREATE_OPCODE,
+            [](TSNumber<uint32>, TSPacketRead read, TSNumber<uint32> accountId)
+            {
+                std::vector<uint8> payload;
+                payload.reserve(read.Size());
+                for (totalSize_t i = 0; i < read.Size(); ++i)
+                    payload.push_back(read.ReadUInt8());
+                HandleCreate(accountId, payload);
+            });
+    });
+}
+
+bool AppendCreate(CharacterDatabaseTransaction const& trans, uint32 accountId, ObjectGuid::LowType guid,
+                  std::string const& name, uint8 race, uint8 sex)
+{
+    PendingCreate pending;
+    {
+        std::lock_guard<std::mutex> lock(s_pendingMutex);
+        auto found = s_pending.find(accountId);
+        if (found == s_pending.end())
+            return false;
+        pending = std::move(found->second);
+        s_pending.erase(found);
+    }
+    if (std::chrono::steady_clock::now() - pending.received > PENDING_LIFETIME)
+        return false;
+
+    std::string normalized = name;
+    if (!normalizePlayerName(normalized) || normalized != pending.name)
+        return false;
+    if (pending.tuple.race != race || pending.tuple.sex != sex)
+    {
+        TC_LOG_INFO("entities.player.creation", "Create tuple race/sex mismatch for {}, not saving", name);
+        return false;
+    }
+
+    trans->Append(StoreSql(guid, pending.tuple).c_str());
+    RememberTuple(guid, pending.tuple);
+    return true;
+}
+
+void SendCharacterList(WorldSession* session, std::vector<ListedCharacter> const& characters)
+{
+    RegisterPackets();
+    if (!session)
+        return;
+
+    std::string ids;
+    for (ListedCharacter const& character : characters)
+    {
+        if (character.race < FIRST_PLAYABLE_RACE || character.race > LAST_PLAYABLE_RACE)
+            continue;
+        if (!ids.empty())
+            ids += ",";
+        ids += std::to_string(character.guid);
+    }
+    if (ids.empty())
+        return;
+
+    std::string sql = "SELECT `guid`";
+    for (std::size_t i = 0; i < TUPLE_BYTES; ++i)
+    {
+        sql += ", `";
+        sql += kColumns[i];
+        sql += "`";
+    }
+    sql += " FROM `ffxivcharactercustomize` WHERE `guid` IN (" + ids + ")";
+
+    QueryResult result = CharacterDatabase.Query(sql.c_str());
+    if (!result)
+        return;
+
+    std::vector<uint8> body;
+    uint8 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        ObjectGuid::LowType const guid = fields[0].GetUInt32();
+        std::uint8_t bytes[TUPLE_BYTES];
+        for (std::size_t i = 0; i < TUPLE_BYTES; ++i)
+            bytes[i] = fields[1 + i].GetUInt8();
+        CustomizeTuple tuple;
+        if (!ReadTuple(bytes, TUPLE_BYTES, tuple) || *ValidateTuple(tuple) != '\0')
+            continue;
+        // A race or sex change at login leaves the old row behind: only a row that fits the listed character counts.
+        auto listed = std::find_if(characters.begin(), characters.end(),
+            [guid](ListedCharacter const& character) { return character.guid == guid; });
+        if (listed == characters.end() || listed->race != tuple.race || listed->sex != tuple.sex)
+            continue;
+
+        // The client keys these by the full GUID it already has for the listed character.
+        uint64 const rawGuid = ObjectGuid(HighGuid::Player, guid).GetRawValue();
+        for (int shift = 0; shift < 64; shift += 8)
+            body.push_back(static_cast<uint8>(rawGuid >> shift));
+        WriteTuple(tuple, body);
+        ++count;
+    }
+    while (result->NextRow());
+
+    if (count == 0)
+        return;
+    std::vector<uint8> payload;
+    payload.push_back(PROTOCOL_VERSION);
+    payload.push_back(count);
+    payload.insert(payload.end(), body.begin(), body.end());
+    SendToSession(session, CHAR_LIST_OPCODE, payload);
 }
 
 void AppendDelete(CharacterDatabaseTransaction const& trans, ObjectGuid::LowType guid)
