@@ -2228,7 +2228,7 @@ private:
         uint32 classMask = ClassIdToMask(profile.ClassId);
         uint32 raceMask = ClassIdToMask(player->GetRace());
         uint32 weaponProficiency = 0;
-        uint32 armorProficiency = 0;
+        uint32 armorProficiency = (1u << ITEM_SUBCLASS_ARMOR_MISC);
         bool hasDualWield = false;
         bool hasTitanGrip = false;
         std::set<uint32> knownSpells;
@@ -2269,7 +2269,7 @@ private:
             ItemTemplate const* proto = item->GetTemplate();
             if (!proto)
                 return SetError(error, "an equipped item has no template");
-            if (player->FindEquipSlot(proto, slot, false) != slot)
+            if (player->FindEquipSlot(proto, slot, true) != slot)
                 return SetError(error, "a class-owned equipment item does not fit its stored slot");
             if (proto->AllowableClass && !(proto->AllowableClass & classMask))
                 return SetError(error, "an equipped item is restricted to another class");
@@ -2377,7 +2377,7 @@ private:
             Item* item = player->GetItemByGuid(ObjectGuid(desired.EquippedGuid));
             if (!item || item->GetEntry() != desired.ItemId)
                 return SetError(error, "a class-owned equipment item is missing or no longer matches its profile");
-            if (player->FindEquipSlot(item->GetTemplate(), slot, false) != slot)
+            if (player->FindEquipSlot(item->GetTemplate(), slot, true) != slot)
                 return SetError(error, "a class-owned equipment item does not fit its stored slot");
             if (!item->IsEquipped())
                 addCandidate(item->GetPos(), true);
