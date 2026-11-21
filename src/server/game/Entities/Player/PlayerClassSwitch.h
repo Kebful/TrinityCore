@@ -156,6 +156,9 @@ enum ClassAvailabilityFlags : uint8
 struct ClassDefinition
 {
     uint8 ClassId = 0;
+    // Shared progression slot (FFXIV ExpArrayIndex/WorkIndex): classes and their jobs use the same value.
+    // 0 in the table means "this class is its own group"; the loader replaces it with ClassId.
+    uint8 ExpGroup = 0;
     uint8 InitialLevel = 0;
     uint32 RaceMask = 0;
     std::string Name;

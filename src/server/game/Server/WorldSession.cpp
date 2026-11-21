@@ -516,6 +516,10 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
 /// %Log the player out
 void WorldSession::LogoutPlayer(bool save)
 {
+    TC_LOG_WARN("server", "LogoutPlayer: account {} character '{}' guid {} save={} socketOpen={}",
+        GetAccountId(), _player ? _player->GetName() : "<none>",
+        _player ? _player->GetGUID().ToString() : "<none>",
+        m_Socket && m_Socket->IsOpen(), save);
     // finish pending transfers before starting the logout
     while (_player && _player->IsBeingTeleportedFar())
         HandleMoveWorldportAck();

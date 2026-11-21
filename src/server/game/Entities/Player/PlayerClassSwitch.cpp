@@ -1240,7 +1240,7 @@ private:
         }
 
         QueryResult result = WorldDatabase.Query(
-            "SELECT class_id, initial_level, race_mask, enabled, display_name "
+            "SELECT class_id, initial_level, race_mask, enabled, display_name, exp_group "
             "FROM ffxiv_class_switch_classes ORDER BY class_id");
         if (!result)
         {
@@ -1257,6 +1257,9 @@ private:
             definition.RaceMask = fields[2].GetUInt32();
             definition.Enabled = fields[3].GetBool();
             definition.Name = fields[4].GetString();
+            definition.ExpGroup = fields[5].GetUInt8();
+            if (!definition.ExpGroup)
+                definition.ExpGroup = definition.ClassId;
 
             RuntimeClassDefinition runtime;
             runtime.Definition = definition;
@@ -1286,6 +1289,8 @@ private:
         ClassDefinition const& def = definition.Definition;
         if (!IsSupportedClassId(def.ClassId))
             return SetError(error, "class ID must be between 1 and 32");
+        if (!def.ExpGroup || !IsSupportedClassId(def.ExpGroup))
+            return SetError(error, "exp group must be a class ID between 1 and 32");
         if (!def.Enabled)
             return true;
         if (!def.InitialLevel ||
@@ -1566,6 +1571,137 @@ private:
         return true;
     }
 
+    // FFXIV keeps one level/EXP slot per ExpArrayIndex (Sapphire: WorkIndex): a class and its job share
+    // that slot while keeping their own spellbook, skills and bars. ExpGroup is the same idea here.
+    uint8 ExpGroupForClass(uint8 classId) const
+    {
+        if (RuntimeClassDefinition const* definition = FindDefinition(classId))
+            return definition->Definition.ExpGroup ? definition->Definition.ExpGroup : classId;
+        return classId;
+    }
+
+    bool LoadProgress(uint32 guid, uint8 expGroup, uint16* level, uint32* xp)
+    {
+        QueryResult result = CharacterDatabase.PQuery(
+            "SELECT level, xp FROM ffxiv_class_switch_progress WHERE guid = {} AND exp_group = {}",
+            guid, expGroup);
+        if (!result)
+            return false;
+        Field* fields = result->Fetch();
+        *level = fields[0].GetUInt8();
+        *xp = fields[1].GetUInt32();
+        return *level > 0;
+    }
+
+    void StoreProgress(uint32 guid, uint8 expGroup, uint16 level, uint32 xp)
+    {
+        CharacterDatabase.PExecute(
+            "REPLACE INTO ffxiv_class_switch_progress (guid, exp_group, level, xp) VALUES ({}, {}, {}, {})",
+            guid, expGroup, level, xp);
+    }
+
+    bool LoadOrSeedProgress(uint32 guid, uint8 expGroup, uint16* level, uint32* xp)
+    {
+        if (LoadProgress(guid, expGroup, level, xp))
+            return true;
+
+        // First use of this group (or an existing character migrating from per-class levels): take the
+        // highest-level profile in the group, then persist the shared row. One query per class keeps the
+        // statement static (groups hold at most a class and its jobs).
+        uint16 seedLevel = 0;
+        uint32 seedXp = 0;
+        for (auto const& [classId, definition] : _definitions)
+        {
+            if (definition.Definition.ExpGroup != expGroup)
+                continue;
+            QueryResult result = CharacterDatabase.PQuery(
+                "SELECT level, xp FROM ffxiv_class_switch_profiles WHERE guid = {} AND class_id = {}",
+                guid, uint32(classId));
+            if (!result)
+                continue;
+            Field* fields = result->Fetch();
+            uint16 const rowLevel = fields[0].GetUInt8();
+            if (rowLevel <= seedLevel)
+                continue;
+            seedLevel = rowLevel;
+            seedXp = fields[1].GetUInt32();
+        }
+        if (!seedLevel)
+            return false;
+        *level = seedLevel;
+        *xp = seedXp;
+        StoreProgress(guid, expGroup, seedLevel, seedXp);
+        return true;
+    }
+
+    void CollectAutolearnSpells(Player* player, uint8 classId, uint32 spellClassSet,
+        uint32 fromLevel, uint32 toLevel, std::set<uint32>* out)
+    {
+        SpellAutoLearns const& autolearn = sObjectMgr->GetSpellAutolearns();
+        for (uint32 level = fromLevel; level <= toLevel && level < autolearn.size(); ++level)
+        {
+            for (SpellAutoLearn const& spell : autolearn[level])
+            {
+                if ((spell.classmask && !(spell.classmask & ClassIdToMask(classId))) ||
+                    (spell.racemask && !(spell.racemask & ClassIdToMask(player->GetRace()))))
+                    continue;
+                SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.spell);
+                if (!info || (info->SpellFamilyName && info->SpellFamilyName != spellClassSet))
+                    continue;
+                out->insert(spell.spell);
+            }
+        }
+    }
+
+    bool ApplySharedProgress(Player* player, StoredClassProfile* profile, std::string* error)
+    {
+        RuntimeClassDefinition const* definition = FindDefinition(profile->ClassId);
+        if (!definition)
+            return SetError(error, "shared progress class definition is missing");
+
+        uint16 level = profile->Level;
+        uint32 xp = profile->Xp;
+        uint32 const guid = player->GetGUID().GetCounter();
+        if (!LoadOrSeedProgress(guid, definition->Definition.ExpGroup, &level, &xp))
+            return true;
+
+        if (level < profile->Level)
+        {
+            // Profile newer than the shared row (migration): keep the profile and refresh the row.
+            StoreProgress(guid, definition->Definition.ExpGroup, profile->Level, profile->Xp);
+            return true;
+        }
+        if (level == profile->Level && xp == profile->Xp)
+            return true;
+
+        if (level > profile->Level)
+        {
+            std::set<uint32> known;
+            for (SpellProfile const& spell : profile->Spells)
+                known.insert(spell.Id);
+            std::set<uint32> learned;
+            CollectAutolearnSpells(player, profile->ClassId, definition->SpellClassSet,
+                profile->Level + 1, level, &learned);
+            for (uint32 spellId : learned)
+            {
+                if (!known.insert(spellId).second)
+                    continue;
+                SpellProfile& spell = profile->Spells.emplace_back();
+                spell.Id = spellId;
+                spell.State = PLAYERSPELL_NEW;
+                spell.Active = true;
+            }
+            profile->FreeTalentPoints +=
+                TalentPointsForClassLevel(profile->ClassId, uint8(level)) -
+                TalentPointsForClassLevel(profile->ClassId, profile->Level);
+        }
+
+        profile->Level = level;
+        profile->Xp = xp;
+        profile->NextLevelXp = sObjectMgr->GetXPForLevel(level);
+        return true;
+    }
+
     ProfileLoadStatus LoadProfile(Player* player, uint8 classId, StoredClassProfile* profile,
         std::string* error, ProfileNormalizationReport* normalization = nullptr)
     {
@@ -1650,6 +1786,8 @@ private:
         ProfileLoadStatus loadStatus = LoadProfile(player, classId, profile, error);
         if (loadStatus == ProfileLoadStatus::Loaded)
         {
+            if (!ApplySharedProgress(player, profile, error))
+                return false;
             if (profile->EquipmentMigrated)
             {
                 // Legacy profiles did not store a loadout. Treat the visible
@@ -1689,7 +1827,14 @@ private:
         StoredClassProfile created;
         created.Revision = 1;
         created.ClassId = classId;
-        created.Level = definition->Definition.InitialLevel;
+        // The job inherits the class's level/EXP: read the group before building the starter spell list,
+        // otherwise a job unlocked at 50 would still be created at level 1 with no actions.
+        uint16 sharedLevel = definition->Definition.InitialLevel;
+        uint32 sharedXp = 0;
+        LoadOrSeedProgress(player->GetGUID().GetCounter(),
+            definition->Definition.ExpGroup, &sharedLevel, &sharedXp);
+        created.Level = sharedLevel;
+        created.Xp = sharedXp;
         created.NextLevelXp = sObjectMgr->GetXPForLevel(created.Level);
         created.ActiveSpec = 0;
         created.SpecCount = 1;
@@ -3337,6 +3482,19 @@ private:
             }
             while (profileRows->NextRow());
         }
+        // Shared progression rows: the class/job pair reports one level.
+        std::map<uint8, uint8> groupLevels;
+        if (QueryResult progressRows = CharacterDatabase.PQuery(
+            "SELECT exp_group, level FROM ffxiv_class_switch_progress WHERE guid = {}",
+            player->GetGUID().GetCounter()))
+        {
+            do
+            {
+                Field* fields = progressRows->Fetch();
+                groupLevels[fields[0].GetUInt8()] = fields[1].GetUInt8();
+            }
+            while (progressRows->NextRow());
+        }
         auto activeRow = levels.find(player->GetClass());
         if (!revisionOverride && activeRow != levels.end())
             revision = activeRow->second.second;
@@ -3367,11 +3525,21 @@ private:
                 classId, false, 0, definition.Definition.InitialLevel,
                 uint8(sWorld->getIntConfig(CONFIG_START_PLAYER_LEVEL)),
                 uint8(sWorld->getIntConfig(CONFIG_START_DEATH_KNIGHT_PLAYER_LEVEL)));
-            auto profileLevel = levels.find(classId);
-            if (classId == player->GetClass())
+            uint8 const group = definition.Definition.ExpGroup;
+            if (group == ExpGroupForClass(player->GetClass()))
+            {
+                // The active class's whole group is live, including its job while the class is played.
                 level = player->GetLevel();
-            else if (profileLevel != levels.end() && profileLevel->second.first)
-                level = profileLevel->second.first;
+            }
+            else
+            {
+                auto sharedLevel = groupLevels.find(group);
+                auto profileLevel = levels.find(classId);
+                if (sharedLevel != groupLevels.end() && sharedLevel->second)
+                    level = sharedLevel->second;
+                else if (profileLevel != levels.end() && profileLevel->second.first)
+                    level = profileLevel->second.first;
+            }
             available.push_back({ classId, uint8(level), flags, definition.Definition.Name });
         }
 
@@ -3541,6 +3709,17 @@ bool AppendStoredProfileToTransaction(CharacterDatabaseTransaction const& transa
         << uint32(profile.Level) << ", "
         << profile.Xp << ", UNHEX('" << hex << "'), NOW())";
     transaction->Append(query.str().c_str());
+
+    // Keep the shared level/EXP row in step with the class profile that was just captured.
+    std::ostringstream progress;
+    progress <<
+        "REPLACE INTO ffxiv_class_switch_progress "
+        "(guid, exp_group, level, xp, updated_at) VALUES ("
+        << player->GetGUID().GetCounter() << ", "
+        << uint32(ExpGroupForClass(profile.ClassId)) << ", "
+        << uint32(profile.Level) << ", "
+        << profile.Xp << ", NOW())";
+    transaction->Append(progress.str().c_str());
     return true;
 }
 

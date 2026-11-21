@@ -4263,6 +4263,8 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             trans->Append(stmt);
             trans->PAppend(
                 "DELETE FROM `ffxiv_class_switch_profiles` WHERE `guid` = {}", guid);
+            trans->PAppend(
+                "DELETE FROM `ffxiv_class_switch_progress` WHERE `guid` = {}", guid);
             FFXIV::Creation::AppendDelete(trans, guid);
 // @tswow-begin (Using Rochet2/Transmog)
 #ifdef PRESETS
