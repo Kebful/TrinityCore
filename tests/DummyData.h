@@ -22,6 +22,7 @@
 #include "Define.h"
 #include "DBCStore.h"
 
+#include <deque>
 #include <list>
 #include <string_view>
 
@@ -75,6 +76,57 @@ class UnitTestDataLoader
         static void LoadAchievementTemplates();
         static void LoadItemTemplates();
         static void LoadSpellInfo();
+
+        // Loader for a DBC whose file format has no id column (gtCombatRatings is
+        // "f", gtOCTClassCombatRatingScalar is "df"; 'd' marks the sorted column,
+        // which is not part of the entry). DBCStorage indexes those files by record
+        // position -- the loader assigns ids 0..recordCount-1 in file order -- so a
+        // test that wants the shipped row at a given id places it at that position.
+        // Positions below the highest one asked for are zero-filled; only the rows a
+        // test names are valid DBC data, so do not read any other id from the store.
+        template <typename T>
+        class FlatDBC
+        {
+            class LoaderGuard
+            {
+                public:
+                    LoaderGuard(FlatDBC& d) : _d(d) {}
+                    ~LoaderGuard() { _d.Dump(); }
+
+                    T& At(uint32 position)
+                    {
+                        while (_d._storage.size() <= position)
+                            _d._storage.push_back(T{});
+                        return _d._storage[position];
+                    }
+                private:
+                    FlatDBC& _d;
+            };
+
+            public:
+                FlatDBC(DBCStorage<T>& store) : _store(store) {}
+                LoaderGuard Loader() { return {*this}; }
+
+                void Dump()
+                {
+                    delete[] _store._indexTable.AsT;
+                    _store._indexTableSize = uint32(_storage.size());
+                    _store._indexTable.AsT = new T*[_store._indexTableSize];
+                    for (uint32 i = 0; i < _store._indexTableSize; ++i)
+                        _store._indexTable.AsT[i] = &_storage[i];
+                }
+
+                bool Empty() const
+                {
+                    return !_store._indexTable.AsT;
+                }
+
+            private:
+                // deque, not vector: At() hands out a reference that the caller fills
+                // before the next At(), and deque keeps existing elements in place.
+                std::deque<T> _storage;
+                DBCStorage<T>& _store;
+        };
 
     private:
         static ItemTemplate& GetItemTemplate(uint32 id, std::string_view name);

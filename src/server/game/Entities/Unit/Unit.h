@@ -347,6 +347,16 @@ enum CombatRating
 
 #define MAX_COMBAT_RATING         25
 
+// classRating->Data / Rating->Data from sGtOCTClassCombatRatingScalarStore and
+// sGtCombatRatingsStore: the factor Player::GetRatingBonusValue() multiplies a
+// rating field by. Factored out of Player::GetRatingMultiplier so a caller that has
+// to *invert* a rating (FFXIV/Stats/FFXIVStatProjection.h) uses the exact same two
+// lookups, and so a test can exercise them without a live Player.
+// Returns 1.0f when either row is missing, exactly like Player::GetRatingMultiplier
+// (a present row with a 0 scalar yields 0.0f -- the DBC's own "class has no such
+// rating" value -- and then no rating yields any percentage).
+TC_GAME_API float GetCombatRatingMultiplier(uint8 classId, uint8 level, CombatRating cr);
+
 enum DamageEffectType : uint8
 {
     DIRECT_DAMAGE           = 0,                            // used for normal weapon damage (not for class abilities or spells)

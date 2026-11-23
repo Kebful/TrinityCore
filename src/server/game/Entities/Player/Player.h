@@ -34,6 +34,7 @@
 #include "PetDefines.h"
 #include "PlayerTaxi.h"
 #include "PlayerClassSwitch.h"
+#include "FFXIV/Stats/FFXIVStatTypes.h"
 #include <atomic>
 #include "QuestDef.h"
 // @tswow-begin (Using Rochet2/Transmog)
@@ -1652,6 +1653,11 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
 
         bool UpdateStats(Stats stat) override;
         bool UpdateAllStats() override;
+        // FFXIV derived-stat snapshot (read-only cache; see FFXIV/Stats/).
+        // Rebuilt by UpdateAllStats(), marked dirty by UpdateStats(); never
+        // persisted and never written to a Unit field (I §3.2/§3.3).
+        void RebuildFFXIVStats();
+        FFXIV::Stats::FfxivDerivedStats const& GetFFXIVStats() const;
         void ApplySpellPenetrationBonus(int32 amount, bool apply);
         void UpdateResistances(uint32 school) override;
         void UpdateArmor() override;
@@ -2398,6 +2404,11 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
 
         uint32 m_GuildIdInvited;
         uint32 m_ArenaTeamIdInvited;
+
+        // FFXIV derived-stat cache (slice 1). Derived values, never persisted;
+        // mutable so the const accessor can rebuild lazily.
+        mutable FFXIV::Stats::FfxivDerivedStats _ffxivStats;
+        mutable bool _ffxivStatsDirty = true;
 
         PlayerMails m_mail;
         PlayerSpellMap m_spells;

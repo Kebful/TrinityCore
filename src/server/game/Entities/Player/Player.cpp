@@ -17,6 +17,7 @@
 
 #include "Player.h"
 #include "FFXIV/CFXIVCreation.h"
+#include "FFXIV/Stats/FFXIVStatsSnapshot.h"
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
 #include "ArenaTeam.h"
@@ -5462,20 +5463,26 @@ float Player::GetSpellCritFromIntellect() const
     return crit * 100.0f;
 }
 
-float Player::GetRatingMultiplier(CombatRating cr) const
+float GetCombatRatingMultiplier(uint8 classId, uint8 level, CombatRating cr)
 {
-    uint8 level = GetLevel();
-
     if (level > GT_MAX_LEVEL)
         level = GT_MAX_LEVEL;
 
-    GtCombatRatingsEntry const* Rating = sGtCombatRatingsStore.LookupEntry(cr*GT_MAX_LEVEL+level-1);
-    // gtOCTClassCombatRatingScalarStore.dbc starts with 1, CombatRating with zero, so cr+1
-    GtOCTClassCombatRatingScalarEntry const* classRating = sGtOCTClassCombatRatingScalarStore.LookupEntry((GetClass()-1)*GT_MAX_RATING+cr+1);
+    // gtCombatRatings.dbc is level-indexed (cr * GT_MAX_LEVEL + level - 1) and has
+    // no id column; gtOCTClassCombatRatingScalarStore.dbc starts with 1, CombatRating
+    // with zero, so cr+1 (same composite ids Player::GetRatingMultiplier always used).
+    GtCombatRatingsEntry const* Rating = sGtCombatRatingsStore.LookupEntry(uint32(cr) * GT_MAX_LEVEL + level - 1);
+    GtOCTClassCombatRatingScalarEntry const* classRating =
+        sGtOCTClassCombatRatingScalarStore.LookupEntry((uint32(classId) - 1) * GT_MAX_RATING + uint32(cr) + 1);
     if (!Rating || !classRating)
         return 1.0f;                                        // By default use minimum coefficient (not must be called)
 
     return classRating->Data / Rating->Data;
+}
+
+float Player::GetRatingMultiplier(CombatRating cr) const
+{
+    return GetCombatRatingMultiplier(uint8(GetClass()), GetLevel(), cr);
 }
 
 float Player::GetRatingBonusValue(CombatRating cr) const
@@ -23245,6 +23252,12 @@ void Player::SendInitialPacketsAfterAddToMap()
         else
             ClearQuestSharingInfo();
     }
+
+    // FFXIV stats sheet (phase 1c): the enter-world send point. The snapshot was already
+    // rebuilt pre-world (LoadFromDB), but a pre-world rebuild cannot send, so the client
+    // gets its first snapshot here -- before the sheet can be drawn. The rebuild hook in
+    // PlayerFFXIVStats.cpp keeps it fresh afterwards. Read-only presentation data.
+    FFXIV::Stats::SendFfxivStatsSnapshot(*this);
 }
 
 void Player::SendUpdateToOutOfRangeGroupMembers()

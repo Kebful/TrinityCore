@@ -213,6 +213,11 @@ bool Player::UpdateStats(Stats stat)
 
     SetStat(stat, int32(value));
 
+    // FFXIV snapshot depends on the primary stats, so any stat update
+    // invalidates it. The equip/aura path reaches UpdateStats, not
+    // UpdateAllStats (E §E.1), so both hooks are required.
+    _ffxivStatsDirty = true;
+
     if (stat == STAT_STAMINA || stat == STAT_INTELLECT || stat == STAT_STRENGTH)
     {
         Pet* pet = GetPet();
@@ -342,6 +347,10 @@ bool Player::UpdateAllStats()
     UpdateExpertise(OFF_ATTACK);
     RecalculateRating(CR_ARMOR_PENETRATION);
     UpdateAllResistances();
+
+    // FFXIV slice 1: refresh the read-only derived-stat snapshot last, after
+    // every WoW field above has settled. Writes nothing back.
+    RebuildFFXIVStats();
 
     return true;
 }
