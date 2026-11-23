@@ -903,6 +903,10 @@ public:
             _players.erase(player->GetGUID().GetCounter());
     }
 
+    // Public view of the level/EXP slot a class belongs to. The free functions at the bottom of
+    // this file append rows for stored profiles and cannot call the private helper directly.
+    uint8 ExpGroup(uint8 classId) const { return ExpGroupForClass(classId); }
+
 private:
     bool CommitAcceptedTarget(Player* player, PlayerRuntime& runtime, std::string* error)
     {
@@ -3716,7 +3720,7 @@ bool AppendStoredProfileToTransaction(CharacterDatabaseTransaction const& transa
         "REPLACE INTO ffxiv_class_switch_progress "
         "(guid, exp_group, level, xp, updated_at) VALUES ("
         << player->GetGUID().GetCounter() << ", "
-        << uint32(ExpGroupForClass(profile.ClassId)) << ", "
+        << uint32(Manager().ExpGroup(profile.ClassId)) << ", "
         << uint32(profile.Level) << ", "
         << profile.Xp << ", NOW())";
     transaction->Append(progress.str().c_str());
