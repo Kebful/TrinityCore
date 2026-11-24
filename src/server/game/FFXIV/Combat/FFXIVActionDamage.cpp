@@ -42,7 +42,8 @@
 #include "SpellInfo.h"
 #include "Unit.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
-#include "FFXIVActionProc.h"
+#include "TSEvent.h"
+#include "TSEvents.h"
 
 #include <algorithm>
 #include <cmath>
@@ -730,12 +731,6 @@ bool TryApplyFfxivActionEffect(::Player& caster, ::Unit& target, ::SpellInfo con
     if (actionId == 0)
         return false;
 
-    // A status-gated replacement resolves before anything reads the action id: a Fell Cleave cast
-    // while Nascent Chaos is up is Inner Chaos for potency, combo, gauge and the statuses it applies.
-    // The client shows the replacement on the bar and sends the proc spell; resolving here too keeps a
-    // macro, a trainer or an old bar correct.
-    actionId = ResolveFfxivActionProcId(caster, actionId, stats.jobId, stats.level);
-
     uint32 const nowMs = GameTime::GetGameTimeMS();
     PruneComboState(nowMs);
 
@@ -791,13 +786,22 @@ bool TryApplyFfxivActionEffect(::Player& caster, ::Unit& target, ::SpellInfo con
         {
             FfxivDirectDamageResult const result = ComputeFfxivActionDamage(
                 stats, selection, weaponDamagePercent, targetLevel, party, rolls);
-            if (result.value > 0)
+            int32 value = int32(result.value);
+            // @tswow-begin
+            // FFXIV-named hook: the number is final (FFXIVCombatMath's own crit/direct-hit/variance/
+            // level stages are inside) and it is applied here, not through Spell::m_damage, so WoW's
+            // spell-power, armor, crit and spell-bonus stages never touch it. A livescript may adjust
+            // the final value (Set 0 to take no damage); the crit flag below is the FFXIV roll.
+            FIRE_ID(spellInfo->events.id, Spell, OnFfxivActionDamage, TSSpellInfo(spellInfo), TSUnit(&target),
+                    TSMutableNumber<int32>(&value), TSNumber<uint8>(result.crit ? 1 : 0));
+            // @tswow-end
+            if (value > 0)
             {
                 // The FFXIV number is already final: no WoW spell bonus or crit stage is applied on
                 // top of it, which is why this hook deals the damage itself instead of filling
                 // Spell::m_damage for the vanilla spell-damage path.
                 SpellNonMeleeDamage damageInfo(&caster, &target, spellInfo->Id, spellInfo->GetSchoolMask());
-                damageInfo.damage = uint32(result.value);
+                damageInfo.damage = uint32(value);
                 damageInfo.HitInfo = result.crit ? SPELL_HIT_TYPE_CRIT : 0;
                 caster.SendSpellNonMeleeDamageLog(&damageInfo);
                 caster.DealSpellDamage(&damageInfo, true);

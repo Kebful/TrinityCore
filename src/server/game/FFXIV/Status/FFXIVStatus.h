@@ -38,9 +38,12 @@ class Player;
  *     refreshPolicy  FfxivStatusRefreshPolicy; no sheet states it, the module writes Reset
  *     flags          FfxivStatusFlag, one Status column each
  *
- * `ffxiv_action_status` (actionId, statusId, duration) holds each duration an action's
+ * `ffxiv_action_status` (actionId, statusId, duration, comboOnly) holds each duration an action's
  * ActionTransient text states: the duration belongs to the action, not the status (Stun is 4 s
- * from Holy and 6 s from Shield Bash).
+ * from Holy and 6 s from Shield Bash). comboOnly is 1 when the action's text grants the status only
+ * on a line that starts "Combo Bonus:" (Storm's Eye -> Surging Tempest, Disembowel -> Power Surge):
+ * such a status is applied only when the cast was the correct step of its combo chain
+ * (Combat::WasFfxivCorrectComboStep, the same test the job gauge's comboOnly rows use).
  *
  * An empty or missing table changes nothing: every lookup misses and ApplyFfxivStatus returns false
  * without touching the target.
@@ -105,6 +108,7 @@ struct FfxivActionStatusRow
     uint32 actionId = 0;
     uint32 statusId = 0;
     int32 duration = 0;
+    bool comboOnly = false; // granted only by a correct combo step ("Combo Bonus: Grants ...")
 };
 
 // --- table access ---------------------------------------------------------------------------
@@ -125,7 +129,15 @@ int32 GetFfxivActionStatusDuration(uint32 actionId, uint32 statusId);
 // The statuses ffxiv_action_status lists for the action, in table order; nullptr when it lists none.
 std::vector<uint32> const* GetFfxivActionStatuses(uint32 actionId);
 
-// Apply every status the action lists, from `caster`, using the action's stated duration. `effectTarget` is the unit the
+// True when the action grants the status only on a correct combo step (the row's comboOnly column).
+bool IsFfxivActionStatusComboOnly(uint32 actionId, uint32 statusId);
+
+// The combo rule for one listed status: a plain row always applies, a comboOnly row applies only when
+// `comboCorrect` (the cast was the correct step of its chain). Pure; ApplyFfxivActionStatuses asks it.
+bool ShouldApplyFfxivActionStatus(uint32 actionId, uint32 statusId, bool comboCorrect);
+
+// Apply every status the action lists (a comboOnly one only after a correct combo step: the damage hook of the same
+// EffectDummy has already advanced the chain), from `caster`, using the action's stated duration. `effectTarget` is the unit the
 // action's effect resolved on (the caster for a self effect, the enemy/ally for a targeted one): a debuff goes there, a
 // buff goes there only when it is friendly, else to the caster. A caster buff is applied once per cast (an area effect
 // calls its dummy effect once per target), so a stacking buff does not gain a stack per target.

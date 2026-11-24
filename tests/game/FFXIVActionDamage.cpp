@@ -583,7 +583,7 @@ TEST_CASE("FFXIV combo: the Marauder/Warrior chain the sheet states", "[ffxiv]")
 // --- Warrior chain end to end (combo state -> gauge comboOnly rows -> status row) ---
 namespace WarriorCombo
 {
-constexpr uint8 WarriorCombo::WAR = 21;
+constexpr uint8 WAR = 21;
 constexpr uint8 BEAST = 22;
 constexpr uint32 HEAVY_SWING = 31, MAIM = 37, STORMS_PATH = 42, STORMS_EYE = 45, SURGING_TEMPEST = 2677;
 
@@ -597,7 +597,7 @@ struct WarriorFixture
         FFXIV::Gauge::SetFfxivJobGaugeTables({ { WarriorCombo::WAR, BEAST, "Beast Gauge", 100 } },
             { { 37, WarriorCombo::WAR, BEAST, 35, 10, true }, { 42, WarriorCombo::WAR, BEAST, 35, 20, true }, { 45, WarriorCombo::WAR, BEAST, 50, 10, true } });
         FFXIV::Status::SetFfxivStatusTables({ { SURGING_TEMPEST, 81814, 30000, 0, 0, 0 } },
-                                     { { STORMS_EYE, SURGING_TEMPEST, 30000 } });
+                                     { { STORMS_EYE, SURGING_TEMPEST, 30000, true } });
         FFXIV::Gauge::ClearFfxivGaugeState();
     }
 
@@ -640,6 +640,35 @@ TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: Heavy Swing -> Ma
     CHECK(statuses->size() == 1);
     CHECK((*statuses)[0] == SURGING_TEMPEST);
     CHECK(FFXIV::Status::GetFfxivStatus(SURGING_TEMPEST) != nullptr);
+}
+
+TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: Surging Tempest only follows the correct Maim -> Storm's Eye step", "[ffxiv]")
+{
+    // ffxiv_action_status (45, 2677) is comboOnly ("Combo Bonus: Grants Surging Tempest"): the status hook asks
+    // WasFfxivCorrectComboStep through ShouldApplyFfxivActionStatus, so the same chain that gates the gauge gates it.
+    CHECK(FFXIV::Status::IsFfxivActionStatusComboOnly(STORMS_EYE, SURGING_TEMPEST));
+
+    // Storm's Eye with no predecessor: no Surging Tempest.
+    bool comboCorrect = Cast(STORMS_EYE, 1000);
+    CHECK_FALSE(FFXIV::Status::ShouldApplyFfxivActionStatus(STORMS_EYE, SURGING_TEMPEST, comboCorrect));
+
+    // Skipped Maim: no Surging Tempest.
+    Cast(HEAVY_SWING, 2000);
+    comboCorrect = Cast(STORMS_EYE, 3000);
+    CHECK_FALSE(FFXIV::Status::ShouldApplyFfxivActionStatus(STORMS_EYE, SURGING_TEMPEST, comboCorrect));
+
+    // Heavy Swing -> Maim -> Storm's Eye: Surging Tempest.
+    Cast(HEAVY_SWING, 5000);
+    Cast(MAIM, 6000);
+    comboCorrect = Cast(STORMS_EYE, 7000);
+    CHECK(comboCorrect);
+    CHECK(FFXIV::Status::ShouldApplyFfxivActionStatus(STORMS_EYE, SURGING_TEMPEST, comboCorrect));
+
+    // Window expired between Maim and Storm's Eye: no Surging Tempest.
+    Cast(HEAVY_SWING, 20000);
+    Cast(MAIM, 21000);
+    comboCorrect = Cast(STORMS_EYE, 21000 + 13501);
+    CHECK_FALSE(FFXIV::Status::ShouldApplyFfxivActionStatus(STORMS_EYE, SURGING_TEMPEST, comboCorrect));
 }
 
 TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: a step with no or the wrong predecessor gains nothing", "[ffxiv]")

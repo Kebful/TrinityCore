@@ -17,6 +17,7 @@
 
 #include "FFXIVStatus.h"
 #include "DatabaseEnv.h"
+#include "FFXIV/Combat/FFXIVActionDamage.h"
 #include "GameTime.h"
 #include "Log.h"
 #include "Player.h"
@@ -27,7 +28,9 @@
 #include "Unit.h"
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace FFXIV::Status
 {
@@ -36,6 +39,7 @@ namespace
 std::unordered_map<uint32, FfxivStatusRow> Statuses;
 std::unordered_map<uint64, int32> ActionStatusDurations;
 std::unordered_map<uint32, std::vector<uint32>> ActionStatuses;   // action -> status ids, table order
+std::unordered_set<uint64> ComboOnlyActionStatuses;               // (action, status) granted only by a correct combo
 
 uint64 ActionStatusKey(uint32 actionId, uint32 statusId)
 {
@@ -44,7 +48,7 @@ uint64 ActionStatusKey(uint32 actionId, uint32 statusId)
 
 void LoadFfxivActionStatusRows(std::vector<FfxivActionStatusRow>& rows)
 {
-    QueryResult result = WorldDatabase.Query("SELECT actionId, statusId, duration FROM ffxiv_action_status");
+    QueryResult result = WorldDatabase.Query("SELECT actionId, statusId, duration, comboOnly FROM ffxiv_action_status");
     if (!result)
     {
         TC_LOG_INFO("server.loading", ">> Loaded 0 FFXIV action status durations. DB table `ffxiv_action_status` "
@@ -59,6 +63,7 @@ void LoadFfxivActionStatusRows(std::vector<FfxivActionStatusRow>& rows)
         row.actionId = fields[0].GetUInt32();
         row.statusId = fields[1].GetUInt32();
         row.duration = fields[2].GetInt32();
+        row.comboOnly = fields[3].GetUInt8() != 0;
         if (row.duration <= 0)
         {
             TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_status` has action {} status {} with duration {}, ignored.",
@@ -129,6 +134,8 @@ void SetFfxivStatusTables(std::vector<FfxivStatusRow> statuses, std::vector<Ffxi
     {
         ActionStatusDurations[ActionStatusKey(row.actionId, row.statusId)] = row.duration;
         ActionStatuses[row.actionId].push_back(row.statusId);
+        if (row.comboOnly)
+            ComboOnlyActionStatuses.insert(ActionStatusKey(row.actionId, row.statusId));
     }
 }
 
@@ -137,6 +144,7 @@ void ClearFfxivStatusTables()
     Statuses.clear();
     ActionStatusDurations.clear();
     ActionStatuses.clear();
+    ComboOnlyActionStatuses.clear();
 }
 
 void LoadFfxivStatusTables()
@@ -214,6 +222,16 @@ std::vector<uint32> const* GetFfxivActionStatuses(uint32 actionId)
     return itr == ActionStatuses.end() ? nullptr : &itr->second;
 }
 
+bool IsFfxivActionStatusComboOnly(uint32 actionId, uint32 statusId)
+{
+    return ComboOnlyActionStatuses.count(ActionStatusKey(actionId, statusId)) != 0;
+}
+
+bool ShouldApplyFfxivActionStatus(uint32 actionId, uint32 statusId, bool comboCorrect)
+{
+    return comboCorrect || !IsFfxivActionStatusComboOnly(actionId, statusId);
+}
+
 namespace
 {
 // Caster buffs are applied once per cast: an area effect calls EffectDummy once per target, and a
@@ -245,11 +263,22 @@ int ApplyFfxivActionStatuses(Player& caster, Unit& effectTarget, uint32 actionId
 
     uint32 const nowMs = GameTime::GetGameTimeMS();
     int applied = 0;
+    // A "Combo Bonus: Grants <status>" row (comboOnly) goes out only when this cast was the correct step of its
+    // chain. The damage hook of the same EffectDummy has already advanced the chain; the answer is the same for
+    // every status of the cast, so it is asked for at most once, and only when a comboOnly row is met.
+    std::optional<bool> comboCorrect;
     for (uint32 statusId : *statuses)
     {
         FfxivStatusRow const* row = GetFfxivStatus(statusId);
         if (!row)
             continue;
+        if (IsFfxivActionStatusComboOnly(actionId, statusId))
+        {
+            if (!comboCorrect)
+                comboCorrect = Combat::WasFfxivCorrectComboStep(caster.GetGUID(), actionId, nowMs);
+            if (!ShouldApplyFfxivActionStatus(actionId, statusId, *comboCorrect))
+                continue;
+        }
         // A debuff goes to the unit the action resolved on. A buff goes to that unit only when it is
         // friendly (self or an ally); a hostile effect's buff (e.g. Surging Tempest from Storm's Eye)
         // goes to the caster.

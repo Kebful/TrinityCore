@@ -36,11 +36,13 @@
 #include "Timer.h"
 #include "WorldPacket.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
-#include "FFXIV/Combat/FFXIVActionProc.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
 #include "FFXIV/Status/FFXIVStatus.h"
+#include "TSEvent.h"
+#include "TSEvents.h"
 
 #include <algorithm>
+#include <bitset>
 #include <limits>
 #include <unordered_map>
 
@@ -59,6 +61,7 @@ struct FfxivGaugeState
 };
 
 std::unordered_map<ObjectGuid, FfxivGaugeState> g_state;
+std::bitset<256> g_scriptOwned; // jobs whose gauge a livescript owns (ClaimFfxivJobGauge); memory only
 
 bool DeltaLess(FfxivActionGaugeRow const& left, FfxivActionGaugeRow const& right)
 {
@@ -357,6 +360,25 @@ bool CanAffordFfxivActionGauge(ObjectGuid player, uint32 actionId, uint8 jobId, 
 }
 
 // --------------------------------------------------------------------------
+// script ownership
+// --------------------------------------------------------------------------
+
+void SetFfxivJobGaugeScriptOwned(uint8 jobId, bool owned)
+{
+    g_scriptOwned.set(jobId, owned);
+}
+
+bool IsFfxivJobGaugeScriptOwned(uint8 jobId)
+{
+    return g_scriptOwned.test(jobId);
+}
+
+void ClearFfxivJobGaugeScriptOwners()
+{
+    g_scriptOwned.reset();
+}
+
+// --------------------------------------------------------------------------
 // Player API
 // --------------------------------------------------------------------------
 
@@ -365,9 +387,30 @@ uint16 GetFfxivGauge(Player const& player)
     return GetFfxivGauge(player.GetGUID(), player.GetFFXIVStats().jobId);
 }
 
+uint16 GetFfxivGaugeMax(Player const& player)
+{
+    FfxivJobGaugeRow const* gauge = GetFfxivJobGaugeRow(player.GetFFXIVStats().jobId);
+    return gauge ? gauge->max : 0;
+}
+
+bool IsFfxivGaugeScriptOwned(Player const& player)
+{
+    return IsFfxivJobGaugeScriptOwned(player.GetFFXIVStats().jobId);
+}
+
+bool IsFfxivActionRageCostWaived(Player const& player, uint32 actionId)
+{
+    if (actionId == 0)
+        return false;
+    return IsFfxivGaugeScriptOwned(player) || IsFfxivActionGaugeCostWaived(player, actionId);
+}
+
 bool CanAffordFfxivActionGauge(Player const& player, uint32 actionId)
 {
     auto const& stats = player.GetFFXIVStats();
+    // A script-owned job's cost gate is the script's (Spell.OnCheckCast); the data cost is not read.
+    if (IsFfxivJobGaugeScriptOwned(stats.jobId))
+        return true;
     return CanAffordFfxivActionGauge(player.GetGUID(), actionId, stats.jobId, stats.level,
                                      IsFfxivActionGaugeCostWaived(player, actionId));
 }
@@ -393,6 +436,13 @@ uint16 AddFfxivGauge(Player& player, int32 amount)
     if (after != before)
         SendFfxivJobGauge(player);
     return after;
+}
+
+uint16 SetFfxivGauge(Player& player, int32 value)
+{
+    // Absolute set = relative add of the difference, so the clamp, the change test and the send are
+    // the ones AddFfxivGauge already has.
+    return AddFfxivGauge(player, value - int32(GetFfxivGauge(player)));
 }
 
 bool SpendFfxivGauge(Player& player, uint16 amount)
@@ -461,24 +511,32 @@ void OnFfxivActionResolved(Player& caster, SpellInfo const* spellInfo)
 {
     if (!spellInfo)
         return;
-    if (g_deltas.empty())
-    {
-        TC_LOG_ERROR("sql.sql", "[ffxiv-debug] gauge: no action-gauge rows loaded");
-        return;
-    }
 
     uint32 actionId = Combat::ResolveFfxivActionIdFromSpell(spellInfo->Id);
     if (actionId == 0)
         return;
 
     auto const& stats = caster.GetFFXIVStats();
-    // A status-gated replacement resolves first: Fell Cleave cast under Nascent Chaos is Inner Chaos,
-    // so its row (and its cost) is the replacement action's.
-    actionId = Combat::ResolveFfxivActionProcId(caster, actionId, stats.jobId, stats.level);
     // The damage hook ran for every target of this cast in this same tick, so a correct combo step
     // is recorded at this GameTime (FFXIVActionDamage.h WasFfxivCorrectComboStep).
     bool const comboCorrect =
         Combat::WasFfxivCorrectComboStep(caster.GetGUID(), actionId, GameTime::GetGameTimeMS());
+
+    // The script's turn, for every mapped action whatever the data says: the event carries what the
+    // core knows and nothing else; a script moves the value through TSPlayer::AddFfxivJobGauge.
+    FIRE_ID(spellInfo->events.id, Spell, OnFfxivActionResolved, TSPlayer(&caster), TSSpellInfo(spellInfo),
+            TSNumber<uint32>(actionId), comboCorrect);
+
+    // A job a script owns has no data path: its rows, waivers and cost are not read.
+    if (IsFfxivJobGaugeScriptOwned(stats.jobId))
+        return;
+
+    if (g_deltas.empty())
+    {
+        TC_LOG_ERROR("sql.sql", "[ffxiv-debug] gauge: no action-gauge rows loaded");
+        return;
+    }
+
     bool const waived = IsFfxivActionGaugeCostWaived(caster, actionId);
     uint16 const before = GetFfxivGauge(caster);
     bool const applied = ApplyFfxivActionGauge(caster.GetGUID(), stats.jobId, stats.level, actionId,

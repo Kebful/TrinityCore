@@ -33,7 +33,6 @@
 #include "Timer.h"
 #include "WorldPacket.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
-#include "FFXIV/Combat/FFXIVActionProc.h"
 
 #include <algorithm>
 #include <limits>
@@ -332,10 +331,6 @@ void OnFfxivActionResolved(Player& caster, SpellInfo const* spellInfo)
     if (actionId == 0)
         return;
 
-    // A status-gated replacement resolves first, exactly as the gauge and damage hooks do: the pool
-    // that pays is the one of the action the cast actually became.
-    auto const& stats = caster.GetFFXIVStats();
-    actionId = Combat::ResolveFfxivActionProcId(caster, actionId, stats.jobId, stats.level);
 
     if (!ConsumeFfxivCharge(caster, actionId))
         return;

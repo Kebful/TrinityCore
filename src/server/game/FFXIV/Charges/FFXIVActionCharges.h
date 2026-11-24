@@ -72,9 +72,7 @@ class SpellInfo;
  * Hook
  * ----
  *   gate    Spell::CheckCast, next to the gauge gate: a pool at 0 refuses the cast with
- *           SPELL_FAILED_NOT_READY. The resolved replacement's pool is the one read (a proc
- *           replacement resolves to its own action id first), so a replacement at 0 is refused the
- *           same way. No row -> allowed, which is the empty-table rule.
+ *           SPELL_FAILED_NOT_READY. No row -> allowed, which is the empty-table rule.
  *   consume Spell::_handle_finish_phase, from OnFfxivActionResolved: the same once-per-successful-cast
  *           point the gauge delta uses, so an area action pays once and a missed action still pays.
  *           This is the only consume site in the tree.
@@ -168,8 +166,7 @@ void ClearFfxivActionChargeState(); // tests
 // --- the hooks ------------------------------------------------------------------------------
 
 // Spell::_handle_finish_phase, once per successful cast (the gauge's hook point, and the only place a
-// charge is consumed). Resolves the spell to its action id and then to a status-gated replacement
-// before consuming, so the pool that pays is the one the cast actually used.
+// charge is consumed). Resolves the spell to its action id before consuming.
 void OnFfxivActionResolved(Player& caster, SpellInfo const* spellInfo);
 
 // Player::Update: sends a snapshot when the pool a client would draw changed (a charge came back).

@@ -201,3 +201,28 @@ TEST_CASE_METHOD(StatusTableFixture, "FFXIV status: only a CanStatusOff status m
     REQUIRE(container.auras.count(90304) == 0);
     REQUIRE_FALSE(RequestRemoveFfxivStatusFrom(container, 304));
 }
+
+TEST_CASE("FFXIV status: a comboOnly action status applies only on a correct combo step", "[ffxiv]")
+{
+    // Storm's Eye 45 -> Surging Tempest 2677 is "Combo Bonus: Grants Surging Tempest" (comboOnly 1); Inner
+    // Release 7389 -> Inner Strength 2663 is a plain grant.
+    SetFfxivStatusTables({ { 2677, 81814, 30000, 0, 0, 0 }, { 2663, 81815, 15000, 0, 0, 0 } },
+                         { { 45, 2677, 30000, true }, { 7389, 2663, 15000, false } });
+
+    CHECK(IsFfxivActionStatusComboOnly(45, 2677));
+    CHECK_FALSE(IsFfxivActionStatusComboOnly(7389, 2663));
+    CHECK_FALSE(IsFfxivActionStatusComboOnly(45, 2663));   // not a row at all
+
+    CHECK(ShouldApplyFfxivActionStatus(45, 2677, true));
+    CHECK_FALSE(ShouldApplyFfxivActionStatus(45, 2677, false));
+    CHECK(ShouldApplyFfxivActionStatus(7389, 2663, false)); // a plain row ignores the combo state
+    CHECK(ShouldApplyFfxivActionStatus(7389, 2663, true));
+
+    // The duration and the status list are untouched by the flag.
+    CHECK(GetFfxivActionStatusDuration(45, 2677) == 30000);
+    REQUIRE(GetFfxivActionStatuses(45) != nullptr);
+    CHECK(GetFfxivActionStatuses(45)->size() == 1);
+
+    ClearFfxivStatusTables();
+    CHECK_FALSE(IsFfxivActionStatusComboOnly(45, 2677));
+}

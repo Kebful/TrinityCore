@@ -6561,14 +6561,18 @@ void Unit::EnergizeBySpell(Unit* victim, uint32 spellId, int32 damage, Powers po
 
 void Unit::EnergizeBySpell(Unit* victim, SpellInfo const* spellInfo, int32 damage, Powers powerType)
 {
+    // @tswow-begin
+    // The event fires even for the FFXIV rage suppression below: it is a notification livescripts may
+    // want (a proc that "should" have energised), and a handler is free to change `damage`. What the
+    // suppression removes is the *gain*, not the knowledge of it.
+    FIRE_ID(spellInfo->events.id, Spell, OnEnergizeBySpell, TSUnit(victim), TSSpellInfo(spellInfo), TSNumber<uint8>(powerType), TSMutableNumber<int32>(&damage));
+    // @tswow-end
+
     // FFXIV: a module class's rage is the job gauge's display; no spell (including a script) adds to
     // it. See FFXIV::Gauge::SuppressesWowRage.
     if (powerType == POWER_RAGE && FFXIV::Gauge::SuppressesWowRage(*victim))
         return;
 
-    // @tswow-begin
-    FIRE_ID(spellInfo->events.id, Spell, OnEnergizeBySpell, TSUnit(victim), TSSpellInfo(spellInfo), TSNumber<uint8>(powerType), TSMutableNumber<int32>(&damage));
-    // @tswow-end
     victim->ModifyPower(powerType, damage, false);
     victim->GetThreatManager().ForwardThreatForAssistingMe(this, float(damage)/2, spellInfo, true);
     SendEnergizeSpellLog(victim, spellInfo->Id, damage, powerType);
@@ -9550,6 +9554,13 @@ void Unit::SetPower(Powers power, uint32 val, bool withPowerUpdate /*= true*/, b
     uint32 maxPower = GetMaxPower(power);
     if (maxPower < val)
         val = maxPower;
+
+    // @tswow-begin
+    // Fired for a player whose power actually changes. The FFXIV job gauge sets POWER_RAGE from the
+    // script-owned value, so a script can keep a display bar in sync without a core resource rule.
+    if (Player* powerOwner = ToPlayer())
+        FIRE(Player, OnPowerChanged, TSPlayer(powerOwner), TSNumber<uint8>(power), TSNumber<uint32>(val), TSNumber<uint32>(maxPower));
+    // @tswow-end
 
     SetStatInt32Value(UNIT_FIELD_POWER1 + AsUnderlyingType(power), val);
 

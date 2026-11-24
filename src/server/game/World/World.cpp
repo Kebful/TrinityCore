@@ -49,7 +49,6 @@
 #include "DisableMgr.h"
 #include "GameEventMgr.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
-#include "FFXIV/Combat/FFXIVActionProc.h"
 #include "FFXIV/Charges/FFXIVActionCharges.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "FFXIV/Status/FFXIVStatus.h"
@@ -1700,11 +1699,6 @@ void World::SetInitialWorldSettings()
     // once-per-cast consume read. A missing table leaves every action on its stock cooldown.
     TC_LOG_INFO("server.loading", "Loading FFXIV action charge table...");
     FFXIV::Charges::LoadFfxivActionChargesTable();
-
-    // FFXIV action replacements (ffxiv_action_proc): the status-gated "this action becomes that one"
-    // rows the cast hook resolves with. A missing table leaves every action on its own id.
-    TC_LOG_INFO("server.loading", "Loading FFXIV action replacement tables...");
-    FFXIV::Combat::LoadFfxivActionProcTables();
 
     TC_LOG_INFO("server.loading", "Loading SpellInfo diminishing infos...");
     sSpellMgr->LoadSpellInfoDiminishing();

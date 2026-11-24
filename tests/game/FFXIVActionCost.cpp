@@ -16,15 +16,14 @@
  */
 
 /*
- * The FFXIV resource-cost gate and the status-gated action replacement, both pure: the rows are the
- * ones tools/generate-ffxiv-job-gauges.py and tools/generate-ffxiv-action-procs.py write from the
- * shipped sheets (Inner Beast 49 / Fell Cleave 3549 -50, Inner Release 1177 waives Fell Cleave and
- * Decimate, Nascent Chaos 1897 turns Fell Cleave into Inner Chaos 16465).
+ * The FFXIV resource-cost gate, pure: the rows are the ones tools/generate-ffxiv-job-gauges.py writes
+ * from the shipped sheets (Inner Beast 49 / Fell Cleave 3549 -50, Inner Release 1177 waives Fell
+ * Cleave and Decimate). The status-gated replacement (Nascent Chaos -> Inner Chaos) is not a core
+ * rule: the client swaps the action and livescripts/spell-scripts/Warrior/warrior.ts gates it.
  */
 
 #include "tc_catch2.h"
 
-#include "FFXIV/Combat/FFXIVActionProc.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
 
 using namespace FFXIV::Gauge;
@@ -43,7 +42,6 @@ constexpr uint32 DECIMATE = 3550;
 constexpr uint32 MAIM = 37;
 constexpr uint32 INNER_CHAOS = 16465;
 constexpr uint32 CHAOTIC_CYCLONE = 16463;
-constexpr uint32 NASCENT_CHAOS = 1897;
 constexpr uint32 INNER_RELEASE = 1177;
 
 ObjectGuid const Player1 = ObjectGuid::Create<HighGuid::Player>(1);
@@ -74,21 +72,12 @@ std::vector<FfxivActionCostWaiverRow> Waivers()
     return { { INNER_RELEASE, FELL_CLEAVE }, { INNER_RELEASE, DECIMATE } };
 }
 
-std::vector<FFXIV::Combat::FfxivActionProcRow> Procs()
-{
-    return {
-        { NASCENT_CHAOS, WAR, FELL_CLEAVE, INNER_CHAOS, 80 },
-        { NASCENT_CHAOS, WAR, DECIMATE, CHAOTIC_CYCLONE, 72 },
-    };
-}
-
 struct CostFixture
 {
     CostFixture()
     {
         SetFfxivJobGaugeTables(Gauges(), Deltas());
         SetFfxivActionCostWaiverRows(Waivers());
-        FFXIV::Combat::SetFfxivActionProcRows(Procs());
         ClearFfxivGaugeState();
     }
 
@@ -96,7 +85,6 @@ struct CostFixture
     {
         ClearFfxivJobGaugeTables();
         ClearFfxivGaugeState();
-        FFXIV::Combat::ClearFfxivActionProcRows();
     }
 };
 } // namespace
@@ -166,33 +154,4 @@ TEST_CASE_METHOD(CostFixture, "FFXIV cost: the waiver table names the statuses",
     CHECK(GetFfxivActionCostWaiverStatuses(FELL_CLEAVE).empty());
     ClearFfxivJobGaugeTables();
     CHECK(GetFfxivActionCostWaiverStatuses(INNER_BEAST).empty());
-}
-
-TEST_CASE_METHOD(CostFixture, "FFXIV proc: the replacement row is the one the sheet states", "[ffxiv]")
-{
-    REQUIRE(FFXIV::Combat::HasFfxivActionProcRows());
-
-    auto const* row = FFXIV::Combat::FindFfxivActionProcRow(FELL_CLEAVE, WAR, 80);
-    REQUIRE(row != nullptr);
-    CHECK(row->statusId == NASCENT_CHAOS);
-    CHECK(row->procActionId == INNER_CHAOS);
-
-    // Below the replacement's level it does not apply.
-    CHECK(FFXIV::Combat::FindFfxivActionProcRow(FELL_CLEAVE, WAR, 79) == nullptr);
-    // Decimate -> Chaotic Cyclone is the same status at level 72.
-    auto const* cyclone = FFXIV::Combat::FindFfxivActionProcRow(DECIMATE, WAR, 72);
-    REQUIRE(cyclone != nullptr);
-    CHECK(cyclone->procActionId == CHAOTIC_CYCLONE);
-    // Not an action a replacement consumes, or not this job.
-    CHECK(FFXIV::Combat::FindFfxivActionProcRow(INNER_BEAST, WAR, 80) == nullptr);
-    CHECK(FFXIV::Combat::FindFfxivActionProcRow(FELL_CLEAVE, MRD, 80) == nullptr);
-
-    // The proc action is the gated one; the base action it replaces is not.
-    CHECK(FFXIV::Combat::IsFfxivActionProcResult(INNER_CHAOS, WAR));
-    CHECK_FALSE(FFXIV::Combat::IsFfxivActionProcResult(FELL_CLEAVE, WAR));
-
-    // No table: every action keeps its own id.
-    FFXIV::Combat::ClearFfxivActionProcRows();
-    CHECK_FALSE(FFXIV::Combat::HasFfxivActionProcRows());
-    CHECK(FFXIV::Combat::FindFfxivActionProcRow(FELL_CLEAVE, WAR, 80) == nullptr);
 }

@@ -28,7 +28,8 @@ class SpellInfo;
 class Unit;
 
 /*
- * FFXIV job gauges (GATE 6: the framework, one gauge -- Warrior's Beast Gauge).
+ * FFXIV job gauges (GATE 6: the framework; the one gauge today, Warrior's Beast Gauge, is owned by its
+ * livescript -- see "Who decides").
  *
  * Data
  * ----
@@ -54,6 +55,21 @@ class Unit;
  * because EffectDummy runs once per target (an area spender would pay N times) and the damage hook
  * returns before resolving an action with no potency (Infuriate).
  *
+ * It fires the script event Spell.OnFfxivActionResolved(player, spellInfo, actionId, comboCorrect)
+ * (keyed by spell id), then, for a job no script owns, applies the data rows below.
+ *
+ * Who decides (per job)
+ * ---------------------
+ * The core stores the value and speaks the protocol; WHO changes it is per job:
+ *   - a job a livescript has claimed (ClaimFfxivJobGauge, SetFfxivJobGaugeScriptOwned) is the script's:
+ *     the core applies none of its `ffxiv_action_gauge` rows, runs no `CanAffordFfxivActionGauge`
+ *     refusal, honours no `ffxiv_action_cost_waiver` row, and charges no WoW rage cost for its actions.
+ *     The script moves the value with AddFfxivJobGauge / SetFfxivJobGauge (the Player API below) and
+ *     refuses a cast it cannot afford from Spell.OnCheckCast. The data rows stay in the world database;
+ *     they are what the client's table and the generator's checks are built from.
+ *   - every other job is data-driven exactly as before: rows, cost gate and waivers read by the core.
+ * The claim is memory only: a restart without the script leaves every job data-driven.
+ *
  * State
  * -----
  * One value per player, tagged with the job it belongs to; reading it as another job gives 0 and
@@ -61,6 +77,8 @@ class Unit;
  *
  * Cost (the cast gate)
  * --------------------
+ * (A script-owned job skips all of this: CanAffordFfxivActionGauge(Player) is true for it and its script
+ * refuses in Spell.OnCheckCast. The rest of this section is the data-driven path.)
  * A spender's cost is its `ffxiv_action_gauge` row's negative delta (a spender row; `comboOnly` rows
  * are gains and never spends). `CanAffordFfxivActionGauge` is the pure check Spell::CheckCast runs
  * before a cast starts; ApplyFfxivActionGauge still clamps at 0 as a safety, but a cast that cannot
@@ -184,17 +202,35 @@ bool ApplyFfxivActionGauge(ObjectGuid player, uint8 jobId, uint8 level, uint32 a
 bool CanAffordFfxivActionGauge(ObjectGuid player, uint32 actionId, uint8 jobId, uint8 level,
                                bool costWaived = false);
 
+// --- script ownership ------------------------------------------------------------------------
+
+// Marks the job's gauge as owned by a livescript (see "Who decides" above). Idempotent; memory only,
+// and independent of the tables, so a claim made before or after LoadFfxivJobGaugeTables holds.
+void SetFfxivJobGaugeScriptOwned(uint8 jobId, bool owned);
+bool IsFfxivJobGaugeScriptOwned(uint8 jobId);
+void ClearFfxivJobGaugeScriptOwners(); // tests
+
 // --- Player API (the player's current job and level from GetFFXIVStats) ----------------------
 
 uint16 GetFfxivGauge(Player const& player);
-uint16 AddFfxivGauge(Player& player, int32 amount);   // sends 0x7A62 on a change
+uint16 GetFfxivGaugeMax(Player const& player);        // 0 when the player's job has no gauge
+uint16 AddFfxivGauge(Player& player, int32 amount);   // clamps to 0..max; mirrors rage, sends 0x7A62 on a change
+uint16 SetFfxivGauge(Player& player, int32 value);    // same, to an absolute value
 bool SpendFfxivGauge(Player& player, uint16 amount);  // sends 0x7A62 on success
 
 // The cast gate, from the player's own job and level. False means the cast must not start.
 bool CanAffordFfxivActionGauge(Player const& player, uint32 actionId);
 
-// True when a status the player is carrying waives the action's gauge cost.
+// True when a status the player is carrying waives the action's gauge cost (ffxiv_action_cost_waiver).
 bool IsFfxivActionGaugeCostWaived(Player const& player, uint32 actionId);
+
+// True when the core must not charge the action's WoW rage cost (Spell::CheckPower / TakePower): a
+// table waiver, or the player's job is script-owned and the script is the cost authority. The rage
+// bar is only the gauge's display; nothing is lost, the script spends through AddFfxivJobGauge.
+bool IsFfxivActionRageCostWaived(Player const& player, uint32 actionId);
+
+// True when the player's current job is script-owned.
+bool IsFfxivGaugeScriptOwned(Player const& player);
 
 // --- rage: the gauge's display ---------------------------------------------------------------
 
@@ -211,8 +247,9 @@ uint16 SyncFfxivRage(Player& player);
 
 // --- the hook ---------------------------------------------------------------------------------
 
-// Spell::_handle_finish_phase, once per successful cast. Not an FFXIV action, no gauge for the
-// caster's job, or no delta: returns without touching anything.
+// Spell::_handle_finish_phase, once per successful cast. Not an FFXIV action: returns. Otherwise
+// fires Spell.OnFfxivActionResolved (player, spellInfo, actionId, comboCorrect); then, unless the
+// caster's job is script-owned, applies the data rows (no gauge or no delta: nothing changes).
 void OnFfxivActionResolved(Player& caster, SpellInfo const* spellInfo);
 
 // --- wire ---------------------------------------------------------------------------------------

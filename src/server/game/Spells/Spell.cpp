@@ -28,7 +28,6 @@
 #include "DisableMgr.h"
 #include "DynamicObject.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
-#include "FFXIV/Combat/FFXIVActionProc.h"
 #include "FFXIV/Combat/FFXIVActionShape.h"
 #include "FFXIV/Combat/FFXIVComboHighlight.h"
 #include "FFXIV/Charges/FFXIVActionCharges.h"
@@ -3893,8 +3892,7 @@ void Spell::_handle_finish_phase()
         FFXIV::Gauge::OnFfxivActionResolved(*player, m_spellInfo);
 
     // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): the same once-per-cast point, and
-    // the only place a charge is consumed. Resolves the action and then a status-gated replacement,
-    // so the pool that pays is the cast's own. Inert for an action with no charge row.
+    // the only place a charge is consumed. Inert for an action with no charge row.
     if (Player* player = m_caster->ToPlayer())
         FFXIV::Charges::OnFfxivActionResolved(*player, m_spellInfo);
 
@@ -4961,9 +4959,11 @@ void Spell::TakePower()
     if (!m_powerCost)
         return;
 
-    // @ffxiv-begin: a waived FFXIV action pays nothing (CheckPower let it through at any rage).
+    // @ffxiv-begin: a waived FFXIV action pays nothing (CheckPower let it through at any rage). A
+    // script-owned job's gauge is spent by its script (TSPlayer::AddFfxivJobGauge), which also
+    // rewrites the rage mirror, so the core takes no WoW rage for it either.
     if (m_spellInfo->PowerType == POWER_RAGE && unitCaster->IsPlayer())
-        if (FFXIV::Gauge::IsFfxivActionGaugeCostWaived(*unitCaster->ToPlayer(),
+        if (FFXIV::Gauge::IsFfxivActionRageCostWaived(*unitCaster->ToPlayer(),
                 FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id)))
             return;
     // @ffxiv-end
@@ -5627,7 +5627,8 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
         // @ffxiv-begin: FFXIV job-gauge cost. A Warrior spender's Spell.dbc rage cost is the same
         // number as its Beast Gauge cost, but rage is only the gauge's display: the gauge is the
         // authority, and a spender must not start at 0 even if the two ever disagreed. Still inert
-        // while no ffxiv_action_gauge row names the action (Cost 0 = free).
+        // while no ffxiv_action_gauge row names the action (Cost 0 = free), and always true for a
+        // script-owned job: its script refuses from Spell.OnCheckCast (CallScriptCheckCastHandlers).
         if (Player* player = m_caster->ToPlayer())
         {
             uint32 const actionId = FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id);
@@ -5639,20 +5640,14 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
                                  uint32(FFXIV::Gauge::GetFfxivGauge(*player)));
                     return SPELL_FAILED_NO_POWER;
                 }
-                // A status-gated replacement action (Inner Chaos 16465) is only castable while the
-                // status that produces it is up; the base action it replaces is never gated here.
-                if (!FFXIV::Combat::IsFfxivActionProcGateSatisfied(*player, actionId,
-                                                                  player->GetFFXIVStats().jobId))
-                    return SPELL_FAILED_CASTER_AURASTATE;
                 // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): the action's own pool is
-                // the timing, because the flat cooldown was cleared in the data. A replacement is
-                // refused on its own pool, exactly like the base action (the proc id resolves first).
-                // No row -> HasFfxivChargeAvailable is true, so nothing changes for every other spell.
-                uint32 const chargedActionId = FFXIV::Combat::ResolveFfxivActionProcId(
-                    *player, actionId, player->GetFFXIVStats().jobId, player->GetFFXIVStats().level);
-                if (!FFXIV::Charges::HasFfxivChargeAvailable(*player, chargedActionId))
+                // the timing, because the flat cooldown was cleared in the data. No row ->
+                // HasFfxivChargeAvailable is true, so nothing changes for every other spell. A
+                // status-gated action (Inner Chaos under Nascent Chaos) is gated by its livescript
+                // (OnCheckCast), not here.
+                if (!FFXIV::Charges::HasFfxivChargeAvailable(*player, actionId))
                 {
-                    TC_LOG_DEBUG("spells", "FFXIV action {}: no charge left, cast refused", chargedActionId);
+                    TC_LOG_DEBUG("spells", "FFXIV action {}: no charge left, cast refused", actionId);
                     return SPELL_FAILED_NOT_READY;
                 }
             }
@@ -6829,9 +6824,11 @@ SpellCastResult Spell::CheckPower() const
     // @ffxiv-begin: a status waives an FFXIV action's cost (Inner Release 1177: Fell Cleave and
     // Decimate cost 0). Spell.dbc's RAGE cost is a fixed number, so the waiver has to be applied
     // here and in TakePower; the client applies the same rule in Spell_C_GetPowerCost so its button
-    // and tooltip agree. See ffxiv_action_cost_waiver (FFXIV/Gauge/FFXIVJobGauge.h).
+    // and tooltip agree. See ffxiv_action_cost_waiver (FFXIV/Gauge/FFXIVJobGauge.h). For a
+    // script-owned job the script is the cost authority (its OnCheckCast refuses what the gauge
+    // cannot pay, waiver included), so the WoW rage check is not a second opinion here.
     if (m_powerCost > 0 && powerType == POWER_RAGE && m_caster->IsPlayer()
-        && FFXIV::Gauge::IsFfxivActionGaugeCostWaived(*m_caster->ToPlayer(),
+        && FFXIV::Gauge::IsFfxivActionRageCostWaived(*m_caster->ToPlayer(),
               FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id)))
         return SPELL_CAST_OK;
     // @ffxiv-end

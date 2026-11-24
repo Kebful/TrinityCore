@@ -164,3 +164,27 @@ TEST_CASE("FFXIV gauge: the 0x7A62 payload", "[ffxiv]")
     CHECK(none == std::vector<uint8>{ 0, 0, 0, 0, 0, 0, 0, FFXIV_JOB_GAUGE_SCHEMA });
     CHECK(none.size() == FFXIV_JOB_GAUGE_FIXED_BYTES);
 }
+
+TEST_CASE_METHOD(GaugeFixture, "FFXIV gauge: a job's script ownership is a per-job memory flag", "[ffxiv]")
+{
+    ClearFfxivJobGaugeScriptOwners();
+    CHECK_FALSE(IsFfxivJobGaugeScriptOwned(WAR));
+
+    SetFfxivJobGaugeScriptOwned(WAR, true);
+    CHECK(IsFfxivJobGaugeScriptOwned(WAR));
+    CHECK_FALSE(IsFfxivJobGaugeScriptOwned(MRD)); // per job: another job stays data-driven
+
+    // The claim survives a table reload (the livescript loads before or after the world tables) and
+    // does not touch the value store the script writes through.
+    ClearFfxivJobGaugeTables();
+    CHECK(IsFfxivJobGaugeScriptOwned(WAR));
+    SetFfxivJobGaugeTables(Gauges(), Deltas());
+    CHECK(AddFfxivGauge(Player1, WAR, 30) == 30);
+    CHECK(IsFfxivJobGaugeScriptOwned(WAR));
+
+    SetFfxivJobGaugeScriptOwned(WAR, false);
+    CHECK_FALSE(IsFfxivJobGaugeScriptOwned(WAR));
+    SetFfxivJobGaugeScriptOwned(WAR, true);
+    ClearFfxivJobGaugeScriptOwners();
+    CHECK_FALSE(IsFfxivJobGaugeScriptOwned(WAR));
+}
