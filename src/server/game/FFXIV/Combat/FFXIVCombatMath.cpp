@@ -35,6 +35,7 @@
 #include "FFXIVCombatMath.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
 #include <algorithm>
+#include <limits>
 
 namespace FFXIV::Combat
 {
@@ -114,6 +115,18 @@ int64 ApplyBuffs(int64 value, std::span<FfxivPercentFactor const> buffs, FfxivCo
         value = FloorDiv(value * buff.numerator, buff.denominator);
     }
     return value;
+}
+
+// Saturating multiply, used only by the tooltip scalar: every factor is a
+// shipped-table value, so a product that cannot fit in int64 is a data bug, and
+// saturating keeps the wire field well formed instead of wrapping it.
+int64 MulOrSaturate(int64 left, int64 right)
+{
+    if (left == 0 || right == 0)
+        return 0;
+    if (left > std::numeric_limits<int64>::max() / right)
+        return std::numeric_limits<int64>::max();
+    return left * right;
 }
 } // namespace
 
@@ -283,6 +296,28 @@ int32 ComputeFfxivLevelCorrectionPermille(uint8 attackerLevel, uint8 targetLevel
     return std::max<int32>(0, 1000 - FFXIV_LEVEL_CORRECTION_PERMILLE_PER_LEVEL * difference);
 }
 
+int32 ComputeFfxivTooltipMultiplierBasisPoints(FfxivDerivedStats const& stats, int32 weaponDamage,
+                                               uint8 targetLevel, FfxivPartyComposition party,
+                                               FfxivTraitState traits)
+{
+    // Same terms as the pipeline (f(ATK) on the party-boosted stat, f(DET), f(TNC),
+    // f(WD), the trait): BuildAttackTerms is the single place those are derived.
+    FfxivAttackTerms const terms = BuildAttackTerms(stats, weaponDamage, party, traits);
+    int32 const correction = ComputeFfxivLevelCorrectionPermille(stats.level, targetLevel);
+
+    // basis points = 10000 * (ATK/100)*(DET/1000)*(TNC/1000)*(WD/100)*(trait/100)*(LC/1000)
+    //              = ATK*DET*TNC*WD*trait*LC / 10^11
+    // One division at the end, so the wire value is the floor of the exact product.
+    int64 numerator = int64(terms.attackPercent) * terms.detPermille;
+    numerator = MulOrSaturate(numerator, terms.tncPermille);
+    numerator = MulOrSaturate(numerator, terms.weaponPercent);
+    numerator = MulOrSaturate(numerator, terms.traitPercent);
+    numerator = MulOrSaturate(numerator, correction);
+
+    int64 const basisPoints = numerator / 100000000000LL; // 10^11
+    return int32(std::min<int64>(basisPoints, std::numeric_limits<int32>::max()));
+}
+
 // --------------------------------------------------------------------------
 // direct damage (B §F15.1 / §F23.5)
 // --------------------------------------------------------------------------
@@ -307,12 +342,12 @@ FfxivDirectDamageResult ComputeFfxivDirectDamage(FfxivDerivedStats const& stats,
     result.trace.Add(FfxivCombatStageId::WeaponDamagePercent, terms.weaponPercent);
     result.trace.Add(FfxivCombatStageId::TraitPercent, terms.traitPercent);
 
-    // D2 = floor(D1 * f(TNC)/1000 * f(WD)/100 * Trait) / 100
-    // The trailing / 100 is the published scale division; see the header's
-    // UNITS / SCALE note (the alternative flp(2) reading of B §B.0 is 100x larger).
+    // D2 = floor(D1 * f(TNC)/1000 * f(WD)/100 * Trait/100)
+    // ONE division per factor: f(WD) is the absolute weapon value (MAIN*jobMod/1000 + WD, e.g. 176 at
+    // L100), so the /100 here is the whole scale. An extra trailing /100 made every hit 100x small;
+    // cross-checked against Sapphire CalcStats::calcActionDamage (150 potency, L100 -> 4224).
     int64 const damage2 = FloorDiv(damage1 * terms.tncPermille * terms.weaponPercent * terms.traitPercent,
-                                   int64(1000) * 100 * 100)
-        / 100;
+                                   int64(1000) * 100 * 100);
     result.trace.Add(FfxivCombatStageId::Stage2Damage, damage2);
 
     // F9 / F10 rolls. Order matters for a seeded source: crit first, then DH.
@@ -386,10 +421,9 @@ FfxivHealResult ComputeFfxivHeal(FfxivDerivedStats const& stats, int32 curePoten
     result.trace.Add(FfxivCombatStageId::WeaponDamagePercent, weaponPercent);
     result.trace.Add(FfxivCombatStageId::TraitPercent, traitPercent);
 
-    // H2 = floor(H1 * f(TNC)/1000 * f(WD)/100 * Trait) / 100
+    // H2 = floor(H1 * f(TNC)/1000 * f(WD)/100 * Trait/100); same single scale as damage.
     int64 const heal2 = FloorDiv(heal1 * tncPermille * weaponPercent * traitPercent,
-                                 int64(1000) * 100 * 100)
-        / 100;
+                                 int64(1000) * 100 * 100);
     result.trace.Add(FfxivCombatStageId::Stage2Damage, heal2);
 
     result.critChanceBp = stats.rate.critBp;
@@ -450,10 +484,9 @@ int64 ComputeFfxivDotTickInternal(FfxivDerivedStats const& stats, int32 potency,
         trace.Add(FfxivCombatStageId::TenacityPermille, terms.tncPermille);
         trace.Add(FfxivCombatStageId::WeaponDamagePercent, terms.weaponPercent);
         trace.Add(FfxivCombatStageId::TraitPercent, terms.traitPercent);
-        // D2 = floor(D1 * f(TNC)/1000 * f(SPD)/1000 * f(WD)/100 * Trait) / 100 + 1
+        // D2 = floor(D1 * f(TNC)/1000 * f(SPD)/1000 * f(WD)/100 * Trait/100) + 1
         damage2 = FloorDiv(damage1 * terms.tncPermille * speedPermille * terms.weaponPercent * terms.traitPercent,
-                           int64(1000) * 1000 * 100 * 100)
-            / 100;
+                           int64(1000) * 1000 * 100 * 100);
     }
     else
     {
@@ -464,10 +497,9 @@ int64 ComputeFfxivDotTickInternal(FfxivDerivedStats const& stats, int32 potency,
         trace.Add(FfxivCombatStageId::TenacityPermille, terms.tncPermille);
         trace.Add(FfxivCombatStageId::WeaponDamagePercent, terms.weaponPercent);
         trace.Add(FfxivCombatStageId::TraitPercent, terms.traitPercent);
-        // D2 = floor(D1 * f(DET)/1000 * f(TNC)/1000 * Trait) / 100 + 1
+        // D2 = floor(D1 * f(DET)/1000 * f(TNC)/1000 * Trait/100) + 1
         damage2 = FloorDiv(damage1 * terms.detPermille * terms.tncPermille * terms.traitPercent,
-                           int64(1000) * 1000 * 100)
-            / 100;
+                           int64(1000) * 1000 * 100);
     }
     damage2 += 1; // the published +1 lands before variance, unlike direct damage
     trace.Add(FfxivCombatStageId::DotPlusOne, damage2);

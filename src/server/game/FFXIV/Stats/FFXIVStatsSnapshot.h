@@ -18,6 +18,7 @@
 #ifndef TRINITYCORE_FFXIV_STATS_SNAPSHOT_H
 #define TRINITYCORE_FFXIV_STATS_SNAPSHOT_H
 
+#include "FFXIV/Combat/FFXIVActionDamage.h"
 #include "FFXIVStatTypes.h"
 #include <cstddef>
 #include <cstdint>
@@ -59,11 +60,16 @@ constexpr uint16 FFXIV_STATS_SNAPSHOT_OPCODE = 0x7A60;
 
 // Payload schema. A change in field set or width is a new number (the client rejects
 // every other size/schema pair as a whole rather than parsing it partially).
-constexpr uint8 FFXIV_STATS_SNAPSHOT_SCHEMA = 1;
+//
+// Schema 2 (GATE 7) appends the tooltip damage multiplier in basis points; schema 1 had no such
+// field. The new field sits at offset 42 and the schema byte stays last, so every schema-1 offset
+// is unchanged. A schema-1 client sees a different size and rejects the packet whole, which is
+// the intended tolerance; this server never sends schema 1 any more.
+constexpr uint8 FFXIV_STATS_SNAPSHOT_SCHEMA = 2;
 
 // job u8, level u8, base[6] u16, secondaries[6] u16, hp u32, mp u32, gcd u32,
-// provenance u32, schema u8. Packed, little-endian, no padding.
-constexpr std::size_t FFXIV_STATS_SNAPSHOT_BYTES = 43;
+// provenance u32, damageMultiplierBp u32, schema u8. Packed, little-endian, no padding.
+constexpr std::size_t FFXIV_STATS_SNAPSHOT_BYTES = 47;
 
 // Traffic switch. ON: the packet is presentation data only -- it changes no gameplay
 // value, so sending it is unconditional under this flag. Turning it off leaves the
@@ -94,18 +100,46 @@ enum FfxivStatsSnapshotOffset : std::size_t
     FFXIV_SNAPSHOT_OFF_MP         = 30,  // u32
     FFXIV_SNAPSHOT_OFF_GCD        = 34,  // u32, milliseconds
     FFXIV_SNAPSHOT_OFF_PROVENANCE = 38,  // u32, FfxivProvenance bits
-    FFXIV_SNAPSHOT_OFF_SCHEMA     = 42,  // u8
+    FFXIV_SNAPSHOT_OFF_MULTIPLIER = 42,  // u32, basis points (schema 2)
+    FFXIV_SNAPSHOT_OFF_SCHEMA     = 46,  // u8
 };
+
+// --- the action potency list (GATE 7) --------------------------------------------------------
+//
+// A second custom-packet sub-opcode, sent from the same two call sites as the snapshot (the
+// enter-world send and the rebuild hook), so it is refreshed whenever the snapshot is. It is not
+// part of the snapshot payload: the list is ~4 bytes per action while the snapshot is a fixed
+// 47 bytes, and mixing them would make every snapshot rebuild carry the whole table.
+//
+// The list is the plain damage column only (combo/positional are contextual and are not shown) for
+// the actions that resolve for this (job, level) -- CollectFfxivActionPlainPotencies.
+constexpr uint16 FFXIV_ACTION_POTENCY_OPCODE = 0x7A61;
+constexpr uint8 FFXIV_ACTION_POTENCY_SCHEMA = 1;
+
+// count u16, count x { actionId u16, damage u16 }, schema u8. Packed, little-endian, no padding.
+constexpr std::size_t FFXIV_ACTION_POTENCY_HEADER_BYTES = 3;
+constexpr std::size_t FFXIV_ACTION_POTENCY_ENTRY_BYTES = 4;
+
+constexpr std::size_t FfxivActionPotencyPayloadBytes(std::size_t count)
+{
+    return FFXIV_ACTION_POTENCY_HEADER_BYTES + count * FFXIV_ACTION_POTENCY_ENTRY_BYTES;
+}
 
 // Pure function: snapshot -> payload bytes. No Player, no DB, no logging, no I/O, so the
 // unit test can pin the exact wire image. Little-endian by explicit byte writes rather
 // than a struct overlay (the layout has no padding and does not depend on host
 // endianness or packing rules).
-std::vector<uint8> BuildFfxivStatsSnapshotPayload(FfxivDerivedStats const& stats);
+std::vector<uint8> BuildFfxivStatsSnapshotPayload(FfxivDerivedStats const& stats,
+                                                  uint32 damageMultiplierBp);
+
+// Pure function: the compact action potency list -> payload bytes (same discipline).
+// An action id or a potency above u16 is a data bug: those entries are skipped here and
+// counted by the caller's log, never wrapped on the wire.
+std::vector<uint8> BuildFfxivActionPotencyPayload(std::vector<Combat::FfxivActionPlainPotency> const& entries);
 
 // Fills the payload from Player::GetFFXIVStats() (the cached snapshot; it rebuilds once
-// if dirty) and sends it over the custom channel. Discarded entirely when
-// kFfxivStatsSnapshotSendEnabled is false.
+// if dirty) and sends it over the custom channel, followed by the action potency list.
+// Discarded entirely when kFfxivStatsSnapshotSendEnabled is false.
 void SendFfxivStatsSnapshot(Player& player);
 } // namespace FFXIV::Stats
 

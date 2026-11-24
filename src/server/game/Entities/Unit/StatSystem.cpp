@@ -24,6 +24,7 @@
 #include "Item.h"
 #include "Pet.h"
 #include "Player.h"
+#include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "SharedDefines.h"
 #include "SpellAuras.h"
 #include "SpellAuraEffects.h"
@@ -1233,6 +1234,17 @@ void Player::UpdatePowerRegen(Powers power)
 {
     if (power == POWER_HEALTH || power >= MAX_POWERS)
         return;
+
+    // FFXIV: the client predicts nothing for a module class's rage -- the job gauge is the authority
+    // and the server writes gauge -> rage. The bit is PLAYER_FIELD_BYTES2's ignore-prediction mask
+    // (FFXIV::Gauge::SyncFfxivRage sets it as well); the two regen fields are zeroed so no other
+    // reader sees a rate either.
+    if (power == POWER_RAGE && FFXIV::Gauge::SuppressesWowRage(*this))
+    {
+        SetFloatValue(UNIT_FIELD_POWER_REGEN_FLAT_MODIFIER + AsUnderlyingType(POWER_RAGE), 0.f);
+        SetFloatValue(UNIT_FIELD_POWER_REGEN_INTERRUPTED_FLAT_MODIFIER + AsUnderlyingType(POWER_RAGE), 0.f);
+        return;
+    }
 
     float result_regen              = 0.f; // Out-of-combat / without last mana use effect
     float result_regen_interrupted  = 0.f; // In combat / with last mana use effect

@@ -1,0 +1,321 @@
+/*
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef TRINITYCORE_FFXIV_ACTION_DAMAGE_H
+#define TRINITYCORE_FFXIV_ACTION_DAMAGE_H
+
+#include "FFXIV/Combat/FFXIVCombatMath.h"
+#include "ObjectGuid.h"
+#include <functional>
+#include <vector>
+
+/*
+ * The one core rule of the FFXIV combat slice: an action's cast resolves to
+ *
+ *     potency (plain / combo / flank / front / rear, or the cure column)
+ *       -> FFXIVCombatMath's published pipeline
+ *       -> a damage or heal amount applied to the cast's target
+ *
+ * Data
+ * ----
+ * Three world tables, all owned by the data slice (FFXIVActionPotency's sibling):
+ *
+ *   ffxiv_action_potency(actionId, classJob, minLevel, kind, damage, cure, combo, flank, front, rear)
+ *   ffxiv_action_combo(actionId, nextActionId)
+ *   ffxiv_action_spell(actionId, spellId)
+ *
+ * A combo row is read as "actionId, then nextActionId is a correct combo" -- the same direction as
+ * the reference's `nextCombo` list (Sapphire aab9cb23, data/actions/player.json: Fast Blade 9 ->
+ * [11, 15, 5822]). A cast is a correct combo when a row (lastActionId, thisActionId) exists.
+ *
+ * The potency and combo tables are keyed by the retail Action id (Heavy Swing = 31), but the cast
+ * only carries the WoW spell id the module created for that action. ffxiv_action_spell is the map
+ * between the two: the module writes it when it creates the action spells, and the hook resolves
+ * spellInfo->Id through it before any lookup. A spell with no row is not an FFXIV action cast.
+ *
+ * All three tables are loaded once at startup from the world database. A missing or empty table
+ * leaves the tables empty and therefore leaves every cast on its existing path: no mapping row, no
+ * FFXIV handling, no number invented. That is the shipping state until the data slice lands.
+ *
+ * Lookup precedence
+ * -----------------
+ * Rows are selected for one (actionId, classJob, level). Only rows whose minLevel is <= the level
+ * are candidates; among those, an exact classJob match outranks a generic row, and a higher minLevel
+ * outranks a lower one. Concretely, the winner is the candidate with the highest
+ * (classJob == job ? 2 : generic ? 1 : 0, minLevel) pair. A generic row is classJob 0 (the sheet's
+ * fallthrough) or classJob 255 (the role lines: Tank / DPS / Healer). No other job's row is ever
+ * used.
+ *
+ * Potency precedence
+ * ------------------
+ * On a hostile target: combo (when the last action makes this a correct combo and the row states a
+ * combo potency), then the target-relative positional column (flank / front / rear, by the angle
+ * from the target's facing -- FFXIV positionals are measured on the *target's* hitbox), then the
+ * plain damage column. A cure column is used only when the row states no damage-side potency at all.
+ *
+ * Combo window
+ * ------------
+ * The last action id is tracked per player and is only read while the player is in combat and the
+ * entry is at most 12500 ms old (the reference's MAX_COMBO_LENGTH, Sapphire aab9cb23
+ * src/common/Common.h:61). A damaging cast that is neither a combo starter nor a combo step clears
+ * it (a non-combo action); heals and actions outside the combo table do not touch it. See
+ * FFXIVActionDamage.cpp for the exact rule.
+ */
+
+class Player;
+class Unit;
+class SpellInfo;
+
+namespace FFXIV::Combat
+{
+// One ffxiv_action_potency row. `kind` is FfxivActionPotencyKind; 0 is accepted for a row that
+// only states a value.
+struct FfxivActionPotencyRow
+{
+    uint32 actionId = 0;
+    uint8 classJob = 0;   // 0 or 255 = generic row, used when no exact job row applies
+    uint8 minLevel = 0;   // applies at this level and above
+    uint8 kind = 0;       // FfxivActionPotencyKind
+    uint16 damage = 0;
+    uint16 cure = 0;
+    uint16 combo = 0;     // potency when the previous action forms a correct combo
+    uint16 flank = 0;     // potency when the attacker is on the target's flank
+    uint16 front = 0;     // potency when the attacker is in front of the target
+    uint16 rear = 0;      // potency when the attacker is behind the target
+};
+
+// One ffxiv_action_combo row: "actionId, then nextActionId" is a correct combo.
+struct FfxivActionComboRow
+{
+    uint32 actionId = 0;
+    uint32 nextActionId = 0;
+};
+
+// One ffxiv_action_spell row: the WoW spell the module created for a retail Action id. Both sides
+// are unique; a spell appears at most once, and one action has at most one spell.
+struct FfxivActionSpellRow
+{
+    uint32 actionId = 0;
+    uint32 spellId = 0;
+};
+
+// The reference's combo window (Sapphire aab9cb23 src/common/Common.h:61 MAX_COMBO_LENGTH).
+constexpr uint32 FFXIV_COMBO_WINDOW_MS = 12500;
+
+// ffxiv_action_potency classJob 255: the role lines (Tank / DPS / Healer). Like 0 it applies to
+// every job; unlike a ClassJob row (0..FFXIV_JOB_COUNT-1) it is cross-job data, not a sheet id.
+constexpr uint8 FFXIV_ACTION_ROLE_JOB = 255;
+
+// Positional sectors, measured on the target's facing: 0 degrees is the target facing the attacker.
+// Front is the arc inside +-45 degrees, rear the arc at/beyond +-135 degrees, flank the rest (the
+// standard 90/90/90 split; the split points themselves are INFERRED -- no shipped data states them).
+constexpr int32 FFXIV_POSITIONAL_FRONT_DEGREES = 45;
+constexpr int32 FFXIV_POSITIONAL_REAR_DEGREES = 135;
+
+enum class FfxivPositional : uint8
+{
+    Front = 0,
+    Flank,
+    Rear,
+};
+
+// Which column of the row the cast resolved to; None means the action is not an FFXIV action here
+// (no row, or a row with no usable potency) and the caller must take its existing path.
+enum class FfxivPotencySource : uint8
+{
+    None = 0,
+    Plain,
+    Combo,
+    Flank,
+    Front,
+    Rear,
+    Cure,
+};
+
+struct FfxivPotencySelection
+{
+    FfxivPotencySource source = FfxivPotencySource::None;
+    uint16 potency = 0;
+
+    bool IsDamage() const
+    {
+        return source != FfxivPotencySource::None && source != FfxivPotencySource::Cure;
+    }
+};
+
+// --- table access ---------------------------------------------------------------------------
+
+// True when a potency row's classJob applies to every job: 0 (the sheet's generic fallthrough)
+// or 255 (the role line). Such a row is only used when no exact ClassJob row applies.
+bool IsFfxivActionGenericJob(uint8 classJob);
+
+// The loader's classJob gate: an exact ClassJob row (0..FFXIV_JOB_COUNT-1) or the role value 255.
+// A row outside that set names no job and is dropped.
+bool IsValidFfxivActionPotencyClassJob(uint8 classJob);
+
+// Startup load from the world database. Missing tables log once and leave the tables empty.
+void LoadFfxivActionDamageTables();
+
+// Replace the potency and combo tables. Used by the loader and by tests; the vectors are copied
+// and sorted. The spell map is independent and keeps its rows (see SetFfxivActionSpellRows).
+void SetFfxivActionDamageTables(std::vector<FfxivActionPotencyRow> potency,
+                                std::vector<FfxivActionComboRow> combo);
+
+// Replace the spell -> action map. Used by the loader and by tests; sorted by spell id.
+void SetFfxivActionSpellRows(std::vector<FfxivActionSpellRow> spellRows);
+
+// Drop every table (tests; also the state missing tables load into).
+void ClearFfxivActionDamageTables();
+
+bool HasFfxivActionPotencyRows();
+bool HasFfxivActionSpellRows();
+
+// The retail Action id the module created `spellId` for, or 0 when this spell is not a mapped
+// FFXIV action (including spellId 0). The potency and combo tables are keyed by the returned id;
+// 0 means the hook must leave the cast on its existing path.
+uint32 ResolveFfxivActionIdFromSpell(uint32 spellId);
+
+// The f(WD) the live hook feeds the pipeline for every action cast. There is no FFXIV gear model
+// yet, so this is f(WD)'s level term alone (ComputeFfxivWeaponDamagePercent(stats, 0)). The tooltip
+// multiplier must use the same value or its number would not describe the damage the hook applies.
+int32 ComputeFfxivActionWeaponDamagePercent(FfxivDerivedStats const& stats);
+
+// The player's party as unique roles, the same input the damage hook and the diagnostic command
+// build (the player first, then every group member; pets are not roles).
+FfxivPartyComposition FfxivPartyFromGroup(::Player& player);
+
+// --- the plain damage column, for the tooltip (GATE 7) ---------------------------------------
+//
+// One entry per action id that has a usable row for (classJobId, level), holding the row's *plain*
+// damage column only. Combo/flank/front/rear are contextual and are not part of the tooltip, so
+// they are not sent. A cure-only row has damage 0 and is omitted. Sorted by action id, no
+// duplicates. Empty when the potency table is empty -- the same condition that keeps every cast on
+// its existing damage path.
+struct FfxivActionPlainPotency
+{
+    uint32 actionId = 0;
+    uint16 damage = 0;
+};
+
+std::vector<FfxivActionPlainPotency> CollectFfxivActionPlainPotencies(uint8 classJobId, uint8 level);
+
+// The winning row for (actionId, classJobId, level) under the precedence above, or nullptr.
+FfxivActionPotencyRow const* FindFfxivActionPotencyRow(uint32 actionId, uint8 classJobId, uint8 level);
+
+// --- combo table ----------------------------------------------------------------------------
+
+// A row (lastActionId, actionId) exists: using lastActionId then actionId is a correct combo.
+bool IsFfxivComboCorrect(uint32 lastActionId, uint32 actionId);
+
+// actionId appears as the next action of some combo row (it can continue a chain).
+bool IsFfxivComboStep(uint32 actionId);
+
+// actionId appears as the first action of some combo row (it can start a chain).
+bool IsFfxivComboStarter(uint32 actionId);
+
+// nowMs - lastActionMs <= FFXIV_COMBO_WINDOW_MS (the window is inclusive).
+bool IsFfxivComboWindowOpen(uint32 lastActionMs, uint32 nowMs);
+
+// Whether any ffxiv_action_combo row is loaded.
+bool HasFfxivActionComboRows();
+
+// The action a correct combo expects after `actionId`: the lowest nextActionId among its
+// ffxiv_action_combo rows, or 0 when no row starts at `actionId`. Several rows can name different
+// successors (retail's PvP combo routes); the lowest keeps the answer deterministic and the port
+// models no routing. Read-only; the combo highlight (FFXIV/Combat/FFXIVComboHighlight.h) uses it.
+uint32 NextFfxivComboActionId(uint32 actionId);
+
+// The first successor of `actionId` that has a generated action spell, as a spell id; 0 when none.
+// The game sheet can list several successors (Heavy Swing -> Skull Sunder 35, Maim 37, ...), and the
+// lowest id is not always one the module ships a spell for. The combo highlight must draw a button
+// that exists, so it skips successors without a spell row instead of sending 0 and clearing the ring.
+uint32 NextFfxivComboActionSpell(uint32 actionId);
+
+// The spell the module created for `actionId` (ffxiv_action_spell), or 0 when there is no row.
+// The reverse of ResolveFfxivActionIdFromSpell; both sides of the map are unique.
+uint32 ResolveFfxivSpellFromActionId(uint32 actionId);
+
+// --- action knowledge -----------------------------------------------------------------------
+//
+// The reconcile selection (Player::LearnMissingFfxivActionSpells): the player knows the action
+// spells their ClassJob and level qualify for, whether or not a data build wrote autolearn rows.
+//
+// The spells to learn for (classJobId, level): for each action with a selected potency row for
+// that job and level (exact classJob, or generic 0/255) and a mapped, nonzero spell id, the spell
+// id, unless `isKnown` returns true. Sorted and unique. Empty when the potency or spell table is
+// empty, which is the shipping state until the data slice lands -- a missing table changes
+// nothing. A row whose minLevel is above the level is not selected, and a potency row with no
+// spell row contributes nothing.
+std::vector<uint32> SelectFfxivActionSpellsToLearn(uint8 classJobId, uint8 level,
+    std::function<bool(uint32)> const& isKnown);
+
+// The last action `caster` cast that can still continue a chain: recorded inside the combo window.
+// 0 means the chain is broken, expired, or not active. The in-combat gate is the caller's, because
+// this signature carries no Player (the damage hook reads it as `caster.IsInCombat() && ...`).
+uint32 GetFfxivLastActionId(ObjectGuid caster, uint32 nowMs);
+
+// After a cast resolved: true when `actionId`, cast by `caster` at `castMs`, was a combo step used
+// with the correct predecessor. The live hook records exactly that cast as the new last action
+// (and erases the state for a wrong step), so a step recorded at `castMs` is a correct one. A pure
+// starter is never a step and returns false. Read-only; used by the job gauge's "Combo Bonus" rule
+// (FFXIV/Gauge/FFXIVJobGauge.h), which runs once per cast after every target was resolved.
+bool WasFfxivCorrectComboStep(ObjectGuid caster, uint32 actionId, uint32 castMs);
+
+// Advance `caster`'s combo chain for one resolved cast (the damage hook's own step, exposed so a test
+// can drive it without a Player): a starter or a correctly chained step becomes the new last action, a
+// step with the wrong predecessor erases the chain, and any other damaging action erases it too.
+// `lastActionId` is the predecessor read before this cast (0 when none or expired).
+void AdvanceFfxivComboState(ObjectGuid caster, uint32 actionId, uint32 lastActionId, uint32 nowMs,
+                            bool damaging);
+
+// --- selection and math ---------------------------------------------------------------------
+
+// The sector a target-relative angle falls in. `degrees` is normalised to -180..180 first; the
+// boundaries belong to the wider sector (45 degrees is flank, 135 is rear).
+FfxivPositional FfxivPositionalFromAngleDegrees(int32 degrees);
+
+// Resolve one cast to a potency column. `targetAngleDegrees` is the attacker's angle on the target's
+// hitbox (0 = attacker in front of the target) and is only consulted when `hostileTarget` is true.
+FfxivPotencySelection SelectFfxivActionPotency(uint32 actionId, uint8 classJobId, uint8 level,
+                                               uint32 lastActionId, int32 targetAngleDegrees,
+                                               bool hostileTarget);
+
+// The published damage pipeline for a resolved selection. `weaponDamagePercent` is f(WD) (see
+// ComputeFfxivWeaponDamagePercent), not the raw weapon damage.
+FfxivDirectDamageResult ComputeFfxivActionDamage(FfxivDerivedStats const& stats,
+                                                 FfxivPotencySelection const& selection,
+                                                 int32 weaponDamagePercent, uint8 targetLevel,
+                                                 FfxivPartyComposition party, FfxivRollSource& rolls);
+
+// The published heal pipeline for a cure selection (same inputs; no direct-hit term inside).
+FfxivHealResult ComputeFfxivActionHeal(FfxivDerivedStats const& stats,
+                                       FfxivPotencySelection const& selection,
+                                       int32 weaponDamagePercent, uint8 targetLevel,
+                                       FfxivPartyComposition party, FfxivRollSource& rolls);
+
+// --- the live hook --------------------------------------------------------------------------
+//
+// Called from Spell::EffectDummy, the only effect handler the module's FFXIV action spells reach
+// (every one of them ships a single DUMMY effect). Returns true when the cast was handled here and
+// the vanilla DUMMY handling must be skipped. False means "not an FFXIV action cast", which is every
+// cast while the tables are empty.
+
+bool TryApplyFfxivActionEffect(::Player& caster, ::Unit& target, ::SpellInfo const* spellInfo);
+
+} // namespace FFXIV::Combat
+
+#endif // TRINITYCORE_FFXIV_ACTION_DAMAGE_H

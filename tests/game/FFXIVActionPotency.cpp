@@ -26,7 +26,7 @@
  *     sheet writes (the starter actions' rows are decoded by the generator and checked there against
  *     datascripts/classes/spells/ffxiv-starter-data.ts).
  *
- * The vector is the module table's plain `potency` / `curePotency` / `kind` for every one of its 660
+ * The vector is the module table's plain `potency` / `curePotency` / `kind` for every one of its 664
  * action ids (the 651 Action rows the module ships as spells plus the nine hand-authored starters),
  * with 0xFFFF for a slot the sheet states conditionally or not at all. It is transcribed by the same
  * generator (--cpp-test-out), so this test compares the compiled server resolver against the
@@ -69,7 +69,7 @@ FfxivActionPotency Potency(uint32 actionId, uint8 job, uint8 level)
 }
 
 // The row counts of the module table, as published in POTENCY-EXTRACTOR-20261123.md §4.
-constexpr std::size_t EXPECTED_ACTIONS = 660;
+constexpr std::size_t EXPECTED_ACTIONS = 664;
 } // namespace
 
 TEST_CASE("FFXIV action potency: table coverage", "[ffxiv]")
@@ -93,7 +93,7 @@ TEST_CASE("FFXIV action potency: table coverage", "[ffxiv]")
 
 TEST_CASE("FFXIV action potency: module table cross-check", "[ffxiv]")
 {
-    // All 660 rows: every plain damage and cure value is identical to the module table's, and so is
+    // All 664 rows: every plain damage and cure value is identical to the module table's, and so is
     // the kind of every row. A conditional slot has no plain value and is resolved by the branch
     // tests below instead.
     std::size_t damage = 0, heal = 0, conditional = 0, none = 0;
@@ -129,8 +129,10 @@ TEST_CASE("FFXIV action potency: module table cross-check", "[ffxiv]")
         }
     }
 
-    // The published bucket sizes: 231 Action rows + 5 starter damage, 74 + 2 heals, 144, 202 + 2.
-    CHECK(damage == 236);
+    // The published bucket sizes: 235 Action rows + 5 starter damage, 74 + 2 heals, 144, 202 + 2.
+    // The four Warrior status-gated replacement actions (16463, 16465, 36924, 36925) are damage rows,
+    // selected by tools/generate-ffxiv-class-spells.py's PROC_JOBS instead of IsPlayerAction.
+    CHECK(damage == 240);
     CHECK(heal == 76);
     CHECK(conditional == 144);
     CHECK(none == 204);

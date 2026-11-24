@@ -41,8 +41,8 @@
  *
  * Model-sourced (community model [X], NOT in any sheet):
  *   mainStat, baseHp and the two VIT->HP scalars, anchored at levels
- *   1/50/60/70/80/90/100. The server caps at 80; the L90/L100 rows exist so the
- *   same code path can be checked against the published worked examples (B §F20).
+ *   1/50/60/70/80/90/100. The server caps at 100; the L90/L100 rows are also the
+ *   top of the playable range now, so no level in 1..100 is interpolation-only.
  *   Levels between anchors are linearly interpolated and mark
  *   FFXIV_PROV_LEVEL_INTERPOLATED. ParamGrow column 8 exists in the sheet and is
  *   deliberately unused (B §F1: it is not the model's base HP).
@@ -50,7 +50,7 @@
 
 namespace FFXIV::Stats
 {
-constexpr uint8 FFXIV_MAX_LEVEL = 80;        // server cap (worldserver.conf MaxPlayerLevel)
+constexpr uint8 FFXIV_MAX_LEVEL = 100;       // server cap (worldserver.conf MaxPlayerLevel)
 constexpr uint8 FFXIV_LEVEL_TABLE_MAX = 100; // model level table (anchors up to L100)
 constexpr uint8 FFXIV_LEVEL_COUNT = 100;
 constexpr uint8 FFXIV_JOB_COUNT = 44;   // ClassJob rows 0..43

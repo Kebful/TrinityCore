@@ -27,6 +27,12 @@
 #include "DBCStores.h"
 #include "DisableMgr.h"
 #include "DynamicObject.h"
+#include "FFXIV/Combat/FFXIVActionDamage.h"
+#include "FFXIV/Combat/FFXIVActionProc.h"
+#include "FFXIV/Combat/FFXIVActionShape.h"
+#include "FFXIV/Combat/FFXIVComboHighlight.h"
+#include "FFXIV/Charges/FFXIVActionCharges.h"
+#include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "G3DPosition.hpp"
 #include "GameObjectAI.h"
 #include "GridNotifiers.h"
@@ -2124,6 +2130,35 @@ class ProcReflectDelayed : public BasicEvent
 
 void Spell::AddUnitTarget(Unit* target, uint32 effectMask, bool checkIfValid /*= true*/, bool implicit /*= true*/, Position const* losPosition /*= nullptr*/)
 {
+    // FFXIV action shape (FFXIV/Combat/FFXIVActionShape.h): an FFXIV action spell can carry a cone or a
+    // line marker on its one DUMMY effect (the module writes it from the retail Action sheet's CastType
+    // 3/4). That effect gathered a circle of the shape's length around the caster, and this is the one
+    // point every selected unit passes through, so the wedge/rectangle is cut here: a unit outside the
+    // shape is not a target at all. The flag is off on every other spell and on every circle action
+    // (a circle is already a radius), so those keep the core's own selection exactly.
+    if (FFXIV::Combat::FfxivActionShapeMarker ffxivShape; FFXIV::Combat::GetFfxivActionShapeMarker(m_spellInfo, ffxivShape))
+    {
+        SpellEffectInfo const& shaper = m_spellInfo->GetEffect(static_cast<SpellEffIndex>(ffxivShape.effectIndex));
+        FFXIV::Combat::FfxivActionShape shape;
+        shape.kind = ffxivShape.kind;
+        shape.radius = shaper.CalcRadius(m_caster);
+        if (shape.kind == FFXIV::Combat::FFXIV_ACTION_SHAPE_CONE)
+            shape.angle = ffxivShape.second;
+        else
+            shape.width = ffxivShape.second;
+
+        // The shape starts on the caster unless the action placed a destination (a ground or
+        // unit-anchored area); either way the axis is the caster's facing or the caster -> anchor ray.
+        Position const casterPos = m_caster->GetPosition();
+        Position anchorPos = casterPos;
+        if (m_targets.HasDst())
+            anchorPos = *m_targets.GetDstPos();
+        if (shape.radius > 0.0f
+            && !FFXIV::Combat::IsPositionInsideFfxivActionShape(shape, casterPos, anchorPos,
+                target->GetPosition(), target->GetCombatReach()))
+            return;
+    }
+
     for (SpellEffectInfo const& spellEffectInfo : m_spellInfo->GetEffects())
         if (!spellEffectInfo.IsEffect() || !CheckEffectTarget(target, spellEffectInfo, losPosition))
             effectMask &= ~(1 << spellEffectInfo.EffectIndex);
@@ -2180,6 +2215,25 @@ void Spell::AddUnitTarget(Unit* target, uint32 effectMask, bool checkIfValid /*=
     // Calculate hit result
     WorldObject* caster = m_originalCaster ? m_originalCaster : m_caster;
     targetInfo.MissCondition = caster->SpellHitResult(target, m_spellInfo, m_canReflect && !(IsPositive() && m_caster->IsFriendlyTo(target)));
+
+    // @ffxiv-begin: an FFXIV action never rolls a WoW avoidance (the damage is FFXIVCombatMath's and the
+    // combo/gauge/status hooks live in the hit-target effect handlers, which a miss skips). Immunity,
+    // reflect and evade stay: they are not rolls.
+    switch (targetInfo.MissCondition)
+    {
+        case SPELL_MISS_MISS:
+        case SPELL_MISS_RESIST:
+        case SPELL_MISS_DODGE:
+        case SPELL_MISS_PARRY:
+        case SPELL_MISS_BLOCK:
+        case SPELL_MISS_DEFLECT:
+            if (FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id) != 0)
+                targetInfo.MissCondition = SPELL_MISS_NONE;
+            break;
+        default:
+            break;
+    }
+    // @ffxiv-end
 
     // @tswow-begin
     uint32 miss = targetInfo.MissCondition;
@@ -3235,6 +3289,9 @@ SpellCastResult Spell::prepare(SpellCastTargets const& targets, AuraEffect const
     {
         if (Unit* unitCaster = m_caster->ToUnit())
         {
+            // @tswow-begin
+            FIRE_ID(m_spellInfo->events.id, Spell, OnPrepared, TSSpell(this), unitCaster->HasStealthAura());
+            // @tswow-end
             // stealth must be removed at cast starting (at show channel bar)
             // skip triggered spell (item equip spell casting and other not explicit character casts/item uses)
             if (!(_triggeredCastFlags & TRIGGERED_IGNORE_AURA_INTERRUPT_FLAGS) && m_spellInfo->IsBreakingStealth())
@@ -3827,6 +3884,24 @@ void Spell::_handle_finish_phase()
         if (m_spellInfo->HasEffect(SPELL_EFFECT_ADD_EXTRA_ATTACKS))
             unitCaster->SetLastExtraAttackSpell(m_spellInfo->Id);
     }
+
+    // FFXIV job gauge (FFXIV/Gauge/FFXIVJobGauge.h): the slice's ONE hook. Once per successful cast,
+    // after every target went through the FFXIV action hook in EffectDummy, so an area spender pays
+    // once and an action with no potency (Infuriate) still counts. Inert while the gauge tables are
+    // empty or the spell is not a mapped FFXIV action.
+    if (Player* player = m_caster->ToPlayer())
+        FFXIV::Gauge::OnFfxivActionResolved(*player, m_spellInfo);
+
+    // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): the same once-per-cast point, and
+    // the only place a charge is consumed. Resolves the action and then a status-gated replacement,
+    // so the pool that pays is the cast's own. Inert for an action with no charge row.
+    if (Player* player = m_caster->ToPlayer())
+        FFXIV::Charges::OnFfxivActionResolved(*player, m_spellInfo);
+
+    // FFXIV combo highlight (FFXIV/Combat/FFXIVComboHighlight.h): same once-per-cast point, reading
+    // the chain the damage hook just advanced, and inert for a cast that is not an FFXIV action.
+    if (Player* player = m_caster->ToPlayer())
+        FFXIV::Combat::OnFfxivActionResolved(*player, m_spellInfo);
 
     // Handle procs on finish
     if (!m_originalCaster)
@@ -4886,6 +4961,13 @@ void Spell::TakePower()
     if (!m_powerCost)
         return;
 
+    // @ffxiv-begin: a waived FFXIV action pays nothing (CheckPower let it through at any rage).
+    if (m_spellInfo->PowerType == POWER_RAGE && unitCaster->IsPlayer())
+        if (FFXIV::Gauge::IsFfxivActionGaugeCostWaived(*unitCaster->ToPlayer(),
+                FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id)))
+            return;
+    // @ffxiv-end
+
     // health as power used
     if (powerType == POWER_HEALTH)
     {
@@ -5541,6 +5623,41 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
         castResult = CheckPower();
         if (castResult != SPELL_CAST_OK)
             return castResult;
+
+        // @ffxiv-begin: FFXIV job-gauge cost. A Warrior spender's Spell.dbc rage cost is the same
+        // number as its Beast Gauge cost, but rage is only the gauge's display: the gauge is the
+        // authority, and a spender must not start at 0 even if the two ever disagreed. Still inert
+        // while no ffxiv_action_gauge row names the action (Cost 0 = free).
+        if (Player* player = m_caster->ToPlayer())
+        {
+            uint32 const actionId = FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id);
+            if (actionId != 0)
+            {
+                if (!FFXIV::Gauge::CanAffordFfxivActionGauge(*player, actionId))
+                {
+                    TC_LOG_DEBUG("spells", "FFXIV action {}: {} Beast Gauge < cost, cast refused", actionId,
+                                 uint32(FFXIV::Gauge::GetFfxivGauge(*player)));
+                    return SPELL_FAILED_NO_POWER;
+                }
+                // A status-gated replacement action (Inner Chaos 16465) is only castable while the
+                // status that produces it is up; the base action it replaces is never gated here.
+                if (!FFXIV::Combat::IsFfxivActionProcGateSatisfied(*player, actionId,
+                                                                  player->GetFFXIVStats().jobId))
+                    return SPELL_FAILED_CASTER_AURASTATE;
+                // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): the action's own pool is
+                // the timing, because the flat cooldown was cleared in the data. A replacement is
+                // refused on its own pool, exactly like the base action (the proc id resolves first).
+                // No row -> HasFfxivChargeAvailable is true, so nothing changes for every other spell.
+                uint32 const chargedActionId = FFXIV::Combat::ResolveFfxivActionProcId(
+                    *player, actionId, player->GetFFXIVStats().jobId, player->GetFFXIVStats().level);
+                if (!FFXIV::Charges::HasFfxivChargeAvailable(*player, chargedActionId))
+                {
+                    TC_LOG_DEBUG("spells", "FFXIV action {}: no charge left, cast refused", chargedActionId);
+                    return SPELL_FAILED_NOT_READY;
+                }
+            }
+        }
+        // @ffxiv-end
     }
 
     if (!(_triggeredCastFlags & TRIGGERED_IGNORE_CASTER_AURAS))
@@ -6708,6 +6825,17 @@ SpellCastResult Spell::CheckPower() const
 
     // Check power amount
     Powers powerType = m_spellInfo->PowerType;
+
+    // @ffxiv-begin: a status waives an FFXIV action's cost (Inner Release 1177: Fell Cleave and
+    // Decimate cost 0). Spell.dbc's RAGE cost is a fixed number, so the waiver has to be applied
+    // here and in TakePower; the client applies the same rule in Spell_C_GetPowerCost so its button
+    // and tooltip agree. See ffxiv_action_cost_waiver (FFXIV/Gauge/FFXIVJobGauge.h).
+    if (m_powerCost > 0 && powerType == POWER_RAGE && m_caster->IsPlayer()
+        && FFXIV::Gauge::IsFfxivActionGaugeCostWaived(*m_caster->ToPlayer(),
+              FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id)))
+        return SPELL_CAST_OK;
+    // @ffxiv-end
+
     if (int32(unitCaster->GetPower(powerType)) < m_powerCost)
         return SPELL_FAILED_NO_POWER;
     else
@@ -8522,7 +8650,21 @@ bool WorldObjectSpellTargetCheck::operator()(WorldObject* target) const
                     return false;
                 // TODO: restore IsValidAttackTarget for corpses using corpse owner (faction, etc)
                 if (!target->IsCorpse() && !_caster->IsValidAttackTarget(unitTarget, _spellInfo))
-                    return false;
+                {
+                    // FFXIV actions follow Sapphire's Action::preFilterActor, which filters by object kind
+                    // (BattleNpc / Player) and not by WoW faction. A neutral, attackable training dummy is
+                    // therefore a legal hostile-action target even though IsValidAttackTarget's reputation
+                    // branch rejects it. Only non-player units are admitted; the flag/visibility checks stay.
+                    bool const ffxivNpc =
+                        FFXIV::Combat::ResolveFfxivActionIdFromSpell(_spellInfo->Id) != 0 &&
+                        unitTarget->GetTypeId() == TYPEID_UNIT && unitTarget->IsAlive() &&
+                        !unitTarget->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_NOT_ATTACKABLE_1 |
+                                                 UNIT_FLAG_NON_ATTACKABLE_2 | UNIT_FLAG_UNINTERACTIBLE |
+                                                 UNIT_FLAG_IMMUNE_TO_PC) &&
+                        _caster->CanSeeOrDetect(unitTarget);
+                    if (!ffxivNpc)
+                        return false;
+                }
                 break;
             case TARGET_CHECK_ALLY:
                 if (unitTarget->IsTotem())

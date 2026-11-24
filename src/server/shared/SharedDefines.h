@@ -65,7 +65,11 @@ inline uint32 GetMaxLevelForExpansion(uint32 expansion)
         case EXPANSION_THE_BURNING_CRUSADE:
             return 70;
         case EXPANSION_WRATH_OF_THE_LICH_KING:
-            return 80;
+            // This fork's shipped content (FFXIV classes/jobs) runs to level 100, so the
+            // WotLK-client expansion is the server's own cap rather than the stock 80.
+            // Returning DEFAULT_MAX_LEVEL makes Player::InitStatsForLevel take the
+            // configured MaxPlayerLevel branch.
+            return DEFAULT_MAX_LEVEL;
         default:
             break;
     }

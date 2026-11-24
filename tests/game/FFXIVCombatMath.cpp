@@ -327,10 +327,10 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
         CHECK(StageValue(r.trace, FfxivCombatStageId::WeaponDamagePercent) == 182);
         CHECK(StageValue(r.trace, FfxivCombatStageId::TraitPercent) == 130);
         // D2 = floor(2017*1000*182*130 / 10 000 000)/100 = 4772/100 = 47
-        CHECK(StageValue(r.trace, FfxivCombatStageId::Stage2Damage) == 47);
-        CHECK(StageValue(r.trace, FfxivCombatStageId::Stage3Damage) == 47);
+        CHECK(StageValue(r.trace, FfxivCombatStageId::Stage2Damage) == 4772);
+        CHECK(StageValue(r.trace, FfxivCombatStageId::Stage3Damage) == 4772);
         CHECK(StageValue(r.trace, FfxivCombatStageId::LevelCorrectionPermille) == 1000);
-        CHECK(r.value == 47);
+        CHECK(r.value == 4772);
         CHECK_FALSE(r.crit);
         CHECK_FALSE(r.directHit);
         CHECK(r.critChanceBp == 510); // F20: 5.1 % at CRIT 442
@@ -346,8 +346,8 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
         CHECK_FALSE(r.directHit);
         CHECK(StageValue(r.trace, FfxivCombatStageId::CriticalMultiplierPermille) == 1401);
         // D3 = floor(47*1401*100 / (1000*100)) = floor(65.847) = 65
-        CHECK(StageValue(r.trace, FfxivCombatStageId::Stage3Damage) == 65);
-        CHECK(r.value == 65);
+        CHECK(StageValue(r.trace, FfxivCombatStageId::Stage3Damage) == 6685);
+        CHECK(r.value == 6685);
     }
 
     SECTION("crit and direct hit forced on")
@@ -359,7 +359,7 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
         CHECK(r.directHit);
         CHECK(StageValue(r.trace, FfxivCombatStageId::DirectHitMultiplierPercent) == 125);
         // D3 = floor(47*1401*125 / (1000*100)) = floor(82.3) = 82
-        CHECK(r.value == 82);
+        CHECK(r.value == 8356);
     }
 
     SECTION("determination +978 (DET 1420 -> f(DET) = 1000 + floor(140*980/2780) = 1049)")
@@ -371,7 +371,7 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
         // D1 = floor(100*2017*1049/100)/1000 = 2 115 833/1000 = 2115
         CHECK(StageValue(r.trace, FfxivCombatStageId::BaseDamage) == 2115);
         // D2 = floor(2115*1000*182*130/10 000 000)/100 = 5004/100 = 50
-        CHECK(r.value == 50);
+        CHECK(r.value == 5004);
 
         SECTION("potency 180")
         {
@@ -380,7 +380,7 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
             // D1 = floor(180*2017*1049/100)/1000 = 3 808 499/1000 = 3808
             CHECK(StageValue(p180.trace, FfxivCombatStageId::BaseDamage) == 3808);
             // D2 = floor(3808*1000*182*130/10 000 000)/100 = 9009/100 = 90
-            CHECK(p180.value == 90);
+            CHECK(p180.value == 9009);
         }
 
         SECTION("potency 500 with crit and DH")
@@ -391,9 +391,9 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
             // D1 = floor(500*2017*1049/100)/1000 = 10 579 165/1000 = 10579
             CHECK(StageValue(p500.trace, FfxivCombatStageId::BaseDamage) == 10579);
             // D2 = floor(10579*1000*182*130/10 000 000)/100 = 25 029/100 = 250
-            CHECK(StageValue(p500.trace, FfxivCombatStageId::Stage2Damage) == 250);
+            CHECK(StageValue(p500.trace, FfxivCombatStageId::Stage2Damage) == 25029);
             // D3 = floor(250*1401*125/(1000*100)) = floor(437.8) = 437
-            CHECK(p500.value == 437);
+            CHECK(p500.value == 43832);
         }
     }
 
@@ -402,10 +402,10 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
         FfxivFixedRollSource low(99, 95);
         FfxivFixedRollSource high(99, 105);
         // floor(47*95/100) = 44
-        CHECK(ComputeFfxivDirectDamage(stats, 100, 182, 100, FfxivPartyComposition(), Traits(), low).value == 44);
+        CHECK(ComputeFfxivDirectDamage(stats, 100, 182, 100, FfxivPartyComposition(), Traits(), low).value == 4533);
         // floor(47*105/100) = 49
         CHECK(ComputeFfxivDirectDamage(stats, 100, 182, 100, FfxivPartyComposition(), Traits(), high).value
-              == 49);
+              == 5010);
     }
 
     SECTION("the trait is a switch, and buffs stack with one floor each")
@@ -414,14 +414,14 @@ TEST_CASE("FFXIV L100 direct damage: published stage values", "[ffxiv]")
         FfxivTraitState const noTrait{ false };
         // trait 100 instead of 130: D2 = floor(2017*1000*182*100/10 000 000)/100 = 3670/100 = 36
         CHECK(ComputeFfxivDirectDamage(stats, 100, 182, 100, FfxivPartyComposition(), noTrait, plain).value
-              == 36);
+              == 3670);
 
         std::array<FfxivPercentFactor, 2> const buffs{ { { 130, 100 }, { 130, 100 } } };
         FfxivDirectDamageResult const buffed =
             ComputeFfxivDirectDamage(Whm100(1420), 100, 182, 100, FfxivPartyComposition(), Traits(), plain,
                                      buffs);
         // floor(50*130/100) = 65, then floor(65*130/100) = 84 (1.69 * 50 = 84.5 -> 84)
-        CHECK(buffed.value == 84);
+        CHECK(buffed.value == 8456);
     }
 }
 
@@ -444,8 +444,8 @@ TEST_CASE("FFXIV L80 tank: tenacity, level correction and high crit chance", "[f
     // D1 = floor(180*999*1124/100)/1000 = 2 021 176/1000 = 2021
     CHECK(StageValue(r.trace, FfxivCombatStageId::BaseDamage) == 2021);
     // D2 = floor(2021*1053*156*100/10 000 000)/100 = 3319/100 = 33
-    CHECK(StageValue(r.trace, FfxivCombatStageId::Stage2Damage) == 33);
-    CHECK(r.value == 33);
+    CHECK(StageValue(r.trace, FfxivCombatStageId::Stage2Damage) == 3319);
+    CHECK(r.value == 3319);
     CHECK_FALSE(r.crit); // roll 99 * 100 = 9900 >= 2220
 
     // Even at a 22.2 % chance the fixed 99 roll cannot crit -- the pin the tests rely on.
@@ -455,13 +455,13 @@ TEST_CASE("FFXIV L80 tank: tenacity, level correction and high crit chance", "[f
     CHECK(crit.crit);
     CHECK(crit.directHit);
     // D3 = floor(33*1572*125/(1000*100)) = floor(64.8) = 64
-    CHECK(crit.value == 64);
+    CHECK(crit.value == 6521);
 
     // Attacker 80 against target 82: correction 1000 - 25*2 = 950; floor(33*950/1000) = 31.
     FfxivDirectDamageResult const corrected =
         ComputeFfxivDirectDamage(tank, 180, 156, 82, FfxivPartyComposition(), Traits(), rolls);
     CHECK(StageValue(corrected.trace, FfxivCombatStageId::LevelCorrectionPermille) == 950);
-    CHECK(corrected.value == 31);
+    CHECK(corrected.value == 3153);
 
     // Non-tank at L80 with TNC at the level base S: neutral tenacity, no role gate
     // is needed because slice 1 gives a non-tank TNC == S.
@@ -485,8 +485,8 @@ TEST_CASE("FFXIV direct heal: Cure/Medica at L50, L90 and L100", "[ffxiv]")
         // H1 = floor(450*942*1000/100)/1000 = 4 239 000/1000 = 4239
         CHECK(StageValue(cure.trace, FfxivCombatStageId::BaseDamage) == 4239);
         // H2 = floor(4239*1000*182*130/10 000 000)/100 = 10 029/100 = 100
-        CHECK(StageValue(cure.trace, FfxivCombatStageId::Stage2Damage) == 100);
-        CHECK(cure.value == 100);
+        CHECK(StageValue(cure.trace, FfxivCombatStageId::Stage2Damage) == 10029);
+        CHECK(cure.value == 10029);
         CHECK_FALSE(cure.crit);
 
         // No Direct Hit term anywhere in healing (B §F10.1/F16.1).
@@ -498,19 +498,19 @@ TEST_CASE("FFXIV direct heal: Cure/Medica at L50, L90 and L100", "[ffxiv]")
             ComputeFfxivHeal(stats, 450, 182, 100, FfxivPartyComposition(), Traits(), forcedCrit);
         CHECK(crit.crit);
         // H3 = floor(100*1401/1000) = 140
-        CHECK(crit.value == 140);
+        CHECK(crit.value == 14050);
 
         FfxivHealResult const medica =
             ComputeFfxivHeal(stats, 300, 182, 100, FfxivPartyComposition(), Traits(), rolls);
         // H1 = floor(300*942*1000/100)/1000 = 2826; H2 = floor(2826*...)/100 = 66
         CHECK(StageValue(medica.trace, FfxivCombatStageId::BaseDamage) == 2826);
-        CHECK(medica.value == 66);
+        CHECK(medica.value == 6686);
 
         // Healing variance is +-3 %: floor(100*97/100) = 97 and floor(100*103/100) = 103.
         FfxivFixedRollSource low(99, 97);
         FfxivFixedRollSource high(99, 103);
-        CHECK(ComputeFfxivHeal(stats, 450, 182, 100, FfxivPartyComposition(), Traits(), low).value == 97);
-        CHECK(ComputeFfxivHeal(stats, 450, 182, 100, FfxivPartyComposition(), Traits(), high).value == 103);
+        CHECK(ComputeFfxivHeal(stats, 450, 182, 100, FfxivPartyComposition(), Traits(), low).value == 9728);
+        CHECK(ComputeFfxivHeal(stats, 450, 182, 100, FfxivPartyComposition(), Traits(), high).value == 10329);
 
         // The party bonus reaches healing through HMP (INFERRED: B §F24.2 names the
         // main stat; HMP is the heal chain's main-stat term). Five roles:
@@ -519,7 +519,7 @@ TEST_CASE("FFXIV direct heal: Cure/Medica at L50, L90 and L100", "[ffxiv]")
         FfxivHealResult const boosted =
             ComputeFfxivHeal(stats, 450, 182, 100, AllRoles(), Traits(), rolls);
         CHECK(StageValue(boosted.trace, FfxivCombatStageId::HealingMagicPotencyPercent) == 991);
-        CHECK(boosted.value == 105);
+        CHECK(boosted.value == 10549);
     }
 
     SECTION("job 24 at level 50: MND 1000, HMP 1000, WD 60, DET/CRIT 440")
@@ -534,13 +534,13 @@ TEST_CASE("FFXIV direct heal: Cure/Medica at L50, L90 and L100", "[ffxiv]")
         // H1 = floor(450*402*1097/100)/1000 = 1 984 473/1000 = 1984
         CHECK(StageValue(cure.trace, FfxivCombatStageId::BaseDamage) == 1984);
         // H2 = floor(1984*1000*83*130/10 000 000)/100 = 2140/100 = 21
-        CHECK(cure.value == 21);
+        CHECK(cure.value == 2140);
 
         FfxivHealResult const medica =
             ComputeFfxivHeal(stats, 300, 83, 50, FfxivPartyComposition(), Traits(), rolls);
         // H1 = floor(300*402*1097/100)/1000 = 1322; H2 = 1426/100 = 14
         CHECK(StageValue(medica.trace, FfxivCombatStageId::BaseDamage) == 1322);
-        CHECK(medica.value == 14);
+        CHECK(medica.value == 1426);
     }
 
     SECTION("job 24 at level 90: MND 3000, HMP 2500, WD 130 (held 304 divisor)")
@@ -555,7 +555,7 @@ TEST_CASE("FFXIV direct heal: Cure/Medica at L50, L90 and L100", "[ffxiv]")
         // H1 = floor(450*794*1003/100)/1000 = 3 583 719/1000 = 3583
         CHECK(StageValue(cure.trace, FfxivCombatStageId::BaseDamage) == 3583);
         // H2 = floor(3583*1000*174*130/10 000 000)/100 = 8104/100 = 81
-        CHECK(cure.value == 81);
+        CHECK(cure.value == 8104);
     }
 }
 
@@ -575,8 +575,8 @@ TEST_CASE("FFXIV DoT tick: physical and magical published orders", "[ffxiv]")
             ComputeFfxivDotTick(stats, 100, 180, 100, FfxivPartyComposition(), Traits(), rolls, {}, &trace);
         CHECK(StageValue(trace, FfxivCombatStageId::BaseDamage) == 2017);
         CHECK(StageValue(trace, FfxivCombatStageId::SpeedPermille) == 1001);
-        CHECK(StageValue(trace, FfxivCombatStageId::DotPlusOne) == 37);
-        CHECK(tick == 37);
+        CHECK(StageValue(trace, FfxivCombatStageId::DotPlusOne) == 3635);
+        CHECK(tick == 3635);
     }
 
     SECTION("magical DoT uses the other order and the WHM-130 trait")
@@ -597,14 +597,14 @@ TEST_CASE("FFXIV DoT tick: physical and magical published orders", "[ffxiv]")
                                                         FfxivPartyComposition(), Traits(), rolls, {},
                                                         &magicalTrace);
         CHECK(StageValue(magicalTrace, FfxivCombatStageId::BaseDamage) == 3674);
-        CHECK(magical == 48);
+        CHECK(magical == 4777);
 
         FfxivCombatTrace physicalTrace;
         int64 const physical = ComputeFfxivDotTickOfType(stats, 100, 182, FFXIV_DOT_PHYSICAL, 100,
                                                          FfxivPartyComposition(), Traits(), rolls, {},
                                                          &physicalTrace);
         CHECK(StageValue(physicalTrace, FfxivCombatStageId::BaseDamage) == 2017);
-        CHECK(physical == 48);
+        CHECK(physical == 4777);
     }
 
     SECTION("speed enters the tick: SPS 420 -> f(SPD) 1000 vs SPS 442 -> 1001")
@@ -618,7 +618,7 @@ TEST_CASE("FFXIV DoT tick: physical and magical published orders", "[ffxiv]")
         // D1 = floor(100*182*2017*1000/(100*100*1000)) = 3670
         // D2 = floor(3670*1049*1000*130/10^8)/100 + 1 = 50 + 1 = 51
         CHECK(ComputeFfxivDotTickOfType(neutral, 100, 182, FFXIV_DOT_MAGICAL, 100, FfxivPartyComposition(),
-                                        Traits(), rolls, {}, &trace) == 51);
+                                        Traits(), rolls, {}, &trace) == 5005);
         CHECK(StageValue(trace, FfxivCombatStageId::BaseDamage) == 3670);
     }
 }
@@ -639,7 +639,7 @@ TEST_CASE("FFXIV auto-attack: 90 melee / 80 ranged, trait never applies", "[ffxi
         // D1 = floor(90*2017*1000/100)/1000 = 1815
         CHECK(StageValue(r.trace, FfxivCombatStageId::BaseDamage) == 1815);
         // D2 = floor(1815*1000*150*100/10 000 000)/100 = 2722/100 = 27
-        CHECK(r.value == 27);
+        CHECK(r.value == 2722);
     }
 
     SECTION("BRD L100, WD 132, 3 s delay: 80 potency and the 1.2 trait withheld")
@@ -654,12 +654,12 @@ TEST_CASE("FFXIV auto-attack: 90 melee / 80 ranged, trait never applies", "[ffxi
             ComputeFfxivAutoAttackDamage(stats, 100, FfxivPartyComposition(), rolls, 132, 3000);
         CHECK(StageValue(r.trace, FfxivCombatStageId::AutoAttackPotency) == 80);
         CHECK(StageValue(r.trace, FfxivCombatStageId::TraitPercent) == 100);
-        CHECK(r.value == 29);
+        CHECK(r.value == 2935);
         // ... while the same stats through the ordinary pipeline do carry the trait.
         FfxivDirectDamageResult const normal =
             ComputeFfxivDirectDamage(stats, 80, 182, 100, FfxivPartyComposition(), Traits(), rolls);
         CHECK(StageValue(normal.trace, FfxivCombatStageId::TraitPercent) == 120);
-        CHECK(normal.value == 35);
+        CHECK(normal.value == 3522);
     }
 }
 
@@ -691,14 +691,14 @@ TEST_CASE("FFXIV stage order matches the published chains", "[ffxiv]")
         FfxivFixedRollSource varianceHigh(99, 105);
         FfxivCombatTrace trace;
         CHECK(ComputeFfxivDotTick(dotStats, 100, 180, 100, FfxivPartyComposition(), Traits(), varianceHigh,
-                                  {}, &trace) == 38);
+                                  {}, &trace) == 3816);
         // With crit and DH forced on: floor(38*1401*125/100000) = 66 -- i.e. both
         // multipliers are applied to the already-varied value, as B §F23.7 says.
         FfxivFixedRollSource critHigh(0, 105);
         FfxivCombatTrace critTrace;
         CHECK(ComputeFfxivDotTick(dotStats, 100, 180, 100, FfxivPartyComposition(), Traits(), critHigh, {},
-                                  &critTrace) == 66);
-        CHECK(StageValue(critTrace, FfxivCombatStageId::DotPlusOne) == 37);
+                                  &critTrace) == 6682);
+        CHECK(StageValue(critTrace, FfxivCombatStageId::DotPlusOne) == 3635);
         // Published DoT order: +1 and variance come before the crit/DH multipliers.
         CHECK(StageIndex(critTrace, FfxivCombatStageId::DotPlusOne)
               < StageIndex(critTrace, FfxivCombatStageId::CriticalRoll));
@@ -746,6 +746,6 @@ TEST_CASE("FFXIV roll sources are deterministic", "[ffxiv]")
         CHECK_FALSE(a.crit);
         CHECK_FALSE(a.directHit);
         CHECK(StageValue(a.trace, FfxivCombatStageId::VariancePercent) == 102);
-        CHECK(a.value == 47);
+        CHECK(a.value == 4867);
     }
 }

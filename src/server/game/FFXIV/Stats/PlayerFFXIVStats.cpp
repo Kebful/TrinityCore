@@ -44,6 +44,7 @@
  */
 
 #include "Player.h"
+#include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "FFXIV/Stats/FFXIVStatEngine.h"
 #include "FFXIV/Stats/FFXIVStatProjection.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
@@ -231,7 +232,11 @@ void Player::RebuildFFXIVStats()
     // the client has the player, and SendInitialPacketsAfterAddToMap() sends the first
     // packet instead.
     if (IsInWorld())
+    {
         FFXIV::Stats::SendFfxivStatsSnapshot(*this);
+        // A rebuild is where a job change lands: the gauge readout follows the new job (or clears).
+        FFXIV::Gauge::SendFfxivJobGauge(*this);
+    }
 }
 
 FFXIV::Stats::FfxivDerivedStats const& Player::GetFFXIVStats() const

@@ -380,6 +380,40 @@ int32 ComputeFfxivSpeedPermille(FfxivDerivedStats const& stats, FfxivDotDamageTy
 int32 ComputeFfxivLevelCorrectionPermille(uint8 attackerLevel, uint8 targetLevel);
 
 // --------------------------------------------------------------------------
+// tooltip multiplier (GATE 7)
+// --------------------------------------------------------------------------
+
+// The one scalar a tooltip needs: the direct-damage chain's multiplier for this
+// player, with crit = 1.0 (no crit), direct hit = 1.0 and variance = 100 (the
+// mean of rand[95,105]), expressed in basis points so a client can print
+//
+//     damage = potency * basisPoints / 10000        (integer division == floor)
+//
+// It is the product of exactly the factors FFXIVCombatMath already builds:
+//
+//     f(ATK) / 100 * f(DET) / 1000 * f(TNC) / 1000 * f(WD) / 100
+//             * trait / 100 * levelCorrection / 1000
+//
+// i.e. 10000 * that product, with ONE integer division at the end. Every factor
+// comes from BuildAttackTerms()/ComputeFfxivLevelCorrectionPermille, so this is
+// the same arithmetic as ComputeFfxivDirectDamage, not a second formula.
+//
+// Exactness: with crit/DH off and variance 100 the damage chain is
+//     floor(floor(P*f(ATK)*f(DET)/10^5) * f(TNC)*f(WD)*trait/10^7)
+// and a single scalar can only reproduce one floor. It is exact at the fixture
+// the goldens use (potency 100, Whm100 -> 4772, see tests/game/FFXIVCombatMath.cpp
+// and FFXIVStatsSnapshot.cpp) and differs from the chain by at most a few points
+// elsewhere, which is why the client labels the line an estimate.
+//
+// `weaponDamage` is f(WD) in percent, exactly as for ComputeFfxivDirectDamage:
+// pass ComputeFfxivActionWeaponDamagePercent() to match the live cast hook.
+// The tooltip has no target, so `targetLevel` is the player's own level (1000,
+// no correction) unless a caller has a better one.
+int32 ComputeFfxivTooltipMultiplierBasisPoints(FfxivDerivedStats const& stats, int32 weaponDamage,
+                                               uint8 targetLevel, FfxivPartyComposition party,
+                                               FfxivTraitState traits);
+
+// --------------------------------------------------------------------------
 // the pipelines
 // --------------------------------------------------------------------------
 

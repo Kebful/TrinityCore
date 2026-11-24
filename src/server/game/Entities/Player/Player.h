@@ -1483,6 +1483,10 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         void LearnCustomSpells();
         void LearnDefaultSkills();
         void LearnDefaultSkill(uint32 skillId, uint16 rank);
+        // FFXIV: learn every action spell this player's ClassJob and level qualify for
+        // (ffxiv_action_potency + ffxiv_action_spell). Idempotent; no-op for non-FFXIV classes
+        // and while the tables are missing. A runtime safety net, not a replacement for autolearn.
+        void LearnMissingFfxivActionSpells();
         void LearnQuestRewardedSpells();
         void LearnQuestRewardedSpells(Quest const* quest);
         void AddTemporarySpell(uint32 spellId);

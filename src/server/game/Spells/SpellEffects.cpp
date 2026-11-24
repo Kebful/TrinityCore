@@ -30,6 +30,9 @@
 #include "CreatureAI.h"
 #include "DatabaseEnv.h"
 #include "DynamicObject.h"
+#include "FFXIV/Combat/FFXIVActionDamage.h"
+#include "FFXIV/Gauge/FFXIVJobGauge.h"
+#include "FFXIV/Status/FFXIVStatus.h"
 #include "Formulas.h"
 #include "GameObject.h"
 #include "GameObjectAI.h"
@@ -707,6 +710,39 @@ void Spell::EffectDummy()
         return;
 
     if (!unitTarget && !gameObjTarget && !itemTarget && !m_corpseTarget)
+        return;
+
+    /*
+     * FFXIV action resolution -- the slice's ONE hook into the spell damage path.
+     *
+     * This is EffectDummy, not EffectSchoolDMG, because the module ships every FFXIV Action as a
+     * single DUMMY effect (shared/ffxiv-action-spell.ts applyTargeting): an FFXIV action never
+     * reaches EffectSchoolDMG, and EffectDummy is the only handler that sees one with a target.
+     * The hook identifies an FFXIV action by having a row in ffxiv_action_potency -- never by name,
+     * icon or family -- and it runs before the vanilla DB-script dispatch so an FFXIV action never
+     * also fires a dummy script. With the tables missing or empty it returns false immediately and
+     * this function is exactly as it was before.
+     *
+     * Why it applies the number here instead of setting m_damage: the value FFXIVCombatMath returns
+     * is already final (its own crit/direct-hit/variance/level stages are inside), so handing it to
+     * the vanilla path would apply the WoW spell-bonus and crit stages a second time.
+     */
+    bool const ffxivActionHandled = unitTarget && m_caster->GetTypeId() == TYPEID_PLAYER
+        && FFXIV::Combat::TryApplyFfxivActionEffect(*m_caster->ToPlayer(), *unitTarget, m_spellInfo);
+
+    /*
+     * FFXIV action statuses (ffxiv_status / ffxiv_action_status): every status the action's ActionTransient text
+     * states, applied with the action's own duration. This is a separate hook from the potency one above because
+     * a pure buff (Inner Release 7389 -> Inner Strength 2663) has no potency row and would return there. Both are
+     * gated by their tables: no row, no behaviour change. Runs for a damaging action too.
+     */
+    if (unitTarget && m_caster->GetTypeId() == TYPEID_PLAYER)
+        if (uint32 const actionId = FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id))
+            FFXIV::Status::ApplyFfxivActionStatuses(*m_caster->ToPlayer(), *unitTarget, actionId);
+
+    // The potency hook claims every action with a potency row, so it can only end the effect after the
+    // statuses went out: a damaging action (Storm's Eye -> Surging Tempest) carries both.
+    if (ffxivActionHandled)
         return;
 
     // pet auras
@@ -1745,6 +1781,11 @@ void Spell::EffectEnergize()
         return;
 
     Powers power = Powers(effectInfo->MiscValue);
+
+    // FFXIV: a module class's rage is the job gauge's display. No spell may energize it.
+    if (power == POWER_RAGE && FFXIV::Gauge::SuppressesWowRage(*unitTarget))
+        return;
+
     if (unitTarget->GetTypeId() == TYPEID_PLAYER && unitTarget->GetPowerType() != power && m_spellInfo->SpellFamilyName != SPELLFAMILY_POTION
         && !m_spellInfo->HasAttribute(SPELL_ATTR7_CAN_RESTORE_SECONDARY_POWER))
         return;
@@ -1817,6 +1858,10 @@ void Spell::EffectEnergizePct()
         return;
 
     Powers power = Powers(effectInfo->MiscValue);
+
+    // FFXIV: a module class's rage is the job gauge's display. No spell may energize it.
+    if (power == POWER_RAGE && FFXIV::Gauge::SuppressesWowRage(*unitTarget))
+        return;
 
     if (unitTarget->GetTypeId() == TYPEID_PLAYER && unitTarget->GetPowerType() != power && !m_spellInfo->HasAttribute(SPELL_ATTR7_CAN_RESTORE_SECONDARY_POWER))
         return;

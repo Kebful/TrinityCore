@@ -58,6 +58,7 @@
 #include "PetAI.h"
 #include "Pet.h"
 #include "Player.h"
+#include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "PlayerAI.h"
 #include "QuestDef.h"
 #include "ReputationMgr.h"
@@ -6560,6 +6561,14 @@ void Unit::EnergizeBySpell(Unit* victim, uint32 spellId, int32 damage, Powers po
 
 void Unit::EnergizeBySpell(Unit* victim, SpellInfo const* spellInfo, int32 damage, Powers powerType)
 {
+    // FFXIV: a module class's rage is the job gauge's display; no spell (including a script) adds to
+    // it. See FFXIV::Gauge::SuppressesWowRage.
+    if (powerType == POWER_RAGE && FFXIV::Gauge::SuppressesWowRage(*victim))
+        return;
+
+    // @tswow-begin
+    FIRE_ID(spellInfo->events.id, Spell, OnEnergizeBySpell, TSUnit(victim), TSSpellInfo(spellInfo), TSNumber<uint8>(powerType), TSMutableNumber<int32>(&damage));
+    // @tswow-end
     victim->ModifyPower(powerType, damage, false);
     victim->GetThreatManager().ForwardThreatForAssistingMe(this, float(damage)/2, spellInfo, true);
     SendEnergizeSpellLog(victim, spellInfo->Id, damage, powerType);
@@ -13300,6 +13309,13 @@ PlayerMovementPendingChange::PlayerMovementPendingChange()
 
 void Unit::RewardRage(uint32 damage, uint32 weaponSpeedHitFactor, bool attacker)
 {
+    // FFXIV: for a module class, POWER_RAGE is a one-way display of the job gauge (the server writes
+    // gauge -> rage). WoW's own rage income -- auto-attack/damage dealt, damage taken, absorbed
+    // damage -- must not move it, or the bar and every rage-cost action button would drift away from
+    // the Beast Gauge. The hits still deal damage; only the rage is dropped.
+    if (FFXIV::Gauge::SuppressesWowRage(*this))
+        return;
+
     float addRage;
 
     float rageconversion = ((0.0091107836f * GetLevel() * GetLevel()) + 3.225598133f * GetLevel()) + 4.2652911f;

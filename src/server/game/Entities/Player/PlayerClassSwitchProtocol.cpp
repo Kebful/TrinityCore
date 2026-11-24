@@ -25,6 +25,10 @@ namespace ClassSwitch
 {
 namespace
 {
+// Mirrors PlayerClassSwitch.cpp's MAX_CLASS_SWITCH_LEVEL: the client protocol and the
+// gt* tables carry 100 levels per class.
+constexpr uint8 MAX_CLASS_SWITCH_LEVEL = 100;
+
 class ByteWriter
 {
 public:
@@ -500,7 +504,7 @@ bool ValidateStoredProfile(StoredClassProfile const& profile, std::string* error
         return SetError(error, "stored profile revision is missing");
     if (!IsSupportedClassId(profile.ClassId))
         return SetError(error, "stored profile class is outside the uint32 class-mask range");
-    if (!profile.Level || profile.Level > 80)
+    if (!profile.Level || profile.Level > MAX_CLASS_SWITCH_LEVEL)
         return SetError(error, "stored profile level is invalid");
     if (profile.NextLevelXp && profile.Xp > profile.NextLevelXp)
         return SetError(error, "stored profile XP exceeds its next-level requirement");
@@ -911,7 +915,7 @@ std::vector<uint8> EncodeActiveClassStatus(StatusStage stage, RequestResult resu
     std::set<uint8> classIds;
     for (ActiveClassStatusDescriptor const& entry : classes)
     {
-        if (!IsSupportedClassId(entry.ClassId) || !entry.Level || entry.Level > 80 ||
+        if (!IsSupportedClassId(entry.ClassId) || !entry.Level || entry.Level > MAX_CLASS_SWITCH_LEVEL ||
             (entry.Flags & ~(CLASS_FLAG_ACTIVE | CLASS_FLAG_PENDING | CLASS_FLAG_AVAILABLE)) ||
             entry.Name.empty() || entry.Name.size() > std::numeric_limits<uint16>::max() ||
             !IsValidUtf8(reinterpret_cast<uint8 const*>(entry.Name.data()), entry.Name.size()) ||

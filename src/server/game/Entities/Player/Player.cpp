@@ -17,6 +17,11 @@
 
 #include "Player.h"
 #include "FFXIV/CFXIVCreation.h"
+#include "FFXIV/Combat/FFXIVActionDamage.h"
+#include "FFXIV/Combat/FFXIVComboHighlight.h"
+#include "FFXIV/Charges/FFXIVActionCharges.h"
+#include "FFXIV/Gauge/FFXIVJobGauge.h"
+#include "FFXIV/Stats/FFXIVStatTables.h"
 #include "FFXIV/Stats/FFXIVStatsSnapshot.h"
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
@@ -616,6 +621,9 @@ bool Player::Create(ObjectGuid::LowType guidlow, CharacterCreateInfo* createInfo
     // original spells
     LearnDefaultSkills();
     LearnCustomSpells();
+    // FFXIV action spells the module class and level qualify for: the starting bars hold action
+    // spell ids, so a fresh character must know them before the first cast.
+    LearnMissingFfxivActionSpells();
 
     // original action bar
     for (PlayerCreateInfoActions::const_iterator action_itr = info->action.begin(); action_itr != info->action.end(); ++action_itr)
@@ -1053,6 +1061,17 @@ void Player::Update(uint32 p_time)
     if (ClassSwitch::IsClassSwitchGameplayBlocked(
         ClassSwitch::IsTransitionPending(this), false))
         return;
+
+    // FFXIV combo highlight (FFXIV/Combat/FFXIVComboHighlight.h): the 12.5 s chain window can lapse
+    // while the player does nothing, and nothing else would notice, so the tick clears the highlight.
+    // One map lookup per tick; it returns immediately when this player has no highlight.
+    FFXIV::Combat::UpdateFfxivComboHighlight(*this);
+
+    // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): a recharge that completes while the
+    // player does nothing would otherwise only be noticed on the next cast, so the tick refreshes the
+    // client's snapshot. It returns immediately when this player has no recharging pool and nothing
+    // was ever sent.
+    FFXIV::Charges::UpdateFfxivActionCharges(*this);
 
     // undelivered mail
     if (m_nextMailDelivereTime && m_nextMailDelivereTime <= GameTime::GetGameTime())
@@ -2110,6 +2129,11 @@ void Player::Regenerate(Powers power)
     if (!maxValue)
         return;
 
+    // FFXIV: rage is the job gauge's display, not a regenerating WoW resource. No out-of-combat
+    // decay (and no income) for a module class: the gauge only moves when an action moves it.
+    if (power == POWER_RAGE && FFXIV::Gauge::SuppressesWowRage(*this))
+        return;
+
     uint32 curValue = GetPower(power);
     float addvalue  = GetPowerRegen(power) * 0.001f * m_regenTimer;
 
@@ -2652,6 +2676,9 @@ void Player::GiveLevel(uint8 level)
     // @tswow-begin
     ApplyAutolearnSpells(oldLevel+1);
     // @tswow-end
+
+    // FFXIV: a level-up can unlock further action spells (the reconcile is idempotent).
+    LearnMissingFfxivActionSpells();
 
     sScriptMgr->OnPlayerLevelChanged(this, oldLevel);
 }
@@ -4618,6 +4645,9 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
         SetHealth(uint32(GetMaxHealth()*restore_percent));
         SetPower(POWER_MANA, uint32(GetMaxPower(POWER_MANA)*restore_percent));
         SetPower(POWER_RAGE, 0);
+        // FFXIV: the Beast Gauge is the authority and rage is its display; the reset above would
+        // leave a resurrected module class showing an empty bar until the next gauge change.
+        FFXIV::Gauge::SyncFfxivRage(*this);
         SetPower(POWER_ENERGY, uint32(GetMaxPower(POWER_ENERGY)*restore_percent));
     }
 
@@ -18141,6 +18171,10 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     // between the profile write and the regular character-table save.
     RestoreActiveClassProfileAfterLoad();
 
+    // The profile restore above swaps the spell map, so the FFXIV action-spell reconcile has to
+    // run after it: a character's bars can name action spells the data build never taught.
+    LearnMissingFfxivActionSpells();
+
     TC_LOG_DEBUG("entities.player.loading", "Player::LoadFromDB: The value of player '{}' after load item and aura is: ", m_name);
     outDebugValues();
 
@@ -23258,6 +23292,14 @@ void Player::SendInitialPacketsAfterAddToMap()
     // gets its first snapshot here -- before the sheet can be drawn. The rebuild hook in
     // PlayerFFXIVStats.cpp keeps it fresh afterwards. Read-only presentation data.
     FFXIV::Stats::SendFfxivStatsSnapshot(*this);
+    // FFXIV job gauge (0x7A62): the client's readout starts from the server value, or "no gauge".
+    FFXIV::Gauge::SendFfxivJobGauge(*this);
+    // FFXIV action charges (0x7A64): the client's SpellCharge map starts from the server's pools, so
+    // a reloaded UI draws the same recharges and an empty pool is greyed from the first frame.
+    FFXIV::Charges::SendFfxivActionCharges(*this);
+    // FFXIV combo highlight (0x7A63): the value the server currently expects, so a reloaded UI and a
+    // re-logged character start from the same state.
+    FFXIV::Combat::SendFfxivComboHighlight(*this);
 }
 
 void Player::SendUpdateToOutOfRangeGroupMembers()
@@ -23436,6 +23478,38 @@ void Player::LearnCustomSpells()
             AddSpell(tspell, true, true, true, false);
         else                                                // but send in normal spell in game learn case
             LearnSpell(tspell, true);
+    }
+}
+
+void Player::LearnMissingFfxivActionSpells()
+{
+    // Stock WoW classes map to the neutral job id (0) and the FFXIV action tables describe only
+    // FFXIV jobs: a character outside the module is left exactly as it is.
+    uint8 const classJobId = FFXIV::Stats::GetFfxivClassJobId(GetClass());
+    if (classJobId == FFXIV::Stats::FFXIV_NEUTRAL_JOB_ID)
+        return;
+
+    // "Known" is presence in the spell map, not HasSpell: a disabled spell is known and must not
+    // be re-learned (that would re-enable it), and a removed one is not.
+    std::vector<uint32> const spellIds = FFXIV::Combat::SelectFfxivActionSpellsToLearn(
+        classJobId, GetLevel(),
+        [this](uint32 spellId)
+        {
+            auto const itr = m_spells.find(spellId);
+            return itr != m_spells.end() && itr->second.state != PLAYERSPELL_REMOVED;
+        });
+
+    for (uint32 spellId : spellIds)
+    {
+        // A row may name a spell this build does not have (half-landed data): skip it rather than
+        // assert inside AddSpell. The tables themselves are never modified here.
+        if (!sSpellMgr->GetSpellInfo(spellId))
+            continue;
+
+        if (!IsInWorld()) // sent in INITIAL_SPELLS at map add, like LearnCustomSpells
+            AddSpell(spellId, true, true, false, false); // learning=true: new row is persisted
+        else
+            LearnSpell(spellId, false);
     }
 }
 

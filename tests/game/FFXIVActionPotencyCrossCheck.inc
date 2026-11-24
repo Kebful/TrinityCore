@@ -367,7 +367,9 @@
     { 16460, 0xFFFF, 0xFFFF, 3 },  // Atonement
     { 16461, 150, 0xFFFF, 1 },  // Intervene
     { 16462, 100, 0xFFFF, 1 },  // Mythril Tempest
+    { 16463, 200, 0xFFFF, 1 },  // Chaotic Cyclone
     { 16464, 0xFFFF, 400, 2 },  // Nascent Flash
+    { 16465, 700, 0xFFFF, 1 },  // Inner Chaos
     { 16466, 100, 0xFFFF, 1 },  // Flood of Darkness
     { 16467, 300, 0xFFFF, 1 },  // Edge of Darkness
     { 16468, 0xFFFF, 0xFFFF, 3 },  // Stalwart Soul
@@ -602,6 +604,8 @@
     { 36920, 0xFFFF, 0xFFFF, 0 },  // Guardian
     { 36921, 580, 0xFFFF, 1 },  // Imperator
     { 36923, 55, 300, 1 },  // Damnation
+    { 36924, 700, 0xFFFF, 1 },  // Primal Wrath
+    { 36925, 800, 0xFFFF, 1 },  // Primal Ruination
     { 36926, 0xFFFF, 0xFFFF, 0 },  // Shadowstride
     { 36927, 0xFFFF, 1200, 2 },  // Shadowed Vigil
     { 36932, 1000, 0xFFFF, 1 },  // Disesteem

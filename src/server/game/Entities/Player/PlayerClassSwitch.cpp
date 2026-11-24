@@ -50,6 +50,9 @@ namespace
 constexpr std::chrono::milliseconds MIN_REQUEST_INTERVAL(500);
 constexpr size_t MAX_REQUESTS_PER_MINUTE = 6;
 constexpr std::chrono::seconds CLIENT_RESPONSE_TIMEOUT(10);
+// The client's class-switch protocol and the gt* tables carry 100 levels per class
+// (gtChanceToMeleeCrit.dbc is 30 classes x 100); the server cap is MaxPlayerLevel.
+constexpr uint8 MAX_CLASS_SWITCH_LEVEL = 100;
 
 struct RuntimeClassDefinition
 {
@@ -1298,7 +1301,7 @@ private:
         if (!def.Enabled)
             return true;
         if (!def.InitialLevel ||
-            def.InitialLevel > std::min<uint32>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL), 80))
+            def.InitialLevel > std::min<uint32>(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL), MAX_CLASS_SWITCH_LEVEL))
             return SetError(error, "initial class level is invalid");
         if (def.Name.empty())
             return SetError(error, "display name is empty");
@@ -1428,15 +1431,39 @@ private:
         return true;
     }
 
+    // The game tables have 20 class columns. The FFXIV jobs 21..30 have no column of their own and read
+    // their base class's row (Paladin->Gladiator, Warrior->Marauder, ...). The client's ActiveClassPolicy
+    // applies the same map; without it a job switch fails "required class combat-rating ... incomplete".
+    uint32 GameTableClassIndex(uint8 classId)
+    {
+        if (classId >= 1 && classId <= 20)
+            return uint32(classId - 1);
+        switch (classId)
+        {
+            case 21: return 12 - 1; // Paladin -> Gladiator
+            case 22: return 13 - 1; // Warrior -> Marauder
+            case 23: return 14 - 1; // Dragoon -> Lancer
+            case 24: return 15 - 1; // Monk -> Pugilist
+            case 25: return 16 - 1; // Ninja -> Rogue
+            case 26: return 17 - 1; // Bard -> Archer
+            case 27: return 18 - 1; // White Mage -> Conjurer
+            case 28: return 19 - 1; // Black Mage -> Thaumaturge
+            case 29: return 20 - 1; // Summoner -> Arcanist
+            case 30: return 20 - 1; // Scholar -> Arcanist
+            default: return 0;
+        }
+    }
+
     bool ValidateClassCapabilityTables(uint8 classId, uint8 level, std::string* error)
     {
-        if (!IsSupportedClassId(classId) || !level || level > 80)
+        if (!IsSupportedClassId(classId) || !level || level > MAX_CLASS_SWITCH_LEVEL)
             return SetError(error, "class capability level is invalid");
 
-        uint32 const levelOffset = uint32(classId - 1) * GT_MAX_LEVEL + uint32(level - 1);
-        if (!sGtChanceToMeleeCritBaseStore.LookupEntry(classId - 1) ||
+        uint32 const classIndex = GameTableClassIndex(classId);
+        uint32 const levelOffset = classIndex * GT_MAX_LEVEL + uint32(level - 1);
+        if (!sGtChanceToMeleeCritBaseStore.LookupEntry(classIndex) ||
             !sGtChanceToMeleeCritStore.LookupEntry(levelOffset) ||
-            !sGtChanceToSpellCritBaseStore.LookupEntry(classId - 1) ||
+            !sGtChanceToSpellCritBaseStore.LookupEntry(classIndex) ||
             !sGtChanceToSpellCritStore.LookupEntry(levelOffset) ||
             !sGtOCTRegenHPStore.LookupEntry(levelOffset) ||
             !sGtRegenHPPerSptStore.LookupEntry(levelOffset))
@@ -1446,7 +1473,7 @@ private:
         {
             if (!sGtCombatRatingsStore.LookupEntry(uint32(rating) * GT_MAX_LEVEL + level - 1) ||
                 !sGtOCTClassCombatRatingScalarStore.LookupEntry(
-                    uint32(classId - 1) * GT_MAX_RATING + rating + 1))
+                    classIndex * GT_MAX_RATING + rating + 1))
                 return SetError(error, "required class combat-rating tables are incomplete");
         }
         return true;
@@ -3092,6 +3119,11 @@ private:
         {
             result = ApplyProfileData(
                 player, target, error, detachPet, rollbackPlan, restorePlan);
+            // The target profile's stored spell list is what it was last saved with; the FFXIV
+            // action spells the new ClassJob and level qualify for are reconciled from the tables
+            // here, while per-spell notifications stay suppressed (the switch sends INITIAL_SPELLS).
+            if (result)
+                player->LearnMissingFfxivActionSpells();
         }
         catch (...)
         {
@@ -3476,7 +3508,7 @@ private:
                 uint8 classId = fields[0].GetUInt8();
                 uint8 level = fields[1].GetUInt8();
                 uint64 rowRevision = fields[2].GetUInt64();
-                if (!IsSupportedClassId(classId) || !level || level > 80 || !rowRevision)
+                if (!IsSupportedClassId(classId) || !level || level > MAX_CLASS_SWITCH_LEVEL || !rowRevision)
                 {
                     if (classId == player->GetClass())
                         invalidActiveProfile = true;

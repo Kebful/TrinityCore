@@ -2139,6 +2139,9 @@ float Aura::CalcProcChance(SpellProcEntry const& procEntry, ProcEventInfo& event
     if ((procEntry.AttributesMask & PROC_ATTR_REDUCE_PROC_60) && eventInfo.GetActor()->GetLevel() > 60)
         chance = std::max(0.f, (1.f - ((eventInfo.GetActor()->GetLevel() - 60) * 1.f / 30.f)) * chance);
 
+    // @tswow-begin
+    FIRE_ID(m_spellInfo->events.id, Spell, OnCalcProcChanceLate, TSProcEventInfo(&eventInfo), TSMutableNumber<float>(&chance));
+    // @tswow-end
     return chance;
 }
 

@@ -52,8 +52,7 @@ constexpr uint32 FFXIV_FIXED_MAX_MP = 10000;
 constexpr uint32 FFXIV_MIN_GCD_MS = 1500;
 
 // Aborts (via the table accessors) on a job/level/tribe id outside the shipped
-// tables. Gameplay callers cap the level at FFXIV_MAX_LEVEL (80) before calling;
-// the L90/L100 rows exist only so the tests can reproduce B §F20.
+// tables. Gameplay callers cap the level at FFXIV_MAX_LEVEL (100) before calling.
 FfxivDerivedStats ComputeFfxivStats(FfxivStatInputs const& inputs);
 
 // Fixed-width, locale-independent block used by `.ffxivstats` and the test
