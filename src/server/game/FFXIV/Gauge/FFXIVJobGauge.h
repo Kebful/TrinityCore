@@ -63,11 +63,11 @@ class Unit;
  * The core stores the value and speaks the protocol; WHO changes it is per job:
  *   - a job a livescript has claimed (ClaimFfxivJobGauge, SetFfxivJobGaugeScriptOwned) is the script's:
  *     the core applies none of its `ffxiv_action_gauge` rows, runs no `CanAffordFfxivActionGauge`
- *     refusal, honours no `ffxiv_action_cost_waiver` row, and charges no WoW rage cost for its actions.
+ *     refusal, and charges no WoW rage cost for its actions.
  *     The script moves the value with AddFfxivJobGauge / SetFfxivJobGauge (the Player API below) and
  *     refuses a cast it cannot afford from Spell.OnCheckCast. The data rows stay in the world database;
  *     they are what the client's table and the generator's checks are built from.
- *   - every other job is data-driven exactly as before: rows, cost gate and waivers read by the core.
+ *   - every other job is data-driven exactly as before: rows and the cost gate read by the core.
  * The claim is memory only: a restart without the script leaves every job data-driven.
  *
  * State
@@ -82,9 +82,10 @@ class Unit;
  * A spender's cost is its `ffxiv_action_gauge` row's negative delta (a spender row; `comboOnly` rows
  * are gains and never spends). `CanAffordFfxivActionGauge` is the pure check Spell::CheckCast runs
  * before a cast starts; ApplyFfxivActionGauge still clamps at 0 as a safety, but a cast that cannot
- * pay never reaches it. A status can waive a cost (`ffxiv_action_cost_waiver`: Inner Release 1177
- * makes Fell Cleave 3549 and Decimate 3550 cost 0); the waiver is part of both the check and the
- * apply, so a free cast neither refuses nor spends.
+ * pay never reaches it. A status that makes an action free is an engine spell mod, not a table here:
+ * Inner Release's aura carries ADD_PCT_MODIFIER / SPELLMOD_COST / -100 on the FFXIV Warrior family
+ * plus the Fell Cleave/Decimate class-mask bits, so SpellInfo::CalcPowerCost already sees cost 0 and
+ * `CanAffordFfxivActionGauge` sees a zero cost. The core reads no waiver row.
  *
  * Rage (the client's display of the gauge)
  * ----------------------------------------
@@ -142,13 +143,6 @@ struct FfxivActionGaugeRow
     bool comboOnly = false;
 };
 
-// One ffxiv_action_cost_waiver row: while `statusId` is on the player, `actionId` costs no gauge.
-struct FfxivActionCostWaiverRow
-{
-    uint32 statusId = 0;
-    uint32 actionId = 0;
-};
-
 // --- table access ---------------------------------------------------------------------------
 
 // Startup load from the world database. A missing or empty table logs once and leaves it empty.
@@ -158,11 +152,6 @@ void LoadFfxivJobGaugeTables();
 // carry are dropped, as the loader does.
 void SetFfxivJobGaugeTables(std::vector<FfxivJobGaugeRow> gauges, std::vector<FfxivActionGaugeRow> deltas);
 void ClearFfxivJobGaugeTables();
-
-// The cost waivers (ffxiv_action_cost_waiver). Independent of the two tables above; cleared by
-// ClearFfxivJobGaugeTables, which is the "no data at all" reset.
-void SetFfxivActionCostWaiverRows(std::vector<FfxivActionCostWaiverRow> waivers);
-void ClearFfxivActionCostWaiverRows();
 
 // The job's gauge, or nullptr when the job has none (or the table is empty).
 FfxivJobGaugeRow const* GetFfxivJobGaugeRow(uint8 jobId);
@@ -174,9 +163,6 @@ int32 ResolveFfxivActionGaugeDelta(uint32 actionId, uint8 jobId, uint8 level, bo
 // The gauge one cast of the action spends: the magnitude of its negative plain delta (the highest
 // minLevel <= level), 0 when it costs nothing. A comboOnly row is a gain, never a spend.
 uint16 GetFfxivActionGaugeCost(uint32 actionId, uint8 jobId, uint8 level);
-
-// The status ids ffxiv_action_cost_waiver names for the action; empty when it names none.
-std::vector<uint32> GetFfxivActionCostWaiverStatuses(uint32 actionId);
 
 // --- state (keyed by player guid and the job the value belongs to) --------------------------
 
@@ -192,15 +178,13 @@ bool SpendFfxivGauge(ObjectGuid player, uint8 jobId, uint16 amount);
 
 void ClearFfxivGaugeState(); // tests
 
-// Applies ResolveFfxivActionGaugeDelta. `costWaived` drops a spend to 0 (a status makes the action
-// free) and leaves gains alone. True when the value changed.
+// Applies ResolveFfxivActionGaugeDelta. True when the value changed.
 bool ApplyFfxivActionGauge(ObjectGuid player, uint8 jobId, uint8 level, uint32 actionId,
-                           bool comboCorrect, bool costWaived = false);
+                           bool comboCorrect);
 
 // Pure: the gauge holds at least the action's cost. True for a free action, for a job without a
 // gauge and for a zero cost (an empty table therefore changes nothing).
-bool CanAffordFfxivActionGauge(ObjectGuid player, uint32 actionId, uint8 jobId, uint8 level,
-                               bool costWaived = false);
+bool CanAffordFfxivActionGauge(ObjectGuid player, uint32 actionId, uint8 jobId, uint8 level);
 
 // --- script ownership ------------------------------------------------------------------------
 
@@ -221,13 +205,12 @@ bool SpendFfxivGauge(Player& player, uint16 amount);  // sends 0x7A62 on success
 // The cast gate, from the player's own job and level. False means the cast must not start.
 bool CanAffordFfxivActionGauge(Player const& player, uint32 actionId);
 
-// True when a status the player is carrying waives the action's gauge cost (ffxiv_action_cost_waiver).
-bool IsFfxivActionGaugeCostWaived(Player const& player, uint32 actionId);
-
-// True when the core must not charge the action's WoW rage cost (Spell::CheckPower / TakePower): a
-// table waiver, or the player's job is script-owned and the script is the cost authority. The rage
-// bar is only the gauge's display; nothing is lost, the script spends through AddFfxivJobGauge.
-bool IsFfxivActionRageCostWaived(Player const& player, uint32 actionId);
+// True when the core must not charge the action's WoW rage cost (Spell::CheckPower / TakePower)
+// because the player's job is script-owned and the script is the cost authority. The rage bar is
+// only the gauge's display; nothing is lost, the script spends through AddFfxivJobGauge. A status
+// that makes an action free is an engine spell mod (SpellInfo::CalcPowerCost already returns 0), so
+// it needs no branch here.
+bool IsFfxivActionRageCostWaived(Player const& player);
 
 // True when the player's current job is script-owned.
 bool IsFfxivGaugeScriptOwned(Player const& player);

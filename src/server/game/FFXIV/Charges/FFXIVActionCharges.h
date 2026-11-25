@@ -79,8 +79,8 @@ class SpellInfo;
  *
  * Wire
  * ----
- * Custom-packet sub-opcode 0x7A64 (0x7A60..0x7A63 are the stats sheet, the potency column, the job
- * gauge and the combo highlight), schema 1:
+ * Custom-packet sub-opcode 0x7A64 (0x7A60..0x7A62 are the stats sheet, the potency column and the job
+ * gauge; 0x7A63 was the combo highlight, now a livescript addon message), schema 1:
  *   count u8, then per entry, ascending by spellId:
  *     spellId u32, current u8, max u8, remainingMs u32, rechargeMs u32
  * Little-endian, packed. The whole snapshot is sent (never deltas): at enter-world, right after a

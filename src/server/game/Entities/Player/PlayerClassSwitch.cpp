@@ -16,6 +16,8 @@
 #include "CustomPacketWrite.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "FFXIV/Combat/FFXIVActionDamage.h"
+#include "FFXIV/Stats/FFXIVStatTables.h"
 #include "GameTime.h"
 #include "Item.h"
 #include "Log.h"
@@ -202,6 +204,22 @@ bool IsDeathKnightExcludedStarterSpell(uint32 spellId)
             itr->second->SkillLine == SKILL_RIDING)
             return true;
     return false;
+}
+
+// FFXIV action spells carry their owner's SPELLFAMILY_FFXIV_* value (100..), not the class's
+// ChrClasses.SpellClassSet, and one action serves every ClassJob that uses it (Heavy Swing is
+// SPELLFAMILY_FFXIV_WAR for both Marauder and Warrior). For those spells the FFXIV action tables
+// are the ownership rule: a class owns every action its ClassJob has a row for at any level, the
+// same selection Player::LearnMissingFfxivActionSpells applies (level-gated) at login. Empty for a
+// class outside the module.
+std::set<uint32> CollectFfxivClassActionSpells(uint8 classId)
+{
+    uint8 const classJobId = FFXIV::Stats::GetFfxivClassJobId(classId);
+    if (classJobId == FFXIV::Stats::FFXIV_NEUTRAL_JOB_ID)
+        return {};
+    std::vector<uint32> const spellIds = FFXIV::Combat::SelectFfxivActionSpellsToLearn(
+        classJobId, std::numeric_limits<uint8>::max(), [](uint32) { return false; });
+    return { spellIds.begin(), spellIds.end() };
 }
 
 }
@@ -1536,6 +1554,7 @@ private:
         if (!classEntry)
             return SetError(error, "stored profile class entry is missing");
 
+        std::set<uint32> const ffxivActions = CollectFfxivClassActionSpells(profile->ClassId);
         std::set<uint32> seenSpells;
         profile->Spells.erase(std::remove_if(profile->Spells.begin(), profile->Spells.end(),
             [&](SpellProfile const& spell) {
@@ -1557,14 +1576,15 @@ private:
                 }
                 bool const excluded = profile->ClassId == CLASS_DEATH_KNIGHT &&
                     IsDeathKnightExcludedStarterSpell(spell.Id);
+                bool const ffxivAction = info && ffxivActions.count(spell.Id) != 0;
                 bool const keep = !excluded &&
-                    ShouldRetainClassProfileSpell(
+                    (ffxivAction || ShouldRetainClassProfileSpell(
                         info != nullptr,
                         info ? info->SpellFamilyName : 0,
                         classEntry->SpellClassSet,
                         info && info->IsProfessionOrRiding(),
                         hasCoverage,
-                        IsExplicitClassStarterSpell(player, profile->ClassId, spell.Id)) &&
+                        IsExplicitClassStarterSpell(player, profile->ClassId, spell.Id))) &&
                     seenSpells.insert(spell.Id).second;
                 if (!keep && report)
                     report->RemovedSpells.push_back(spell.Id);
@@ -1854,6 +1874,7 @@ private:
         RuntimeClassDefinition const* definition = FindDefinition(classId);
         if (!definition)
             return SetError(error, "target class definition is missing");
+        std::set<uint32> const ffxivActions = CollectFfxivClassActionSpells(classId);
 
         StoredClassProfile created;
         created.Revision = 1;
@@ -1903,7 +1924,8 @@ private:
         }
         for (uint32 spellId : sObjectMgr->GetClassCreateActionSpells(classId))
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-                info && info->SpellFamilyName == definition->SpellClassSet)
+                info && (info->SpellFamilyName == definition->SpellClassSet ||
+                    ffxivActions.count(spellId)))
                 spellIds.insert(spellId);
         for (PlayerCreateInfoAction const& action : createInfo->action)
         {
@@ -1980,7 +2002,8 @@ private:
             if (action.type == ACTION_BUTTON_SPELL)
             {
                 SpellInfo const* info = sSpellMgr->GetSpellInfo(action.action);
-                if (!info || info->SpellFamilyName != definition->SpellClassSet)
+                if (!info || (info->SpellFamilyName != definition->SpellClassSet &&
+                    !ffxivActions.count(action.action)))
                     continue;
             }
             created.Groups[0].Actions[action.button] = action.action | (uint32(action.type) << 24);
@@ -2087,6 +2110,7 @@ private:
         for (SpellProfile const& known : profile->Spells)
             if (known.Active && !known.Disabled)
                 activeActionRanks.insert(known.Id);
+        std::set<uint32> const ffxivActions = CollectFfxivClassActionSpells(profile->ClassId);
 
         for (uint8 group = 0; group < profile->SpecCount; ++group)
         {
@@ -2106,7 +2130,8 @@ private:
                     continue;
                 }
                 if (spell->SpellFamilyName &&
-                    spell->SpellFamilyName != classEntry->SpellClassSet)
+                    spell->SpellFamilyName != classEntry->SpellClassSet &&
+                    !ffxivActions.count(spellId))
                 {
                     packed = 0;
                     if (repaired)
@@ -2154,7 +2179,7 @@ private:
                             break;
                         }
                     }
-                    if (!covered &&
+                    if (!covered && !ffxivActions.count(activeRank) &&
                         !IsExplicitClassStarterSpell(player, profile->ClassId, activeRank))
                     {
                         packed = 0;
@@ -2253,8 +2278,11 @@ private:
             for (uint8 glyph = 0; glyph < GLYPH_SLOTS; ++glyph)
                 captured.Groups[spec].Glyphs[glyph] = player->m_Glyphs[spec][glyph];
         }
+        // A button the player cleared stays in m_actionButtons as ACTIONBUTTON_DELETED (with its old
+        // data) until a _SaveActions pass erases it, and the class-profile save never runs one.
         for (auto const& [button, action] : player->m_actionButtons)
-            captured.Groups[captured.ActiveSpec].Actions[button] = action.packedData;
+            captured.Groups[captured.ActiveSpec].Actions[button] =
+                action.uState == ACTIONBUTTON_DELETED ? 0 : action.packedData;
         for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
         {
             if (Item* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
@@ -2332,16 +2360,18 @@ private:
             return SetError(error, "target profile rune state is incompatible with the class");
 
         bool hasRuneCapabilitySpell = false;
+        std::set<uint32> const ffxivActions = CollectFfxivClassActionSpells(profile.ClassId);
         for (SpellProfile const& spell : profile.Spells)
         {
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.Id);
-            if (!info || !IsSpellAllowedForClassProfile(
-                info->SpellFamilyName, definition.SpellClassSet, info->IsProfessionOrRiding()))
+            bool const ffxivAction = info && ffxivActions.count(spell.Id) != 0;
+            if (!info || (!ffxivAction && !IsSpellAllowedForClassProfile(
+                info->SpellFamilyName, definition.SpellClassSet, info->IsProfessionOrRiding())))
                 return SetError(error, "target profile contains a missing or foreign-class spell");
             if (spell.Active && !spell.Disabled &&
                 (info->PowerType == POWER_RUNE || info->RuneCostID))
                 hasRuneCapabilitySpell = true;
-            if (info->SpellFamilyName)
+            if (info->SpellFamilyName && !ffxivAction)
             {
                 SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spell.Id);
                 bool covered = false;

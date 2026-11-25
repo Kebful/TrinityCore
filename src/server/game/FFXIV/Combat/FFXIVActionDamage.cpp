@@ -21,7 +21,8 @@
  * Reference for the behaviour, read-only: Sapphire aab9cb23.
  *   src/world/Math/CalcStats.cpp      calcActionDamage: the stage order and the two divisors
  *   src/world/Action/Action.cpp       combo selection (isCorrectCombo -> ComboParent == last),
- *                                      combo advance/clear after a hit, potency vs comboPotency
+ *                                      combo advance/clear after a hit (weaponskills without
+ *                                      ComboContinue only), potency vs comboPotency
  *   src/world/Action/Action.cpp       calcHealing (a TODO in the reference; not copied)
  *   data/actions/player.json          nextCombo / *Potency columns
  *   src/common/Common.h:61            MAX_COMBO_LENGTH = 12500 ms
@@ -285,7 +286,8 @@ void LoadFfxivActionComboRows()
 
 void LoadFfxivActionSpellRows()
 {
-    QueryResult result = WorldDatabase.Query("SELECT actionId, spellId FROM ffxiv_action_spell");
+    QueryResult result = WorldDatabase.Query(
+        "SELECT actionId, spellId, category, preservesCombo FROM ffxiv_action_spell");
     if (!result)
     {
         TC_LOG_INFO("server.loading", ">> Loaded 0 FFXIV action spell rows. DB table `ffxiv_action_spell` is "
@@ -301,6 +303,8 @@ void LoadFfxivActionSpellRows()
         FfxivActionSpellRow row;
         row.actionId = fields[0].GetUInt32();
         row.spellId = fields[1].GetUInt32();
+        row.category = fields[2].GetUInt8();
+        row.preservesCombo = fields[3].GetUInt8() != 0;
         if (row.actionId == 0 || row.spellId == 0)
         {
             TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_spell` has a zero action or spell id ({} -> {}), "
@@ -387,16 +391,22 @@ void LoadFfxivActionDamageTables()
                 uint32(g_potencyRows.size()), uint32(g_comboRows.size()), uint32(g_spellRows.size()));
 }
 
-uint32 ResolveFfxivActionIdFromSpell(uint32 spellId)
+FfxivActionSpellRow const* FindFfxivActionSpellRow(uint32 spellId)
 {
     if (spellId == 0)
-        return 0;
+        return nullptr;
 
     auto const it = std::lower_bound(g_spellRows.begin(), g_spellRows.end(), spellId,
         [](FfxivActionSpellRow const& row, uint32 id) { return row.spellId < id; });
     if (it == g_spellRows.end() || it->spellId != spellId)
-        return 0;
-    return it->actionId;
+        return nullptr;
+    return &*it;
+}
+
+uint32 ResolveFfxivActionIdFromSpell(uint32 spellId)
+{
+    FfxivActionSpellRow const* row = FindFfxivActionSpellRow(spellId);
+    return row ? row->actionId : 0;
 }
 
 FfxivActionPotencyRow const* FindFfxivActionPotencyRow(uint32 actionId, uint8 classJobId, uint8 level)
@@ -547,22 +557,6 @@ uint32 ResolveFfxivSpellFromActionId(uint32 actionId)
     return 0;
 }
 
-uint32 NextFfxivComboActionSpell(uint32 lastActionId)
-{
-    if (lastActionId == 0)
-        return 0;
-
-    auto const first = std::lower_bound(g_comboRows.begin(), g_comboRows.end(), lastActionId,
-        [](FfxivActionComboRow const& row, uint32 id) { return row.actionId < id; });
-    for (auto it = first; it != g_comboRows.end() && it->actionId == lastActionId; ++it)
-    {
-        uint32 const spellId = ResolveFfxivSpellFromActionId(it->nextActionId);
-        if (spellId != 0)
-            return spellId;
-    }
-    return 0;
-}
-
 std::vector<uint32> SelectFfxivActionSpellsToLearn(uint8 classJobId, uint8 level,
     std::function<bool(uint32)> const& isKnown)
 {
@@ -612,23 +606,31 @@ uint32 GetFfxivLastActionId(ObjectGuid caster, uint32 nowMs)
 }
 
 void AdvanceFfxivComboState(ObjectGuid caster, uint32 actionId, uint32 lastActionId, uint32 nowMs,
-                            bool damaging)
+                            uint8 category, bool preservesCombo)
 {
-    bool const isStep = IsFfxivComboStep(actionId);
-    bool const isStarter = IsFfxivComboStarter(actionId);
-    bool const comboCorrect = isStep && IsFfxivComboCorrect(lastActionId, actionId);
+    // Sapphire Action.cpp: if (isWeaponskill() && !ComboContinue) { hit && (!isComboAction() ||
+    // isCorrectCombo()) ? setLastComboActionId(id) : setLastComboActionId(0); }. The hook only runs
+    // for a cast that hit, so the hit term is already true here.
+    if (category != FFXIV_ACTION_CATEGORY_WEAPONSKILL)
+        return; // spells and abilities (damaging oGCDs included) never touch the chain
 
-    if (isStarter || isStep)
+    if (preservesCombo)
     {
-        if (isStep && !comboCorrect)
-            g_comboState.erase(caster);
-        else
-            g_comboState[caster] = FfxivComboEntry{ actionId, nowMs };
+        TC_LOG_ERROR("sql.sql", "[ffxiv-debug] combo action {}: PreservesCombo weaponskill, chain {} preserved",
+                     actionId, lastActionId);
+        return;
     }
-    else if (damaging)
+
+    bool const isStep = IsFfxivComboStep(actionId);
+    if (!isStep || IsFfxivComboCorrect(lastActionId, actionId))
     {
-        g_comboState.erase(caster);
+        g_comboState[caster] = FfxivComboEntry{ actionId, nowMs };
+        return;
     }
+
+    g_comboState.erase(caster);
+    TC_LOG_ERROR("sql.sql", "[ffxiv-debug] combo action {}: weaponskill step after {}, chain broken",
+                 actionId, lastActionId);
 }
 
 bool WasFfxivCorrectComboStep(ObjectGuid caster, uint32 actionId, uint32 castMs)
@@ -727,9 +729,10 @@ bool TryApplyFfxivActionEffect(::Player& caster, ::Unit& target, ::SpellInfo con
     // The tables are keyed by the retail Action id; the cast carries the WoW spell id. A spell with
     // no mapping row is not an FFXIV action cast: return before reading or touching any state, which
     // is exactly the behaviour of an absent map (and the shipping state today).
-    uint32 actionId = ResolveFfxivActionIdFromSpell(spellInfo->Id);
-    if (actionId == 0)
+    FfxivActionSpellRow const* const spellRow = FindFfxivActionSpellRow(spellInfo->Id);
+    if (!spellRow)
         return false;
+    uint32 const actionId = spellRow->actionId;
 
     uint32 const nowMs = GameTime::GetGameTimeMS();
     PruneComboState(nowMs);
@@ -833,13 +836,13 @@ bool TryApplyFfxivActionEffect(::Player& caster, ::Unit& target, ::SpellInfo con
         return true; // the action was ours; nothing to apply, and the vanilla dummy has nothing to do
     }
 
-    // Combo window (see the header): a combo starter or a correctly chained step becomes the new
-    // last action; a step used with the wrong predecessor breaks the chain; any other damaging
-    // FFXIV action is a non-combo action and also breaks it. Heals and non-table actions leave it
-    // alone (they are not weaponskills in retail; the data slice does not carry ActionCategory, so
-    // "damaging table action that is not in the combo chain" is the approximation used here).
+    // Combo window (see the header): only a weaponskill without PreservesCombo touches it -- a
+    // starter, a non-combo weaponskill or a correctly chained step becomes the new last action, a
+    // step with the wrong predecessor breaks the chain. Spells, abilities (damaging oGCDs included)
+    // and PreservesCombo weaponskills (the Warrior's gauge spenders) leave it alone.
     if (!recordedThisCast) // another target of the same cast already advanced it
-        AdvanceFfxivComboState(caster.GetGUID(), actionId, lastActionId, nowMs, selection.IsDamage());
+        AdvanceFfxivComboState(caster.GetGUID(), actionId, lastActionId, nowMs, spellRow->category,
+                               spellRow->preservesCombo);
 
     return true;
 }

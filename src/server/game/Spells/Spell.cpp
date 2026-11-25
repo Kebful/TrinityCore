@@ -29,7 +29,6 @@
 #include "DynamicObject.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
 #include "FFXIV/Combat/FFXIVActionShape.h"
-#include "FFXIV/Combat/FFXIVComboHighlight.h"
 #include "FFXIV/Charges/FFXIVActionCharges.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "G3DPosition.hpp"
@@ -3896,11 +3895,6 @@ void Spell::_handle_finish_phase()
     if (Player* player = m_caster->ToPlayer())
         FFXIV::Charges::OnFfxivActionResolved(*player, m_spellInfo);
 
-    // FFXIV combo highlight (FFXIV/Combat/FFXIVComboHighlight.h): same once-per-cast point, reading
-    // the chain the damage hook just advanced, and inert for a cast that is not an FFXIV action.
-    if (Player* player = m_caster->ToPlayer())
-        FFXIV::Combat::OnFfxivActionResolved(*player, m_spellInfo);
-
     // Handle procs on finish
     if (!m_originalCaster)
         return;
@@ -4959,12 +4953,11 @@ void Spell::TakePower()
     if (!m_powerCost)
         return;
 
-    // @ffxiv-begin: a waived FFXIV action pays nothing (CheckPower let it through at any rage). A
-    // script-owned job's gauge is spent by its script (TSPlayer::AddFfxivJobGauge), which also
-    // rewrites the rage mirror, so the core takes no WoW rage for it either.
+    // @ffxiv-begin: a script-owned FFXIV job's gauge is spent by its script
+    // (TSPlayer::AddFfxivJobGauge), which also rewrites the rage mirror, so the core takes no WoW
+    // rage for it.
     if (m_spellInfo->PowerType == POWER_RAGE && unitCaster->IsPlayer())
-        if (FFXIV::Gauge::IsFfxivActionRageCostWaived(*unitCaster->ToPlayer(),
-                FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id)))
+        if (FFXIV::Gauge::IsFfxivActionRageCostWaived(*unitCaster->ToPlayer()))
             return;
     // @ffxiv-end
 
@@ -6821,15 +6814,12 @@ SpellCastResult Spell::CheckPower() const
     // Check power amount
     Powers powerType = m_spellInfo->PowerType;
 
-    // @ffxiv-begin: a status waives an FFXIV action's cost (Inner Release 1177: Fell Cleave and
-    // Decimate cost 0). Spell.dbc's RAGE cost is a fixed number, so the waiver has to be applied
-    // here and in TakePower; the client applies the same rule in Spell_C_GetPowerCost so its button
-    // and tooltip agree. See ffxiv_action_cost_waiver (FFXIV/Gauge/FFXIVJobGauge.h). For a
-    // script-owned job the script is the cost authority (its OnCheckCast refuses what the gauge
-    // cannot pay, waiver included), so the WoW rage check is not a second opinion here.
+    // @ffxiv-begin: a script-owned job's script is the cost authority (its OnCheckCast refuses what
+    // the gauge cannot pay), so the WoW rage check is not a second opinion here. A status that makes
+    // an action free is an engine spell mod: m_powerCost is already 0 from CalcPowerCost, so the
+    // comparison below passes without a branch.
     if (m_powerCost > 0 && powerType == POWER_RAGE && m_caster->IsPlayer()
-        && FFXIV::Gauge::IsFfxivActionRageCostWaived(*m_caster->ToPlayer(),
-              FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id)))
+        && FFXIV::Gauge::IsFfxivActionRageCostWaived(*m_caster->ToPlayer()))
         return SPELL_CAST_OK;
     // @ffxiv-end
 

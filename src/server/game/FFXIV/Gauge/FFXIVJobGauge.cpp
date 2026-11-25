@@ -37,7 +37,6 @@
 #include "WorldPacket.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
-#include "FFXIV/Status/FFXIVStatus.h"
 #include "TSEvent.h"
 #include "TSEvents.h"
 
@@ -52,7 +51,6 @@ namespace
 {
 std::vector<FfxivJobGaugeRow> g_gauges;        // sorted by jobId
 std::vector<FfxivActionGaugeRow> g_deltas;     // sorted by (actionId, jobId, comboOnly, minLevel)
-std::vector<FfxivActionCostWaiverRow> g_waivers; // sorted by (actionId, statusId)
 
 struct FfxivGaugeState
 {
@@ -142,7 +140,6 @@ void ClearFfxivJobGaugeTables()
 {
     g_gauges.clear();
     g_deltas.clear();
-    g_waivers.clear();
 }
 
 void LoadFfxivJobGaugeTables()
@@ -200,57 +197,8 @@ void LoadFfxivJobGaugeTables()
         TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_gauge`: {} rows name a gauge `ffxiv_job_gauge` does not carry "
                                 "or a zero delta, ignored.", deltaRows - g_deltas.size());
 
-    // ffxiv_action_cost_waiver: the statuses that make a spender free (Inner Release -> Fell Cleave).
-    // Independent of the gauge rows above: a waiver for an action with no cost is harmless.
-    std::vector<FfxivActionCostWaiverRow> waivers;
-    if (QueryResult waiverResult = WorldDatabase.Query(
-            "SELECT statusId, actionId FROM ffxiv_action_cost_waiver"))
-    {
-        do
-        {
-            Field* fields = waiverResult->Fetch();
-            FfxivActionCostWaiverRow row;
-            row.statusId = fields[0].GetUInt32();
-            row.actionId = fields[1].GetUInt32();
-            if (row.statusId == 0 || row.actionId == 0)
-            {
-                TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_cost_waiver` has a zero status or action, ignored.");
-                continue;
-            }
-            waivers.push_back(row);
-        } while (waiverResult->NextRow());
-    }
-    std::size_t const waiverRows = waivers.size();
-    SetFfxivActionCostWaiverRows(std::move(waivers));
-
-    TC_LOG_INFO("server.loading", ">> Loaded {} FFXIV job gauges, {} action gauge deltas and {} cost waivers in {} ms",
-                g_gauges.size(), g_deltas.size(), waiverRows, GetMSTimeDiffToNow(oldMSTime));
-}
-
-void ClearFfxivActionCostWaiverRows()
-{
-    g_waivers.clear();
-}
-
-void SetFfxivActionCostWaiverRows(std::vector<FfxivActionCostWaiverRow> waivers)
-{
-    waivers.erase(std::remove_if(waivers.begin(), waivers.end(), [](FfxivActionCostWaiverRow const& row)
-        {
-            return row.statusId == 0 || row.actionId == 0;
-        }), waivers.end());
-    std::sort(waivers.begin(), waivers.end(), [](FfxivActionCostWaiverRow const& left,
-                                                 FfxivActionCostWaiverRow const& right)
-        {
-            if (left.actionId != right.actionId)
-                return left.actionId < right.actionId;
-            return left.statusId < right.statusId;
-        });
-    waivers.erase(std::unique(waivers.begin(), waivers.end(),
-        [](FfxivActionCostWaiverRow const& left, FfxivActionCostWaiverRow const& right)
-        {
-            return left.actionId == right.actionId && left.statusId == right.statusId;
-        }), waivers.end());
-    g_waivers = std::move(waivers);
+    TC_LOG_INFO("server.loading", ">> Loaded {} FFXIV job gauges and {} action gauge deltas in {} ms",
+                g_gauges.size(), g_deltas.size(), GetMSTimeDiffToNow(oldMSTime));
 }
 
 FfxivJobGaugeRow const* GetFfxivJobGaugeRow(uint8 jobId)
@@ -284,16 +232,6 @@ uint16 GetFfxivActionGaugeCost(uint32 actionId, uint8 jobId, uint8 level)
     if (!spend || spend->delta >= 0)
         return 0;
     return uint16(-int32(spend->delta));
-}
-
-std::vector<uint32> GetFfxivActionCostWaiverStatuses(uint32 actionId)
-{
-    std::vector<uint32> statuses;
-    auto const it = std::lower_bound(g_waivers.begin(), g_waivers.end(), actionId,
-        [](FfxivActionCostWaiverRow const& row, uint32 id) { return row.actionId < id; });
-    for (auto row = it; row != g_waivers.end() && row->actionId == actionId; ++row)
-        statuses.push_back(row->statusId);
-    return statuses;
 }
 
 // --------------------------------------------------------------------------
@@ -336,25 +274,19 @@ void ClearFfxivGaugeState()
 }
 
 bool ApplyFfxivActionGauge(ObjectGuid player, uint8 jobId, uint8 level, uint32 actionId,
-                           bool comboCorrect, bool costWaived)
+                           bool comboCorrect)
 {
     int32 delta = ResolveFfxivActionGaugeDelta(actionId, jobId, level, comboCorrect);
-    // A status-waived cost cannot spend: the gain part of the row (if any) still applies. The clamp
-    // below stays as a safety, but a cast that cannot pay is refused in Spell::CheckCast and never
-    // reaches this function (CanAffordFfxivActionGauge).
-    if (costWaived && delta < 0)
-        delta = 0;
     if (delta == 0)
         return false;
     uint16 const before = GetFfxivGauge(player, jobId);
     return AddFfxivGauge(player, jobId, delta) != before;
 }
 
-bool CanAffordFfxivActionGauge(ObjectGuid player, uint32 actionId, uint8 jobId, uint8 level,
-                               bool costWaived)
+bool CanAffordFfxivActionGauge(ObjectGuid player, uint32 actionId, uint8 jobId, uint8 level)
 {
     uint16 const cost = GetFfxivActionGaugeCost(actionId, jobId, level);
-    if (cost == 0 || costWaived)
+    if (cost == 0)
         return true;
     return GetFfxivGauge(player, jobId) >= cost;
 }
@@ -398,11 +330,12 @@ bool IsFfxivGaugeScriptOwned(Player const& player)
     return IsFfxivJobGaugeScriptOwned(player.GetFFXIVStats().jobId);
 }
 
-bool IsFfxivActionRageCostWaived(Player const& player, uint32 actionId)
+bool IsFfxivActionRageCostWaived(Player const& player)
 {
-    if (actionId == 0)
-        return false;
-    return IsFfxivGaugeScriptOwned(player) || IsFfxivActionGaugeCostWaived(player, actionId);
+    // Only a script-owned job: its script is the cost authority and spends through AddFfxivJobGauge,
+    // so the core must not take WoW rage as a second opinion. A status that makes an action free is
+    // an engine spell mod and already produced m_powerCost 0 in Spell::Prepare.
+    return IsFfxivGaugeScriptOwned(player);
 }
 
 bool CanAffordFfxivActionGauge(Player const& player, uint32 actionId)
@@ -411,21 +344,7 @@ bool CanAffordFfxivActionGauge(Player const& player, uint32 actionId)
     // A script-owned job's cost gate is the script's (Spell.OnCheckCast); the data cost is not read.
     if (IsFfxivJobGaugeScriptOwned(stats.jobId))
         return true;
-    return CanAffordFfxivActionGauge(player.GetGUID(), actionId, stats.jobId, stats.level,
-                                     IsFfxivActionGaugeCostWaived(player, actionId));
-}
-
-bool IsFfxivActionGaugeCostWaived(Player const& player, uint32 actionId)
-{
-    if (actionId == 0 || g_waivers.empty())
-        return false;
-    for (uint32 const statusId : GetFfxivActionCostWaiverStatuses(actionId))
-    {
-        FFXIV::Status::FfxivStatusRow const* status = FFXIV::Status::GetFfxivStatus(statusId);
-        if (status && status->spellId != 0 && player.HasAura(status->spellId))
-            return true;
-    }
-    return false;
+    return CanAffordFfxivActionGauge(player.GetGUID(), actionId, stats.jobId, stats.level);
 }
 
 uint16 AddFfxivGauge(Player& player, int32 amount)
@@ -527,7 +446,7 @@ void OnFfxivActionResolved(Player& caster, SpellInfo const* spellInfo)
     FIRE_ID(spellInfo->events.id, Spell, OnFfxivActionResolved, TSPlayer(&caster), TSSpellInfo(spellInfo),
             TSNumber<uint32>(actionId), comboCorrect);
 
-    // A job a script owns has no data path: its rows, waivers and cost are not read.
+    // A job a script owns has no data path: its rows and cost are not read.
     if (IsFfxivJobGaugeScriptOwned(stats.jobId))
         return;
 
@@ -537,12 +456,11 @@ void OnFfxivActionResolved(Player& caster, SpellInfo const* spellInfo)
         return;
     }
 
-    bool const waived = IsFfxivActionGaugeCostWaived(caster, actionId);
     uint16 const before = GetFfxivGauge(caster);
     bool const applied = ApplyFfxivActionGauge(caster.GetGUID(), stats.jobId, stats.level, actionId,
-                                               comboCorrect, waived);
-    TC_LOG_ERROR("sql.sql", "[ffxiv-debug] gauge action {} job {} level {} combo {} waived {} applied {} {}->{}",
-                actionId, uint32(stats.jobId), uint32(stats.level), comboCorrect, waived, applied,
+                                               comboCorrect);
+    TC_LOG_ERROR("sql.sql", "[ffxiv-debug] gauge action {} job {} level {} combo {} applied {} {}->{}",
+                actionId, uint32(stats.jobId), uint32(stats.level), comboCorrect, applied,
                 before, GetFfxivGauge(caster));
     if (!applied)
         return;

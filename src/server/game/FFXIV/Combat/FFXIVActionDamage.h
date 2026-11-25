@@ -36,7 +36,7 @@
  *
  *   ffxiv_action_potency(actionId, classJob, minLevel, kind, damage, cure, combo, flank, front, rear)
  *   ffxiv_action_combo(actionId, nextActionId)
- *   ffxiv_action_spell(actionId, spellId)
+ *   ffxiv_action_spell(actionId, spellId, category, preservesCombo)
  *
  * A combo row is read as "actionId, then nextActionId is a correct combo" -- the same direction as
  * the reference's `nextCombo` list (Sapphire aab9cb23, data/actions/player.json: Fast Blade 9 ->
@@ -45,7 +45,9 @@
  * The potency and combo tables are keyed by the retail Action id (Heavy Swing = 31), but the cast
  * only carries the WoW spell id the module created for that action. ffxiv_action_spell is the map
  * between the two: the module writes it when it creates the action spells, and the hook resolves
- * spellInfo->Id through it before any lookup. A spell with no row is not an FFXIV action cast.
+ * spellInfo->Id through it before any lookup. A spell with no row is not an FFXIV action cast. The
+ * same row carries the two Action sheet columns the combo rule reads: ActionCategory (column 3) and
+ * PreservesCombo (column 37, Sapphire's ComboContinue).
  *
  * All three tables are loaded once at startup from the world database. A missing or empty table
  * leaves the tables empty and therefore leaves every cast on its existing path: no mapping row, no
@@ -111,7 +113,12 @@ struct FfxivActionSpellRow
 {
     uint32 actionId = 0;
     uint32 spellId = 0;
+    uint8 category = 0;          // Action sheet column 3 ActionCategory (FFXIV_ACTION_CATEGORY_*)
+    bool preservesCombo = false; // Action sheet column 37 PreservesCombo (Sapphire's ComboContinue)
 };
+
+// Action sheet column 3 ActionCategory: the only category the combo rule reads.
+constexpr uint8 FFXIV_ACTION_CATEGORY_WEAPONSKILL = 3;
 
 // The reference's combo window (Sapphire aab9cb23 src/common/Common.h:61 MAX_COMBO_LENGTH).
 constexpr uint32 FFXIV_COMBO_WINDOW_MS = 12500;
@@ -189,6 +196,9 @@ bool HasFfxivActionSpellRows();
 // 0 means the hook must leave the cast on its existing path.
 uint32 ResolveFfxivActionIdFromSpell(uint32 spellId);
 
+// The ffxiv_action_spell row for `spellId`, or nullptr under the same rule as above.
+FfxivActionSpellRow const* FindFfxivActionSpellRow(uint32 spellId);
+
 // The f(WD) the live hook feeds the pipeline for every action cast. There is no FFXIV gear model
 // yet, so this is f(WD)'s level term alone (ComputeFfxivWeaponDamagePercent(stats, 0)). The tooltip
 // multiplier must use the same value or its number would not describe the damage the hook applies.
@@ -236,14 +246,8 @@ bool HasFfxivActionComboRows();
 // The action a correct combo expects after `actionId`: the lowest nextActionId among its
 // ffxiv_action_combo rows, or 0 when no row starts at `actionId`. Several rows can name different
 // successors (retail's PvP combo routes); the lowest keeps the answer deterministic and the port
-// models no routing. Read-only; the combo highlight (FFXIV/Combat/FFXIVComboHighlight.h) uses it.
+// models no routing. Read-only.
 uint32 NextFfxivComboActionId(uint32 actionId);
-
-// The first successor of `actionId` that has a generated action spell, as a spell id; 0 when none.
-// The game sheet can list several successors (Heavy Swing -> Skull Sunder 35, Maim 37, ...), and the
-// lowest id is not always one the module ships a spell for. The combo highlight must draw a button
-// that exists, so it skips successors without a spell row instead of sending 0 and clearing the ring.
-uint32 NextFfxivComboActionSpell(uint32 actionId);
 
 // The spell the module created for `actionId` (ffxiv_action_spell), or 0 when there is no row.
 // The reverse of ResolveFfxivActionIdFromSpell; both sides of the map are unique.
@@ -275,12 +279,18 @@ uint32 GetFfxivLastActionId(ObjectGuid caster, uint32 nowMs);
 // (FFXIV/Gauge/FFXIVJobGauge.h), which runs once per cast after every target was resolved.
 bool WasFfxivCorrectComboStep(ObjectGuid caster, uint32 actionId, uint32 castMs);
 
-// Advance `caster`'s combo chain for one resolved cast (the damage hook's own step, exposed so a test
-// can drive it without a Player): a starter or a correctly chained step becomes the new last action, a
-// step with the wrong predecessor erases the chain, and any other damaging action erases it too.
+// Advance `caster`'s combo chain for one resolved cast that hit (the damage hook's own step, exposed
+// so a test can drive it without a Player). Retail's rule, as Sapphire's Action.cpp states it:
+//   - only a weaponskill (`category` FFXIV_ACTION_CATEGORY_WEAPONSKILL) touches the chain; a spell or
+//     an ability (a damaging oGCD included) leaves it alone;
+//   - a weaponskill with `preservesCombo` (Action col 37, ComboContinue) leaves it alone too;
+//   - any other weaponskill advances it when it is not a combo step or is the correct step, and
+//     breaks it when it is a step with the wrong (or no) predecessor.
+// A weaponskill that is no step records itself, as Sapphire's setLastComboActionId does: when it
+// is not a starter either, no step follows it, so the chain is over all the same.
 // `lastActionId` is the predecessor read before this cast (0 when none or expired).
 void AdvanceFfxivComboState(ObjectGuid caster, uint32 actionId, uint32 lastActionId, uint32 nowMs,
-                            bool damaging);
+                            uint8 category, bool preservesCombo);
 
 // --- selection and math ---------------------------------------------------------------------
 

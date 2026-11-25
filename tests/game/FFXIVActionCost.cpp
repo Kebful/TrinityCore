@@ -17,9 +17,10 @@
 
 /*
  * The FFXIV resource-cost gate, pure: the rows are the ones tools/generate-ffxiv-job-gauges.py writes
- * from the shipped sheets (Inner Beast 49 / Fell Cleave 3549 -50, Inner Release 1177 waives Fell
- * Cleave and Decimate). The status-gated replacement (Nascent Chaos -> Inner Chaos) is not a core
- * rule: the client swaps the action and livescripts/spell-scripts/Warrior/warrior.ts gates it.
+ * from the shipped sheets (Inner Beast 49 / Fell Cleave 3549 -50). A status that makes a cast free is
+ * an engine spell mod (Inner Release's ADD_PCT_MODIFIER aura), so there is no waiver row here: the
+ * cost the gate sees is already 0. The status-gated replacement (Nascent Chaos -> Inner Chaos) is not
+ * a core rule: the client swaps the action and livescripts/spell-scripts/Warrior/warrior.ts gates it.
  */
 
 #include "tc_catch2.h"
@@ -42,7 +43,6 @@ constexpr uint32 DECIMATE = 3550;
 constexpr uint32 MAIM = 37;
 constexpr uint32 INNER_CHAOS = 16465;
 constexpr uint32 CHAOTIC_CYCLONE = 16463;
-constexpr uint32 INNER_RELEASE = 1177;
 
 ObjectGuid const Player1 = ObjectGuid::Create<HighGuid::Player>(1);
 
@@ -67,17 +67,11 @@ std::vector<FfxivActionGaugeRow> Deltas()
     };
 }
 
-std::vector<FfxivActionCostWaiverRow> Waivers()
-{
-    return { { INNER_RELEASE, FELL_CLEAVE }, { INNER_RELEASE, DECIMATE } };
-}
-
 struct CostFixture
 {
     CostFixture()
     {
         SetFfxivJobGaugeTables(Gauges(), Deltas());
-        SetFfxivActionCostWaiverRows(Waivers());
         ClearFfxivGaugeState();
     }
 
@@ -122,36 +116,19 @@ TEST_CASE_METHOD(CostFixture, "FFXIV cost: the cast gate, at 0 and at the cost",
     CHECK(SpendFfxivGauge(Player1, WAR, 50));
     CHECK(GetFfxivGauge(Player1, WAR) == 0);
     CHECK_FALSE(CanAffordFfxivActionGauge(Player1, DECIMATE, WAR, 60));
-    // The waive is a parameter of the pure check (the Player overload reads the status auras).
-    CHECK(CanAffordFfxivActionGauge(Player1, DECIMATE, WAR, 60, true));
 }
 
-TEST_CASE_METHOD(CostFixture, "FFXIV cost: a waived cost neither refuses nor spends", "[ffxiv]")
+TEST_CASE_METHOD(CostFixture, "FFXIV cost: a spender spends its row, a gain adds it", "[ffxiv]")
 {
     CHECK(AddFfxivGauge(Player1, WAR, 100) == 100);
 
-    // Inner Release: Fell Cleave costs 0, so the row's -50 is not applied at all.
-    CHECK_FALSE(ApplyFfxivActionGauge(Player1, WAR, 60, FELL_CLEAVE, false, true));
-    CHECK(GetFfxivGauge(Player1, WAR) == 100);
-
-    // Without the waiver the same cast spends.
-    CHECK(ApplyFfxivActionGauge(Player1, WAR, 60, FELL_CLEAVE, false, false));
+    CHECK(ApplyFfxivActionGauge(Player1, WAR, 60, FELL_CLEAVE, false));
     CHECK(GetFfxivGauge(Player1, WAR) == 50);
 
-    // The gain part of a row is not affected by the waiver parameter.
-    CHECK(ApplyFfxivActionGauge(Player1, WAR, 50, INFURIATE, false, true));
+    CHECK(ApplyFfxivActionGauge(Player1, WAR, 50, INFURIATE, false));
     CHECK(GetFfxivGauge(Player1, WAR) == 100);
-}
 
-TEST_CASE_METHOD(CostFixture, "FFXIV cost: the waiver table names the statuses", "[ffxiv]")
-{
-    CHECK(GetFfxivActionCostWaiverStatuses(FELL_CLEAVE) == std::vector<uint32>{ INNER_RELEASE });
-    CHECK(GetFfxivActionCostWaiverStatuses(DECIMATE) == std::vector<uint32>{ INNER_RELEASE });
-    CHECK(GetFfxivActionCostWaiverStatuses(INNER_BEAST).empty());
-
-    // A row with a zero id is dropped, and clearing the tables drops the waivers too.
-    SetFfxivActionCostWaiverRows({ { 0, FELL_CLEAVE }, { INNER_RELEASE, 0 } });
-    CHECK(GetFfxivActionCostWaiverStatuses(FELL_CLEAVE).empty());
-    ClearFfxivJobGaugeTables();
-    CHECK(GetFfxivActionCostWaiverStatuses(INNER_BEAST).empty());
+    // An action with no row changes nothing.
+    CHECK_FALSE(ApplyFfxivActionGauge(Player1, WAR, 60, 12345, false));
+    CHECK(GetFfxivGauge(Player1, WAR) == 100);
 }

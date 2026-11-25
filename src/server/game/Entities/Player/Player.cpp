@@ -18,7 +18,6 @@
 #include "Player.h"
 #include "FFXIV/CFXIVCreation.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
-#include "FFXIV/Combat/FFXIVComboHighlight.h"
 #include "FFXIV/Charges/FFXIVActionCharges.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
@@ -1061,11 +1060,6 @@ void Player::Update(uint32 p_time)
     if (ClassSwitch::IsClassSwitchGameplayBlocked(
         ClassSwitch::IsTransitionPending(this), false))
         return;
-
-    // FFXIV combo highlight (FFXIV/Combat/FFXIVComboHighlight.h): the 12.5 s chain window can lapse
-    // while the player does nothing, and nothing else would notice, so the tick clears the highlight.
-    // One map lookup per tick; it returns immediately when this player has no highlight.
-    FFXIV::Combat::UpdateFfxivComboHighlight(*this);
 
     // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): a recharge that completes while the
     // player does nothing would otherwise only be noticed on the next cast, so the tick refreshes the
@@ -23297,9 +23291,6 @@ void Player::SendInitialPacketsAfterAddToMap()
     // FFXIV action charges (0x7A64): the client's SpellCharge map starts from the server's pools, so
     // a reloaded UI draws the same recharges and an empty pool is greyed from the first frame.
     FFXIV::Charges::SendFfxivActionCharges(*this);
-    // FFXIV combo highlight (0x7A63): the value the server currently expects, so a reloaded UI and a
-    // re-logged character start from the same state.
-    FFXIV::Combat::SendFfxivComboHighlight(*this);
 }
 
 void Player::SendUpdateToOutOfRangeGroupMembers()

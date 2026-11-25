@@ -246,6 +246,12 @@ TEST_CASE("FFXIV action spell map: a spell id resolves to its retail Action id",
     CHECK(ResolveFfxivActionIdFromSpell(FAST_BLADE) == 0); // an action id is not a spell id
     CHECK(ResolveFfxivActionIdFromSpell(0) == 0);
 
+    // The reverse map (action -> spell), which the charge snapshot reads.
+    CHECK(ResolveFfxivSpellFromActionId(HEAVY_SWING) == HEAVY_SWING_SPELL);
+    CHECK(ResolveFfxivSpellFromActionId(FAST_BLADE) == FAST_BLADE_SPELL);
+    CHECK(ResolveFfxivSpellFromActionId(RIOT_BLADE) == 0); // a chain action with no spell row
+    CHECK(ResolveFfxivSpellFromActionId(0) == 0);
+
     ClearFfxivActionDamageTables();
 }
 
@@ -574,7 +580,7 @@ TEST_CASE("FFXIV combo: the Marauder/Warrior chain the sheet states", "[ffxiv]")
     CHECK(IsFfxivComboCorrect(37, 45));
     CHECK_FALSE(IsFfxivComboCorrect(42, 45)); // wrong predecessor: no combo
     CHECK_FALSE(IsFfxivComboCorrect(0, 45));  // no predecessor at all
-    // The highlight's successor is deterministic (the lowest): Maim can go to Path or Eye.
+    // The successor is deterministic (the lowest): Maim can go to Path or Eye.
     CHECK(NextFfxivComboActionId(37) == 42);
 
     ClearFfxivActionDamageTables();
@@ -586,6 +592,8 @@ namespace WarriorCombo
 constexpr uint8 WAR = 21;
 constexpr uint8 BEAST = 22;
 constexpr uint32 HEAVY_SWING = 31, MAIM = 37, STORMS_PATH = 42, STORMS_EYE = 45, SURGING_TEMPEST = 2677;
+constexpr uint32 OVERPOWER = 41, INNER_BEAST = 49, UPHEAVAL = 7387;
+constexpr uint8 WEAPONSKILL = FFXIV::Combat::FFXIV_ACTION_CATEGORY_WEAPONSKILL, ABILITY = 4;
 
 ObjectGuid const Caster = ObjectGuid::Create<HighGuid::Player>(7);
 
@@ -611,12 +619,13 @@ struct WarriorFixture
 
     // One cast the way the hooks see it: the damage hook advances the chain (reading the predecessor
     // the window still holds), then the gauge hook asks whether that step was correct and applies the row.
-    bool Cast(uint32 actionId, uint32 nowMs)
+    // `category` / `preservesCombo` are the Action sheet's columns 3 / 37 (ffxiv_action_spell).
+    bool Cast(uint32 actionId, uint32 nowMs, uint8 category = WEAPONSKILL, bool preservesCombo = false)
     {
         uint32 const last = FFXIV::Combat::GetFfxivLastActionId(Caster, nowMs);
-        FFXIV::Combat::AdvanceFfxivComboState(Caster, actionId, last, nowMs, true);
+        FFXIV::Combat::AdvanceFfxivComboState(Caster, actionId, last, nowMs, category, preservesCombo);
         bool const comboCorrect = FFXIV::Combat::WasFfxivCorrectComboStep(Caster, actionId, nowMs);
-        FFXIV::Gauge::ApplyFfxivActionGauge(Caster, WarriorCombo::WAR, 50, actionId, comboCorrect, false);
+        FFXIV::Gauge::ApplyFfxivActionGauge(Caster, WarriorCombo::WAR, 50, actionId, comboCorrect);
         return comboCorrect;
     }
 };
@@ -686,4 +695,32 @@ TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: a step with no or
     CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 10);
     CHECK_FALSE(Cast(STORMS_EYE, 6000 + 13501));      // combo window (12.5 s) expired
     CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 10);
+}
+
+TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: only a weaponskill without PreservesCombo touches the chain", "[ffxiv]")
+{
+    // Sapphire Action.cpp (retail): if (isWeaponskill() && !ComboContinue) advance-or-clear.
+    // Heavy Swing -> Inner Beast (weaponskill, PreservesCombo) -> Maim still combos.
+    CHECK_FALSE(Cast(HEAVY_SWING, 1000));
+    CHECK_FALSE(Cast(INNER_BEAST, 2000, WEAPONSKILL, true));
+    CHECK(FFXIV::Combat::GetFfxivLastActionId(Caster, 2000) == HEAVY_SWING);
+    CHECK(Cast(MAIM, 3000));
+    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 10);
+
+    // A damaging oGCD (Upheaval, an ability) between steps: the chain survives.
+    CHECK_FALSE(Cast(UPHEAVAL, 3500, ABILITY));
+    CHECK(Cast(STORMS_EYE, 4000));
+    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 20);
+
+    // The window still runs from the last chain step, not from the preserving action.
+    CHECK_FALSE(Cast(HEAVY_SWING, 10000));
+    CHECK_FALSE(Cast(INNER_BEAST, 20000, WEAPONSKILL, true));
+    CHECK_FALSE(Cast(MAIM, 10000 + 12501));
+
+    // Any other weaponskill is a chain break: Overpower (a starter of its own chain) replaces it.
+    CHECK_FALSE(Cast(HEAVY_SWING, 30000));
+    CHECK_FALSE(Cast(OVERPOWER, 31000));
+    CHECK(FFXIV::Combat::GetFfxivLastActionId(Caster, 31000) == OVERPOWER);
+    CHECK_FALSE(Cast(MAIM, 32000));
+    CHECK(FFXIV::Combat::GetFfxivLastActionId(Caster, 32000) == 0); // wrong step: cleared
 }
