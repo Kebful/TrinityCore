@@ -44,7 +44,8 @@
  */
 
 #include "Player.h"
-#include "FFXIV/Gauge/FFXIVJobGauge.h"
+#include "DBCStores.h"
+#include "FFXIV/Jobs/FFXIVJobSlot.h"
 #include "FFXIV/Stats/FFXIVStatEngine.h"
 #include "FFXIV/Stats/FFXIVStatProjection.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
@@ -184,7 +185,10 @@ void Player::RebuildFFXIVStats()
     FFXIV::Stats::FfxivStatInputs inputs;
     inputs.level = uint8(std::clamp<uint32>(GetLevel(), 1, FFXIV::Stats::FFXIV_MAX_LEVEL));
     inputs.effectiveLevel = inputs.level;
-    inputs.jobId = FFXIV::Stats::GetFfxivClassJobId(moduleClassId);
+    // The job, not only the class slot: a later job's kit is learned on a base class slot, and the
+    // Soul of <Job> the player wears is what makes it their job (FFXIV/Jobs/FFXIVJobSlot.h). A class
+    // with no stone resolves to its own ClassJob row exactly as before.
+    inputs.jobId = FFXIV::Jobs::GetFfxivPlayerJobId(*this);
     inputs.tribeId = FFXIV::Stats::FFXIV_NEUTRAL_TRIBE_ID;
 
     _ffxivStats = FFXIV::Stats::ComputeFfxivStats(inputs);
@@ -234,8 +238,8 @@ void Player::RebuildFFXIVStats()
     if (IsInWorld())
     {
         FFXIV::Stats::SendFfxivStatsSnapshot(*this);
-        // A rebuild is where a job change lands: the gauge readout follows the new job (or clears).
-        FFXIV::Gauge::SendFfxivJobGauge(*this);
+        // A rebuild is where a job change lands; the job livescripts re-send their gauge/charge
+        // snapshots from their own tick when the job or level changed (no core send point).
     }
 }
 
@@ -244,4 +248,30 @@ FFXIV::Stats::FfxivDerivedStats const& Player::GetFFXIVStats() const
     if (_ffxivStatsDirty)
         const_cast<Player*>(this)->RebuildFFXIVStats();
     return _ffxivStats;
+}
+
+void Player::RefreshFFXIVJob()
+{
+    // The job a player has can change without a class switch: equipping or removing the Soul of
+    // <Job> does it (FFXIV/Jobs/FFXIVJobSlot.h). This is called from the equip/login path
+    // (Unit::UpdateDisplayPower) and after a class switch restored the equipment profile.
+    uint8 const jobId = FFXIV::Jobs::GetFfxivPlayerJobId(*this);
+
+    // The bar first: the client's MP gauge binds on the unit's power type, so a Dark Knight must
+    // show mana before the packets below go out. A hosted MP job on a physical slot adopts the
+    // class's base mana pool (player_classlevelstats.basemana) when it has none yet.
+    uint8 classPower = 0; // POWER_MANA
+    if (ChrClassesEntry const* entry = sChrClassesStore.LookupEntry(GetClass()))
+        classPower = entry->DisplayPower;
+    uint8 const displayPower = FFXIV::Jobs::GetFfxivJobDisplayPower(jobId, classPower);
+    if (uint8(GetPowerType()) != displayPower)
+    {
+        bool const fillMana = displayPower == 0 && GetMaxPower(POWER_MANA) > 0 && GetPower(POWER_MANA) == 0;
+        SetPowerType(Powers(displayPower));
+        if (fillMana)
+            SetFullPower(POWER_MANA);
+    }
+
+    if (_ffxivStats.jobId != jobId)
+        RebuildFFXIVStats();
 }

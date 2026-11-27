@@ -42,7 +42,12 @@
 #include "Player.h"
 #include "SpellInfo.h"
 #include "Unit.h"
+#include "FFXIV/Combat/FFXIVSpellStages.h"
+#include "FFXIV/Gauge/FFXIVJobGauge.h"
+#include "FFXIV/Jobs/FFXIVJobSlot.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
+#include "FFXIV/Status/FFXIVStatus.h"
+#include "Spells/Auras/SpellAuraDefines.h"
 #include "TSEvent.h"
 #include "TSEvents.h"
 
@@ -60,6 +65,9 @@ namespace
 std::vector<FfxivActionPotencyRow> g_potencyRows;
 std::vector<FfxivActionComboRow> g_comboRows;
 std::vector<FfxivActionSpellRow> g_spellRows;
+
+// actionId -> (kind -> value). A small per-action map: ffxiv_action_effect is a handful of rows.
+std::unordered_map<uint32, std::unordered_map<uint8, int32>> g_actionEffects;
 
 // The last action a player cast, for the combo check. Module-owned state: the Player type is not
 // extended by this slice (the snapshot is the only Player addition the stats slice made).
@@ -231,6 +239,7 @@ void ClearFfxivActionDamageTables()
 {
     SetFfxivActionDamageTables({}, {});
     SetFfxivActionSpellRows({});
+    g_actionEffects.clear();
 }
 
 bool HasFfxivActionPotencyRows()
@@ -241,6 +250,27 @@ bool HasFfxivActionPotencyRows()
 bool HasFfxivActionSpellRows()
 {
     return !g_spellRows.empty();
+}
+
+bool HasFfxivActionPotencyRowForAction(uint32 actionId)
+{
+    if (actionId == 0)
+        return false;
+
+    auto const it = std::lower_bound(g_potencyRows.begin(), g_potencyRows.end(), actionId,
+        [](FfxivActionPotencyRow const& row, uint32 id) { return row.actionId < id; });
+    return it != g_potencyRows.end() && it->actionId == actionId;
+}
+
+uint8 FfxivActionPotencyBaseLevel(uint32 actionId)
+{
+    if (actionId == 0)
+        return 0;
+
+    auto const it = std::lower_bound(g_potencyRows.begin(), g_potencyRows.end(), actionId,
+        [](FfxivActionPotencyRow const& row, uint32 id) { return row.actionId < id; });
+    // Rows are sorted by (actionId, minLevel), so the first row is the base band.
+    return it != g_potencyRows.end() && it->actionId == actionId ? it->minLevel : 0;
 }
 
 namespace
@@ -317,6 +347,35 @@ void LoadFfxivActionSpellRows()
     TC_LOG_INFO("server.loading", ">> Loaded {} FFXIV action spell rows", uint32(rows.size()));
     SetFfxivActionSpellRows(std::move(rows));
 }
+
+void LoadFfxivActionEffectRows()
+{
+    QueryResult result = WorldDatabase.Query("SELECT actionId, kind, value FROM ffxiv_action_effect");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 FFXIV action effects. DB table `ffxiv_action_effect` is "
+                                      "missing or empty; an ENERGIZE effect on an action keeps its own value.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const actionId = fields[0].GetUInt32();
+        uint8 const kind = fields[1].GetUInt8();
+        int32 const value = fields[2].GetInt32();
+        if (actionId == 0)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_effect` has a zero action id, ignored.");
+            continue;
+        }
+        g_actionEffects[actionId][kind] = value;
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} FFXIV action effect rows", count);
+}
 } // namespace
 
 void LoadFfxivActionDamageTables()
@@ -326,7 +385,7 @@ void LoadFfxivActionDamageTables()
     ClearFfxivActionDamageTables();
 
     QueryResult result = WorldDatabase.Query(
-        "SELECT actionId, classJob, minLevel, kind, damage, cure, combo, flank, front, rear "
+        "SELECT actionId, classJob, minLevel, kind, damage, cure, dot, combo, flank, front, rear "
         "FROM ffxiv_action_potency");
     if (!result)
     {
@@ -335,6 +394,7 @@ void LoadFfxivActionDamageTables()
         // Still try the other two tables so a half-landed set is visible in the log.
         LoadFfxivActionComboRows();
         LoadFfxivActionSpellRows();
+        LoadFfxivActionEffectRows();
         return;
     }
 
@@ -349,10 +409,11 @@ void LoadFfxivActionDamageTables()
         row.kind = fields[3].GetUInt8();
         row.damage = fields[4].GetUInt16();
         row.cure = fields[5].GetUInt16();
-        row.combo = fields[6].GetUInt16();
-        row.flank = fields[7].GetUInt16();
-        row.front = fields[8].GetUInt16();
-        row.rear = fields[9].GetUInt16();
+        row.dot = fields[6].GetUInt16();
+        row.combo = fields[7].GetUInt16();
+        row.flank = fields[8].GetUInt16();
+        row.front = fields[9].GetUInt16();
+        row.rear = fields[10].GetUInt16();
 
         if (row.actionId == 0)
         {
@@ -384,6 +445,7 @@ void LoadFfxivActionDamageTables()
     SetFfxivActionDamageTables(std::move(rows), {});
     LoadFfxivActionComboRows();
     LoadFfxivActionSpellRows();
+    LoadFfxivActionEffectRows();
 
     // Startup proof that the `spells` logger/appenders are live; the action hooks below use the
     // same category, so a missing line here means a log-config problem, not an unreached hook.
@@ -453,7 +515,7 @@ FfxivPartyComposition FfxivPartyFromGroup(::Player& player)
     {
         if (!member || !member->IsInWorld())
             return;
-        uint8 const classJobId = Stats::GetFfxivClassJobId(member->GetClass());
+        uint8 const classJobId = Jobs::GetFfxivPlayerJobId(*member);
         FfxivPartyRole role;
         if (GetFfxivPartyRole(classJobId, role))
             party = party.With(role);
@@ -474,8 +536,8 @@ std::vector<FfxivActionPlainPotency> CollectFfxivActionPlainPotencies(uint8 clas
         uint32 const actionId = g_potencyRows[first].actionId;
         // One answer per action id: the same precedence the damage hook resolves with.
         FfxivActionPotencyRow const* const row = FindFfxivActionPotencyRow(actionId, classJobId, level);
-        if (row && row->damage > 0)
-            entries.push_back(FfxivActionPlainPotency{ actionId, row->damage });
+        if (row && (row->damage > 0 || row->cure > 0 || row->dot > 0))
+            entries.push_back(FfxivActionPlainPotency{ actionId, row->damage, row->cure, row->dot });
 
         // Skip the rest of this action's rows (sorted by actionId, then minLevel).
         std::size_t next = first;
@@ -555,44 +617,6 @@ uint32 ResolveFfxivSpellFromActionId(uint32 actionId)
         if (row.actionId == actionId)
             return row.spellId;
     return 0;
-}
-
-std::vector<uint32> SelectFfxivActionSpellsToLearn(uint8 classJobId, uint8 level,
-    std::function<bool(uint32)> const& isKnown)
-{
-    std::vector<uint32> spellIds;
-    if (g_potencyRows.empty() || g_spellRows.empty())
-        return spellIds;
-
-    // Rows are sorted by actionId: walk one action's rows at a time and use the same job rule the
-    // potency lookup uses (exact job, or a generic 0/255 row), gated by the level.
-    for (std::size_t first = 0; first < g_potencyRows.size();)
-    {
-        uint32 const actionId = g_potencyRows[first].actionId;
-        bool matches = false;
-        std::size_t next = first;
-        for (; next < g_potencyRows.size() && g_potencyRows[next].actionId == actionId; ++next)
-        {
-            FfxivActionPotencyRow const& row = g_potencyRows[next];
-            if (row.minLevel > level)
-                continue;
-            if (JobSpecificity(row, classJobId) > 0)
-                matches = true;
-        }
-        first = next;
-
-        if (!matches)
-            continue;
-
-        uint32 const spellId = ResolveFfxivSpellFromActionId(actionId);
-        if (spellId == 0 || isKnown(spellId))
-            continue;
-        spellIds.push_back(spellId);
-    }
-
-    std::sort(spellIds.begin(), spellIds.end());
-    spellIds.erase(std::unique(spellIds.begin(), spellIds.end()), spellIds.end());
-    return spellIds;
 }
 
 uint32 GetFfxivLastActionId(ObjectGuid caster, uint32 nowMs)
@@ -690,7 +714,9 @@ FfxivPotencySelection SelectFfxivActionPotency(uint32 actionId, uint8 classJobId
 FfxivDirectDamageResult ComputeFfxivActionDamage(FfxivDerivedStats const& stats,
                                                  FfxivPotencySelection const& selection,
                                                  int32 weaponDamagePercent, uint8 targetLevel,
-                                                 FfxivPartyComposition party, FfxivRollSource& rolls)
+                                                 FfxivPartyComposition party, FfxivRollSource& rolls,
+                                                 std::span<FfxivPercentFactor const> buffs,
+                                                 FfxivCombatGuarantees guarantees)
 {
     FfxivDirectDamageResult result;
     if (!selection.IsDamage() || selection.potency == 0)
@@ -698,22 +724,365 @@ FfxivDirectDamageResult ComputeFfxivActionDamage(FfxivDerivedStats const& stats,
 
     // The published pipeline is FFXIVCombatMath's; this wrapper only supplies the selected potency.
     result = ComputeFfxivDirectDamage(stats, selection.potency, weaponDamagePercent, targetLevel, party,
-                                      FfxivTraitState{}, rolls);
+                                      FfxivTraitState{}, rolls, buffs, guarantees);
     return result;
 }
 
 FfxivHealResult ComputeFfxivActionHeal(FfxivDerivedStats const& stats,
                                        FfxivPotencySelection const& selection,
                                        int32 weaponDamagePercent, uint8 targetLevel,
-                                       FfxivPartyComposition party, FfxivRollSource& rolls)
+                                       FfxivPartyComposition party, FfxivRollSource& rolls,
+                                       std::span<FfxivPercentFactor const> buffs)
 {
     FfxivHealResult result;
     if (selection.source != FfxivPotencySource::Cure || selection.potency == 0)
         return result;
 
     result = ComputeFfxivHeal(stats, selection.potency, weaponDamagePercent, targetLevel, party,
-                              FfxivTraitState{}, rolls);
+                              FfxivTraitState{}, rolls, buffs);
     return result;
+}
+
+namespace
+{
+// The caster's active ffxiv_status_effect rows, turned into the two inputs the published pipeline
+// accepts: damage_done_pct (on the caster) and damage_taken_pct (on the target) become multiplicative
+// percent factors, and force_crit / force_direct_hit become guarantees. These are the same rows the
+// status aura carries for the client, so the engine/UI and our math read one number. A row with no
+// aura semantic (a marker) contributes nothing.
+void CollectFfxivCombatModifiers(::Unit& caster, ::Unit& target, std::vector<FfxivPercentFactor>& buffs,
+                                 FfxivCombatGuarantees& guarantees)
+{
+    for (Status::FfxivStatusEffectRow const& effect : Status::CollectActiveFfxivStatusEffects(caster))
+    {
+        switch (effect.kind)
+        {
+            case Status::FFXIV_STATUS_EFFECT_DAMAGE_DONE_PCT:
+                if (effect.value != 0)
+                    buffs.push_back(FfxivPercentFactor{ 100 + effect.value, 100 });
+                break;
+            case Status::FFXIV_STATUS_EFFECT_FORCE_CRIT:
+                guarantees.critical = guarantees.critical || effect.value != 0;
+                break;
+            case Status::FFXIV_STATUS_EFFECT_FORCE_DIRECT_HIT:
+                guarantees.directHit = guarantees.directHit || effect.value != 0;
+                break;
+            default:
+                break; // max HP / move speed / damage taken are the engine's or the target's
+        }
+    }
+
+    if (&target != &caster)
+    {
+        for (Status::FfxivStatusEffectRow const& effect : Status::CollectActiveFfxivStatusEffects(target))
+            if (effect.kind == Status::FFXIV_STATUS_EFFECT_DAMAGE_TAKEN_PCT && effect.value != 0)
+                buffs.push_back(FfxivPercentFactor{ 100 + effect.value, 100 });
+    }
+}
+} // namespace
+
+void CollectFfxivStatusCombatModifiers(::Unit& caster, ::Unit& target, std::vector<FfxivPercentFactor>& buffs,
+                                        FfxivCombatGuarantees& guarantees)
+{
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+}
+
+// --------------------------------------------------------------------------
+// the effect-driven cast path (the one-time spine)
+// --------------------------------------------------------------------------
+
+uint32 FfxivActionIdForSpell(SpellInfo const* spellInfo)
+{
+    return spellInfo ? ResolveFfxivActionIdFromSpell(spellInfo->Id) : 0;
+}
+
+int32 GetFfxivActionEffectValue(uint32 actionId, uint8 kind)
+{
+    auto const action = g_actionEffects.find(actionId);
+    if (action == g_actionEffects.end())
+        return 0;
+    auto const value = action->second.find(kind);
+    return value == action->second.end() ? 0 : value->second;
+}
+
+namespace
+{
+// The combo predecessor for this cast and whether this target is the first of the cast that may
+// advance the chain. Same rule as the DUMMY hook: an area action calls its effect once per target,
+// so the second target must not advance (or break) the chain again.
+uint32 LastActionForCast(Player& caster, uint32 actionId, uint32 nowMs, bool& recordedThisCast)
+{
+    PruneComboState(nowMs);
+    recordedThisCast = false;
+
+    uint32 lastActionId = 0;
+    auto const stateIt = g_comboState.find(caster.GetGUID());
+    if (stateIt != g_comboState.end())
+    {
+        recordedThisCast = stateIt->second.lastActionId == actionId && stateIt->second.lastActionMs == nowMs;
+        if (IsFfxivComboWindowOpen(stateIt->second.lastActionMs, nowMs))
+            lastActionId = stateIt->second.lastActionId;
+    }
+    return lastActionId;
+}
+
+// The target's angle on its own hitbox, 0 for a friendly/self cast.
+int32 TargetAngleDegrees(Player& caster, Unit& target, bool hostileTarget)
+{
+    if (!hostileTarget)
+        return 0;
+    float const radians = target.GetRelativeAngle(&caster);
+    return int32(std::lround(radians * 180.0f / float(M_PI)));
+}
+
+FfxivPotencySelection SelectForCast(Player& caster, Unit& target, uint32 actionId,
+                                    int32 explicitPotency, bool hostileTarget, uint32 nowMs,
+                                    bool& recordedThisCast, uint32& lastActionId)
+{
+    FfxivDerivedStats const& stats = caster.GetFFXIVStats();
+    lastActionId = LastActionForCast(caster, actionId, nowMs, recordedThisCast);
+    FfxivPotencySelection selection = SelectFfxivActionPotency(
+        actionId, stats.jobId, stats.level, lastActionId, TargetAngleDegrees(caster, target, hostileTarget),
+        hostileTarget);
+
+    // The spell chain writes the sheet's BASE band literally. The table wins only where it holds a
+    // real higher band (a row above the action's base minLevel, e.g. Heavy Swing 200@84 / 240@94) or
+    // a positional/combo variant the chain has no single number for. Below that, the chain is the
+    // value, so a hand-edited chain takes effect and the base band does not duplicate the table.
+    if (explicitPotency > 0)
+    {
+        bool const variant = selection.source == FfxivPotencySource::Combo
+            || selection.source == FfxivPotencySource::Flank
+            || selection.source == FfxivPotencySource::Front
+            || selection.source == FfxivPotencySource::Rear;
+        FfxivActionPotencyRow const* const row =
+            FindFfxivActionPotencyRow(actionId, stats.jobId, stats.level);
+        bool const higherBand = row && row->minLevel > FfxivActionPotencyBaseLevel(actionId);
+
+        if (selection.source == FfxivPotencySource::None)
+        {
+            selection.source = hostileTarget ? FfxivPotencySource::Plain : FfxivPotencySource::Cure;
+            selection.potency = uint16(std::min<int32>(explicitPotency, 0xFFFF));
+        }
+        else if (!variant && !higherBand)
+            selection.potency = uint16(std::min<int32>(explicitPotency, 0xFFFF));
+    }
+    return selection;
+}
+} // namespace
+
+FfxivActionEffectResult ComputeFfxivActionEffectDamage(::Player& caster, ::Unit& target,
+                                                       ::SpellInfo const* spellInfo,
+                                                       int32 explicitPotency)
+{
+    FfxivActionEffectResult out;
+    if (!spellInfo || !HasFfxivActionPotencyRows())
+        return out;
+
+    uint32 const actionId = FfxivActionIdForSpell(spellInfo);
+    if (actionId == 0)
+        return out; // not an FFXIV action cast: the caller keeps its vanilla damage
+
+    out.handled = true;
+    if (!target.IsAlive())
+        return out;
+
+    FfxivDerivedStats const& stats = caster.GetFFXIVStats();
+    uint32 const nowMs = GameTime::GetGameTimeMS();
+    bool const hostileTarget = &target != &caster && !caster.IsFriendlyTo(&target);
+    bool recordedThisCast = false;
+    uint32 lastActionId = 0;
+    FfxivPotencySelection const selection = SelectForCast(caster, target, actionId, explicitPotency,
+                                                          hostileTarget, nowMs, recordedThisCast,
+                                                          lastActionId);
+    if (!selection.IsDamage() || selection.potency == 0)
+        return out;
+
+    int32 const weaponDamagePercent = ComputeFfxivActionWeaponDamagePercent(stats);
+    uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
+    std::vector<FfxivPercentFactor> buffs;
+    FfxivCombatGuarantees guarantees;
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+
+    // Per target: the seed carries the target guid, so two targets of one area cast draw different
+    // variance and crit (the property the old cast-wide hook lacked).
+    FfxivSeededRollSource rolls(FfxivActionRollSeed(caster.GetGUID().GetRawValue(), actionId,
+                                                    target.GetGUID().GetRawValue(), nowMs));
+
+    FfxivDirectDamageResult const result = ComputeFfxivActionDamage(
+        stats, selection, weaponDamagePercent, targetLevel, FfxivPartyFromGroup(caster), rolls, buffs,
+        guarantees);
+    out.value = result.value;
+    out.crit = result.crit;
+
+    if (out.value > 0)
+    {
+        FfxivActionSpellRow const* const spellRow = FindFfxivActionSpellRow(spellInfo->Id);
+        if (spellRow && !recordedThisCast)
+            AdvanceFfxivComboState(caster.GetGUID(), actionId, lastActionId, nowMs,
+                                   spellRow->category, spellRow->preservesCombo);
+        caster.SetInCombatWith(&target);
+    }
+    return out;
+}
+
+FfxivActionEffectResult ComputeFfxivActionEffectHeal(::Player& caster, ::Unit& target,
+                                                     ::SpellInfo const* spellInfo, int32 explicitCure)
+{
+    FfxivActionEffectResult out;
+    if (!spellInfo || !HasFfxivActionPotencyRows())
+        return out;
+
+    uint32 const actionId = FfxivActionIdForSpell(spellInfo);
+    if (actionId == 0)
+        return out;
+
+    out.handled = true;
+    if (!target.IsAlive())
+        return out;
+
+    FfxivDerivedStats const& stats = caster.GetFFXIVStats();
+    uint32 const nowMs = GameTime::GetGameTimeMS();
+    bool const hostileTarget = &target != &caster && !caster.IsFriendlyTo(&target);
+    bool recordedThisCast = false;
+    uint32 lastActionId = 0;
+    FfxivPotencySelection selection = SelectForCast(caster, target, actionId, explicitCure,
+                                                    hostileTarget, nowMs, recordedThisCast, lastActionId);
+    if (selection.source == FfxivPotencySource::None)
+    {
+        if (explicitCure <= 0)
+            return out;
+        selection.source = FfxivPotencySource::Cure;
+        selection.potency = uint16(std::min<int32>(explicitCure, 0xFFFF));
+    }
+    if (selection.potency == 0)
+        return out;
+
+    int32 const weaponDamagePercent = ComputeFfxivActionWeaponDamagePercent(stats);
+    uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
+    std::vector<FfxivPercentFactor> buffs;
+    FfxivCombatGuarantees guarantees;
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+    FfxivSeededRollSource rolls(FfxivActionRollSeed(caster.GetGUID().GetRawValue(), actionId,
+                                                    target.GetGUID().GetRawValue(), nowMs));
+
+    FfxivHealResult const result = ComputeFfxivActionHeal(
+        stats, selection, weaponDamagePercent, targetLevel, FfxivPartyFromGroup(caster), rolls, buffs);
+    out.value = result.value;
+    out.crit = result.crit;
+    return out;
+}
+
+int64 ComputeFfxivActionEffectDotTick(::Player& caster, ::Unit& target, ::SpellInfo const* spellInfo,
+                                      int32 explicitPotency)
+{
+    if (!spellInfo)
+        return 0;
+    uint32 const actionId = FfxivActionIdForSpell(spellInfo);
+    if (actionId == 0)
+        return 0;
+
+    Status::FfxivActionDotRow const* dot = Status::GetFfxivActionDotForAction(actionId);
+    int32 const potency = explicitPotency > 0 ? explicitPotency : (dot ? int32(dot->potency) : 0);
+    if (potency <= 0)
+        return 0;
+
+    FfxivDerivedStats const& stats = caster.GetFFXIVStats();
+    uint32 const nowMs = GameTime::GetGameTimeMS();
+    uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
+    std::vector<FfxivPercentFactor> buffs;
+    FfxivCombatGuarantees guarantees;
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+    FfxivSeededRollSource rolls(FfxivActionRollSeed(caster.GetGUID().GetRawValue(), actionId,
+                                                    target.GetGUID().GetRawValue(), nowMs));
+    return ComputeFfxivDotTick(stats, potency, ComputeFfxivActionWeaponDamagePercent(stats), targetLevel,
+                               FfxivPartyFromGroup(caster), FfxivTraitState{}, rolls, buffs, nullptr,
+                               guarantees);
+}
+
+bool TryApplyFfxivActionEnergize(::Player& /*caster*/, ::SpellInfo const* spellInfo, int32 explicitAmount,
+                                 int32& appliedAmount)
+{
+    appliedAmount = 0;
+    if (!spellInfo)
+        return false;
+
+    uint32 const actionId = FfxivActionIdForSpell(spellInfo);
+    if (actionId == 0)
+        return false;
+
+    // The action's grant row is the default; a non-zero effect value is the per-spell tune.
+    int32 const table = GetFfxivActionEffectValue(actionId, FFXIV_ACTION_EFFECT_GAUGE_DELTA);
+    int32 const amount = explicitAmount != 0 ? explicitAmount : table;
+    appliedAmount = amount;
+    if (amount == 0)
+        return false;
+
+    // The grant goes to the FFXIV gauge, never to WoW's rage: for a module class rage is the gauge's
+    // one-way display (FFXIV/Gauge/FFXIVJobGauge.h) and the gauge is the job livescript's, which
+    // applies the same action's ffxiv_action_gauge row at Spell.OnFfxivActionResolved. Report the
+    // effect handled so the vanilla power path cannot grant something else; the core holds no gauge
+    // value to write.
+    return true;
+}
+
+bool ComputeFfxivActionAuraAmount(::Player& caster, ::Unit& target, ::SpellInfo const* spellInfo,
+                                  uint32 auraType, int32 explicitValue, int32& amount)
+{
+    if (!spellInfo)
+        return false;
+
+    uint32 const actionId = FfxivActionIdForSpell(spellInfo);
+    if (actionId == 0)
+        return false;
+
+    if (auraType == SPELL_AURA_PERIODIC_DAMAGE)
+    {
+        int64 const tick = ComputeFfxivActionEffectDotTick(caster, target, spellInfo, explicitValue);
+        if (tick <= 0)
+            return false;
+        amount = int32(std::min<int64>(tick, std::numeric_limits<int32>::max()));
+        return true;
+    }
+
+    // A status-shaped aura an action applies itself carries the same hand-authored magnitude the
+    // status aura would (ffxiv_status_effect). The action may list more than one status; the first
+    // row whose kind maps to this aura type wins, which is deterministic because the rows are sorted
+    // by kind.
+    std::vector<uint32> const* statuses = Status::GetFfxivActionStatuses(actionId);
+    if (!statuses)
+        return false;
+
+    auto kindForAura = [](uint32 type) -> int32
+    {
+        switch (type)
+        {
+            case SPELL_AURA_MOD_DAMAGE_PERCENT_DONE:    return Status::FFXIV_STATUS_EFFECT_DAMAGE_DONE_PCT;
+            case SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN:   return Status::FFXIV_STATUS_EFFECT_DAMAGE_TAKEN_PCT;
+            case SPELL_AURA_MOD_INCREASE_HEALTH_PERCENT:return Status::FFXIV_STATUS_EFFECT_MAX_HP_PCT;
+            case SPELL_AURA_MOD_DECREASE_SPEED:         return Status::FFXIV_STATUS_EFFECT_MOVE_SPEED_PCT;
+            default:                                    return -1;
+        }
+    };
+    int32 const wantedKind = kindForAura(auraType);
+    if (wantedKind < 0)
+        return false;
+
+    for (uint32 statusId : *statuses)
+    {
+        std::vector<Status::FfxivStatusEffectRow> const* effects = Status::GetFfxivStatusEffects(statusId);
+        if (!effects)
+            continue;
+        for (Status::FfxivStatusEffectRow const& effect : *effects)
+        {
+            if (effect.kind == uint8(wantedKind))
+            {
+                amount = effect.value;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // --------------------------------------------------------------------------
@@ -782,13 +1151,19 @@ bool TryApplyFfxivActionEffect(::Player& caster, ::Unit& target, ::SpellInfo con
     FfxivSeededRollSource rolls(uint64(caster.GetGUID().GetRawValue()) * 0x9E3779B97F4A7C15ull
                                 + uint64(actionId) * 0xBF58476D1CE4E5B9ull + uint64(nowMs));
 
+    // The active ffxiv_status_effect rows: a real aura (Surging Tempest's MOD_DAMAGE_PERCENT_DONE)
+    // and our math read the same number. Force-crit/DH rows are guarantees, not percentages.
+    std::vector<FfxivPercentFactor> buffs;
+    FfxivCombatGuarantees guarantees;
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+
     bool applied = false;
     if (selection.IsDamage())
     {
         if (target.IsAlive())
         {
             FfxivDirectDamageResult const result = ComputeFfxivActionDamage(
-                stats, selection, weaponDamagePercent, targetLevel, party, rolls);
+                stats, selection, weaponDamagePercent, targetLevel, party, rolls, buffs, guarantees);
             int32 value = int32(result.value);
             // @tswow-begin
             // FFXIV-named hook: the number is final (FFXIVCombatMath's own crit/direct-hit/variance/

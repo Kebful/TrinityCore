@@ -19,6 +19,7 @@
 #define TRINITYCORE_FFXIV_STATS_SNAPSHOT_H
 
 #include "FFXIV/Combat/FFXIVActionDamage.h"
+#include "FFXIV/FFXIVMessages.h"
 #include "FFXIVStatTypes.h"
 #include <cstddef>
 #include <cstdint>
@@ -55,8 +56,9 @@ class Player;
 
 namespace FFXIV::Stats
 {
-// Custom-packet sub-opcode. Both ends carry this constant; see DESIGN.md §1.3.
-constexpr uint16 FFXIV_STATS_SNAPSHOT_OPCODE = 0x7A60;
+// Custom-packet sub-opcode. Both ends carry this constant; see DESIGN.md §1.3. The value is the
+// shared FFXIV::Protocol::SubOpcode mirror of shared/Messages.ts.
+constexpr uint16 FFXIV_STATS_SNAPSHOT_OPCODE = uint16(FFXIV::Protocol::SubOpcode::STATS_SNAPSHOT);
 
 // Payload schema. A change in field set or width is a new number (the client rejects
 // every other size/schema pair as a whole rather than parsing it partially).
@@ -111,14 +113,17 @@ enum FfxivStatsSnapshotOffset : std::size_t
 // part of the snapshot payload: the list is ~4 bytes per action while the snapshot is a fixed
 // 47 bytes, and mixing them would make every snapshot rebuild carry the whole table.
 //
-// The list is the plain damage column only (combo/positional are contextual and are not shown) for
-// the actions that resolve for this (job, level) -- CollectFfxivActionPlainPotencies.
-constexpr uint16 FFXIV_ACTION_POTENCY_OPCODE = 0x7A61;
-constexpr uint8 FFXIV_ACTION_POTENCY_SCHEMA = 1;
+// The list is the plain damage column, the cure column and the DoT tick potency (combo/positional
+// are contextual and are not shown) for the actions that resolve for this (job, level) --
+// CollectFfxivActionPlainPotencies. Schema 2 adds cure and dot beside damage so a tooltip macro can
+// resolve any of the three at the player's level; schema 1 carried damage only.
+constexpr uint16 FFXIV_ACTION_POTENCY_OPCODE = uint16(FFXIV::Protocol::SubOpcode::ACTION_POTENCY);
+constexpr uint8 FFXIV_ACTION_POTENCY_SCHEMA = 2;
 
-// count u16, count x { actionId u16, damage u16 }, schema u8. Packed, little-endian, no padding.
+// count u16, count x { actionId u16, damage u16, cure u16, dot u16 }, schema u8. Packed,
+// little-endian, no padding.
 constexpr std::size_t FFXIV_ACTION_POTENCY_HEADER_BYTES = 3;
-constexpr std::size_t FFXIV_ACTION_POTENCY_ENTRY_BYTES = 4;
+constexpr std::size_t FFXIV_ACTION_POTENCY_ENTRY_BYTES = 8;
 
 constexpr std::size_t FfxivActionPotencyPayloadBytes(std::size_t count)
 {

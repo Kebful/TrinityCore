@@ -1483,10 +1483,6 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         void LearnCustomSpells();
         void LearnDefaultSkills();
         void LearnDefaultSkill(uint32 skillId, uint16 rank);
-        // FFXIV: learn every action spell this player's ClassJob and level qualify for
-        // (ffxiv_action_potency + ffxiv_action_spell). Idempotent; no-op for non-FFXIV classes
-        // and while the tables are missing. A runtime safety net, not a replacement for autolearn.
-        void LearnMissingFfxivActionSpells();
         void LearnQuestRewardedSpells();
         void LearnQuestRewardedSpells(Quest const* quest);
         void AddTemporarySpell(uint32 spellId);
@@ -1661,6 +1657,9 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         // Rebuilt by UpdateAllStats(), marked dirty by UpdateStats(); never
         // persisted and never written to a Unit field (I §3.2/§3.3).
         void RebuildFFXIVStats();
+        // The FFXIV job a player has can change when the Soul of <Job> is equipped; this re-derives
+        // the job, the power bar and (on a change) the snapshot. FFXIV/Jobs/FFXIVJobSlot.h.
+        void RefreshFFXIVJob();
         FFXIV::Stats::FfxivDerivedStats const& GetFFXIVStats() const;
         void ApplySpellPenetrationBonus(int32 amount, bool apply);
         void UpdateResistances(uint32 school) override;
@@ -1748,6 +1747,7 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         bool UpdatePosition(float x, float y, float z, float orientation, bool teleport = false) override;
         bool UpdatePosition(Position const& pos, bool teleport = false) override { return UpdatePosition(pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(), pos.GetOrientation(), teleport); }
         void ProcessTerrainStatusUpdate(ZLiquidStatus oldLiquidStatus, Optional<LiquidData> const& newLiquidData) override;
+        void AtEnterCombat() override;
         void AtExitCombat() override;
 
         void SendMessageToSet(WorldPacket const* data, bool self) const override { SendMessageToSetInRange(data, GetVisibilityRange(), self); }

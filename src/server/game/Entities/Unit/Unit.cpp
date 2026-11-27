@@ -58,7 +58,9 @@
 #include "PetAI.h"
 #include "Pet.h"
 #include "Player.h"
+#include "FFXIV/Combat/FFXIVSpellStages.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
+#include "FFXIV/Jobs/FFXIVJobSlot.h"
 #include "PlayerAI.h"
 #include "QuestDef.h"
 #include "ReputationMgr.h"
@@ -1031,6 +1033,12 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
     );
     // @tswow-end
 
+    // @ffxiv-begin: which engine mitigation stages this cast may pass through. Armour/resist are
+    // already identity in their own functions; crit damage, block and resilience are guarded here so
+    // the FFXIV value (and its own crit roll) is not scaled twice. See ENGINE-DEVIATIONS.md.
+    bool const ffxivOwnsDamage = FFXIV::Combat::FfxivActionOwnsCombatStages(spellInfo);
+    // @ffxiv-end
+
     // Spells with SPELL_ATTR4_FIXED_DAMAGE ignore resilience because their damage is based off another spell's damage.
     if (!spellInfo->HasAttribute(SPELL_ATTR4_FIXED_DAMAGE))
     {
@@ -1048,6 +1056,8 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
                 {
                     damageInfo->HitInfo |= SPELL_HIT_TYPE_CRIT;
 
+                    if (!ffxivOwnsDamage)
+                    {
                     // Calculate crit bonus
                     uint32 crit_bonus = damage;
                     // Apply crit_damage bonus for melee spells
@@ -1070,10 +1080,11 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
 
                     if (critPctDamageMod != 0)
                         AddPct(damage, critPctDamageMod);
+                    }
                 }
 
                 // Spell weapon based damage CAN BE crit & blocked at same time
-                if (blocked)
+                if (blocked && !ffxivOwnsDamage)
                 {
                     damageInfo->blocked = victim->GetShieldBlockValue();
                     // double blocked amount if block is critical
@@ -1087,7 +1098,7 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
                     damage -= damageInfo->blocked;
                 }
 
-                if (CanApplyResilience())
+                if (!ffxivOwnsDamage && CanApplyResilience())
                     Unit::ApplyResilience(victim, nullptr, &damage, crit, (attackType == RANGED_ATTACK ? CR_CRIT_TAKEN_RANGED : CR_CRIT_TAKEN_MELEE));
                 break;
             }
@@ -1102,7 +1113,7 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
                     damage = Unit::SpellCriticalDamageBonus(this, spellInfo, damage, victim);
                 }
 
-                if (CanApplyResilience())
+                if (!ffxivOwnsDamage && CanApplyResilience())
                     Unit::ApplyResilience(victim, nullptr, &damage, crit, CR_CRIT_TAKEN_SPELL);
                 break;
             }
@@ -1640,6 +1651,12 @@ void Unit::HandleEmoteCommand(Emote emoteId)
 
 /*static*/ uint32 Unit::CalcArmorReducedDamage(Unit const* attacker, Unit* victim, uint32 damage, SpellInfo const* spellInfo, WeaponAttackType attackType /*= MAX_ATTACK*/, uint8 attackerLevel /*= 0*/)
 {
+    // @ffxiv-begin: FFXIV has no WoW armour stage; an action's number is already final
+    // (ENGINE-DEVIATIONS.md).
+    if (spellInfo && FFXIV::Combat::FfxivActionOwnsCombatStages(spellInfo))
+        return damage;
+    // @ffxiv-end
+
     float armor = float(victim->GetArmor());
 
     // Ignore enemy armor by SPELL_AURA_MOD_TARGET_RESISTANCE aura
@@ -1708,6 +1725,11 @@ void Unit::HandleEmoteCommand(Emote emoteId)
 
 /*static*/ uint32 Unit::CalcSpellResistedDamage(Unit const* attacker, Unit* victim, uint32 damage, SpellSchoolMask schoolMask, SpellInfo const* spellInfo)
 {
+    // @ffxiv-begin: no partial resist for an FFXIV action; the number is final (ENGINE-DEVIATIONS.md).
+    if (spellInfo && FFXIV::Combat::FfxivActionOwnsCombatStages(spellInfo))
+        return 0;
+    // @ffxiv-end
+
     // Magic damage, check for resists
     if (!(schoolMask & SPELL_SCHOOL_MASK_MAGIC))
         return 0;
@@ -5584,6 +5606,11 @@ void Unit::UpdateDisplayPower()
                 ChrClassesEntry const* cEntry = sChrClassesStore.LookupEntry(GetClass());
                 if (cEntry && cEntry->DisplayPower < MAX_POWERS)
                     displayPower = Powers(cEntry->DisplayPower);
+                // FFXIV: a job hosted on this class slot (the Soul of <Job> the player wears, see
+                // FFXIV/Jobs/FFXIVJobSlot.h) shows its own power bar -- Dark Knight on Marauder
+                // shows MP. No stone: the class's power, unchanged.
+                displayPower = Powers(FFXIV::Jobs::GetFfxivJobDisplayPower(
+                    FFXIV::Jobs::GetFfxivPlayerJobId(*ToPlayer()), uint8(displayPower)));
             }
             else if (GetTypeId() == TYPEID_UNIT)
             {
@@ -5607,6 +5634,11 @@ void Unit::UpdateDisplayPower()
     }
 
     SetPowerType(displayPower);
+
+    // FFXIV: the power bar above may be a hosted job's instead of the class's; re-derive the job so
+    // the snapshot/gauge follow an equipped or removed Soul of <Job> (FFXIV/Jobs/FFXIVJobSlot.h).
+    if (GetTypeId() == TYPEID_PLAYER)
+        ToPlayer()->RefreshFFXIVJob();
 }
 
 void Unit::_addAttacker(Unit* pAttacker)
@@ -6583,6 +6615,13 @@ uint32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, uin
     if (!spellProto || !victim || damagetype == DIRECT_DAMAGE)
         return pdamage;
 
+    // @ffxiv-begin: an FFXIV action's damage is FFXIVCombatMath's, already final; no spell power,
+    // school bonus, flat-versus or done-% stage may scale it. Selection is the data test in
+    // FFXIV/Combat/FFXIVSpellStages.h -- never an id here. See ENGINE-DEVIATIONS.md.
+    if (FFXIV::Combat::FfxivActionOwnsCombatStages(spellProto))
+        return pdamage;
+    // @ffxiv-end
+
     // Some spells don't benefit from done mods
     if (spellProto->HasAttribute(SPELL_ATTR3_NO_DONE_BONUS))
         return pdamage;
@@ -7036,6 +7075,11 @@ uint32 Unit::SpellDamageBonusTaken(Unit* caster, SpellInfo const* spellProto, ui
     if (!spellProto || damagetype == DIRECT_DAMAGE)
         return pdamage;
 
+    // @ffxiv-begin: the taken-% stages are the engine's, not ours (ENGINE-DEVIATIONS.md).
+    if (FFXIV::Combat::FfxivActionOwnsCombatStages(spellProto))
+        return pdamage;
+    // @ffxiv-end
+
     float TakenTotalMod = 1.0f;
 
     // Mod damage from spell mechanic
@@ -7380,6 +7424,12 @@ float Unit::SpellCritChanceTaken(Unit const* caster, SpellInfo const* spellInfo,
 
 /*static*/ uint32 Unit::SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, Unit* victim)
 {
+    // @ffxiv-begin: the FFXIV crit multiplier is inside FFXIVCombatMath's value; the engine only
+    // marks the hit type (ENGINE-DEVIATIONS.md).
+    if (spellProto && FFXIV::Combat::FfxivActionOwnsCombatStages(spellProto))
+        return damage;
+    // @ffxiv-end
+
     // Calculate critical bonus
     int32 crit_bonus = damage;
     float crit_mod = 0.0f;
@@ -7423,6 +7473,11 @@ float Unit::SpellCritChanceTaken(Unit const* caster, SpellInfo const* spellInfo,
 
 /*static*/ uint32 Unit::SpellCriticalHealingBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, Unit* victim)
 {
+    // @ffxiv-begin: the FFXIV heal crit multiplier is already in our value (ENGINE-DEVIATIONS.md).
+    if (spellProto && FFXIV::Combat::FfxivActionOwnsCombatStages(spellProto))
+        return damage;
+    // @ffxiv-end
+
     // Calculate critical bonus
     int32 crit_bonus;
     switch (spellProto->DmgClass)
@@ -7457,6 +7512,12 @@ float Unit::SpellCritChanceTaken(Unit const* caster, SpellInfo const* spellInfo,
 
 uint32 Unit::SpellHealingBonusDone(Unit* victim, SpellInfo const* spellProto, uint32 healamount, DamageEffectType damagetype, SpellEffectInfo const& spellEffectInfo, Optional<float> const& donePctTotal, uint32 stack /*= 1*/) const
 {
+    // @ffxiv-begin: an FFXIV cure's amount is FFXIVCombatMath's f(HMP) chain, already final
+    // (ENGINE-DEVIATIONS.md).
+    if (spellProto && FFXIV::Combat::FfxivActionOwnsCombatStages(spellProto))
+        return healamount;
+    // @ffxiv-end
+
     // For totems get healing bonus from owner (statue isn't totem in fact)
     if (GetTypeId() == TYPEID_UNIT && IsTotem())
         if (Unit* owner = GetOwner())
@@ -7681,6 +7742,11 @@ float Unit::SpellHealingPctDone(Unit* victim, SpellInfo const* spellProto) const
 
 uint32 Unit::SpellHealingBonusTaken(Unit* caster, SpellInfo const* spellProto, uint32 healamount, DamageEffectType damagetype) const
 {
+    // @ffxiv-begin: the healing-taken stages are the engine's (ENGINE-DEVIATIONS.md).
+    if (spellProto && FFXIV::Combat::FfxivActionOwnsCombatStages(spellProto))
+        return healamount;
+    // @ffxiv-end
+
     float TakenTotalMod = 1.0f;
 
     // Healing taken percent

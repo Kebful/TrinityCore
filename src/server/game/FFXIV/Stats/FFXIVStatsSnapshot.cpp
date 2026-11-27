@@ -164,10 +164,11 @@ std::vector<uint8> BuildFfxivActionPotencyPayload(
     payload.reserve(FfxivActionPotencyPayloadBytes(entries.size()));
 
     // Count first, then the entries, then the schema byte last: the reader checks the width
-    // (3 + 4*count) and the trailing schema before it looks at a single entry.
+    // (3 + 8*count) and the trailing schema before it looks at a single entry.
     std::size_t written = 0;
     for (Combat::FfxivActionPlainPotency const& entry : entries)
-        if (entry.actionId <= std::numeric_limits<uint16>::max() && entry.damage > 0)
+        if (entry.actionId <= std::numeric_limits<uint16>::max()
+            && (entry.damage > 0 || entry.cure > 0 || entry.dot > 0))
             ++written;
 
     AppendU16(payload, uint16(written));
@@ -175,10 +176,13 @@ std::vector<uint8> BuildFfxivActionPotencyPayload(
     // trailing schema byte is last. Writing a reserved byte here made the body one byte too long.
     for (Combat::FfxivActionPlainPotency const& entry : entries)
     {
-        if (entry.actionId > std::numeric_limits<uint16>::max() || entry.damage == 0)
+        if (entry.actionId > std::numeric_limits<uint16>::max()
+            || (entry.damage == 0 && entry.cure == 0 && entry.dot == 0))
             continue;
         AppendU16(payload, uint16(entry.actionId));
         AppendU16(payload, entry.damage);
+        AppendU16(payload, entry.cure);
+        AppendU16(payload, entry.dot);
     }
     payload.push_back(FFXIV_ACTION_POTENCY_SCHEMA);
 

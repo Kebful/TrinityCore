@@ -129,13 +129,16 @@ TEST_CASE("FFXIV action potency: module table cross-check", "[ffxiv]")
         }
     }
 
-    // The published bucket sizes: 235 Action rows + 5 starter damage, 74 + 2 heals, 144, 202 + 2.
+    // The published bucket sizes: 235 Action rows + 5 starter damage minus the seven rows whose
+    // only "Potency:" is a tick or an MP regen (233), 74 + 2 heals, 144 minus the two conditional
+    // DoTs (142), 202 + 2 travel + 9 rows the DoT correction moved (213). A DoT-only action's
+    // damage column is 0: its tick is ffxiv_action_dot's, never a direct hit.
     // The four Warrior status-gated replacement actions (16463, 16465, 36924, 36925) are damage rows,
     // selected by tools/generate-ffxiv-class-spells.py's PROC_JOBS instead of IsPlayerAction.
-    CHECK(damage == 240);
+    CHECK(damage == 233);
     CHECK(heal == 76);
-    CHECK(conditional == 144);
-    CHECK(none == 204);
+    CHECK(conditional == 142);
+    CHECK(none == 213);
 }
 
 TEST_CASE("FFXIV action potency: Cure and Medica job/level trees", "[ffxiv]")

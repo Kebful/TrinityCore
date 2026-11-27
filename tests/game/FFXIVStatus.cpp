@@ -20,6 +20,7 @@
 #include "FFXIV/Status/FFXIVStatus.h"
 
 #include <map>
+#include <set>
 
 using namespace FFXIV::Status;
 
@@ -225,4 +226,31 @@ TEST_CASE("FFXIV status: a comboOnly action status applies only on a correct com
 
     ClearFfxivStatusTables();
     CHECK_FALSE(IsFfxivActionStatusComboOnly(45, 2677));
+}
+
+TEST_CASE("FFXIV status: a trait-gated action status applies only once the trait's passive is known", "[ffxiv]")
+{
+    // Infuriate 52 -> Nascent Chaos 1897 waits for trait 267 (Warrior, level 72); Infuriate's Nascent Chaos row is the
+    // generated [52, 1897, 30000, 0, 267]. Fight or Flight 20 -> 76 waits for none. Spell ids are arbitrary.
+    SetFfxivStatusTables({ { 1897, 81897, 30000, 0, 0, 0 }, FightOrFlight },
+                         { { 52, 1897, 30000, false, 267 }, { 20, 76, 20000 } },
+                         { { 267, 82967 } });
+
+    auto knows = [](std::set<uint32> spells) { return [spells](uint32 spellId) { return spells.count(spellId) != 0; }; };
+
+    CHECK(GetFfxivActionStatusTrait(52, 1897) == 267);
+    CHECK(GetFfxivActionStatusTrait(20, 76) == 0);
+    CHECK(GetFfxivTraitSpell(267) == 82967);
+
+    CHECK_FALSE(IsFfxivActionStatusTraitMet(52, 1897, knows({})));        // below 72: no trait 267
+    CHECK(IsFfxivActionStatusTraitMet(52, 1897, knows({ 82967 })));       // 72+: the passive is learned
+    CHECK(IsFfxivActionStatusTraitMet(20, 76, knows({})));                // no trait on the row
+
+    // A trait ffxiv_trait does not carry can never be met.
+    SetFfxivStatusTables({ { 1897, 81897, 30000, 0, 0, 0 } }, { { 52, 1897, 30000, false, 267 } });
+    CHECK_FALSE(IsFfxivActionStatusTraitMet(52, 1897, [](uint32) { return true; }));
+
+    ClearFfxivStatusTables();
+    CHECK(GetFfxivActionStatusTrait(52, 1897) == 0);
+    CHECK(IsFfxivActionStatusTraitMet(52, 1897, knows({})));
 }

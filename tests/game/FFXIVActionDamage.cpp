@@ -33,7 +33,6 @@
 #include "FFXIV/Combat/FFXIVActionDamage.h"
 #include "FFXIV/Combat/FFXIVActionPotency.h"
 #include "FFXIV/Combat/FFXIVCombatMath.h"
-#include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "FFXIV/Status/FFXIVStatus.h"
 #include "FFXIV/Stats/FFXIVStatEngine.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
@@ -279,85 +278,6 @@ TEST_CASE("FFXIV action spell map: a spell with no mapping keeps the untouched p
     ClearFfxivActionDamageTables();
 }
 
-TEST_CASE("FFXIV action spells: the reconcile selects by ClassJob and level", "[ffxiv]")
-{
-    ClearFfxivActionDamageTables();
-
-    // Four actions for the level/gate cases plus three that must contribute nothing. The spell id
-    // is the action's own +900000 so a failure names the wrong side of the map.
-    std::vector<FfxivActionPotencyRow> rows;
-    auto addPotency = [&rows](uint32 actionId, uint8 classJob, uint8 minLevel)
-    {
-        FfxivActionPotencyRow row;
-        row.actionId = actionId;
-        row.classJob = classJob;
-        row.minLevel = minLevel;
-        row.kind = FFXIV_POTENCY_KIND_DAMAGE;
-        row.damage = 100;
-        rows.push_back(row);
-    };
-
-    addPotency(201, PLD, 2);   // exact job, unlocked at level 2
-    addPotency(202, PLD, 5);   // exact job, unlocked at level 5
-    addPotency(203, 0, 1);     // generic row
-    addPotency(204, 255, 1);   // role row, generic like 0
-    addPotency(205, MNK, 1);   // another job
-    addPotency(206, PLD, 1);   // no spell row at all
-    addPotency(207, PLD, 1);   // spell row with a zero (unknown) spell id
-    addPotency(208, PLD, 90);  // exact job, above the test level
-    addPotency(209, 0, 10);    // generic row above the test level
-
-    std::vector<FfxivActionSpellRow> spellRows;
-    for (uint32 actionId : { 201u, 202u, 203u, 204u, 205u, 208u, 209u })
-        spellRows.push_back(FfxivActionSpellRow{ actionId, actionId + 900000 });
-    spellRows.push_back(FfxivActionSpellRow{ 207, 0 }); // not a spell
-    SetFfxivActionDamageTables(rows, {});
-    SetFfxivActionSpellRows(spellRows);
-
-    auto neverKnown = [](uint32) { return false; };
-    auto knownFrom = [](std::vector<uint32> const& known)
-    {
-        return [known](uint32 spellId)
-        {
-            return std::find(known.begin(), known.end(), spellId) != known.end();
-        };
-    };
-
-    // Level gate: at 4 only the level-1/2 rows qualify; 202 waits for 5, 208/209 for 90/10.
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 4, neverKnown)
-        == std::vector<uint32>{ 900201, 900203, 900204 });
-
-    // The level exactly on the gate is included (minLevel <= level).
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 2, neverKnown)
-        == std::vector<uint32>{ 900201, 900203, 900204 });
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 1, neverKnown)
-        == std::vector<uint32>{ 900203, 900204 });
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 5, neverKnown)
-        == std::vector<uint32>{ 900201, 900202, 900203, 900204 });
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 100, neverKnown)
-        == std::vector<uint32>{ 900201, 900202, 900203, 900204, 900208, 900209 });
-
-    // Another job gets its own row plus the generic 0 and 255 rows, never PLD's exact rows.
-    CHECK(SelectFfxivActionSpellsToLearn(MNK, 4, neverKnown)
-        == std::vector<uint32>{ 900203, 900204, 900205 });
-
-    // Already-known spells are not selected; passing the whole first answer back is idempotent.
-    std::vector<uint32> const first =
-        SelectFfxivActionSpellsToLearn(PLD, 5, neverKnown);
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 5, knownFrom(first)).empty());
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 5, knownFrom({ 900201, 900203 }))
-        == std::vector<uint32>{ 900202, 900204 });
-
-    // Unknown spell ids (207's zero, 206's missing row) and a missing table change nothing.
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 100, neverKnown).size() == 6);
-    SetFfxivActionSpellRows({});
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 100, neverKnown).empty());
-    ClearFfxivActionDamageTables();
-    CHECK(SelectFfxivActionSpellsToLearn(PLD, 100, neverKnown).empty());
-
-    ClearFfxivActionDamageTables();
-}
-
 TEST_CASE("FFXIV action potency: classJob 255 role rows are accepted and matchable", "[ffxiv]")
 {
     ClearFfxivActionDamageTables();
@@ -406,11 +326,6 @@ TEST_CASE("FFXIV action potency: classJob 255 role rows are accepted and matchab
 
     // The selection path sees the role row too, not just the raw lookup.
     CHECK(SelectFfxivActionPotency(16560, WHM, 50, 0, 0, true).potency == 120);
-
-    // And the role row is a learnable action once the spell map names it.
-    SetFfxivActionSpellRows({ FfxivActionSpellRow{ 16560, 80999 } });
-    CHECK(SelectFfxivActionSpellsToLearn(WHM, 50, [](uint32) { return false; })
-        == std::vector<uint32>{ 80999 });
 
     ClearFfxivActionDamageTables();
 }
@@ -569,8 +484,9 @@ TEST_CASE("FFXIV action damage vectors: exact numbers", "[ffxiv]")
 TEST_CASE("FFXIV combo: the Marauder/Warrior chain the sheet states", "[ffxiv]")
 {
     // The rows the data build writes into ffxiv_action_combo (world db, verified by the owner):
-    // Heavy Swing 31 -> Maim 37, Maim 37 -> Storm's Eye 45 and Storm's Path 42. Storm's Eye's Beast
-    // Gauge gain and Surging Tempest are comboOnly, so this chain is what gates both.
+    // Heavy Swing 31 -> Maim 37, Maim 37 -> Storm's Eye 45 and Storm's Path 42. The comboOnly rows
+    // (Storm's Eye's gauge gain and Surging Tempest) hang off this chain; the gauge row itself is
+    // applied by the job livescript, the status row by FFXIV::Status.
     SetFfxivActionDamageTables({}, { { 31, 37 }, { 37, 45 }, { 37, 42 } });
 
     CHECK(IsFfxivComboStarter(31));
@@ -586,7 +502,7 @@ TEST_CASE("FFXIV combo: the Marauder/Warrior chain the sheet states", "[ffxiv]")
     ClearFfxivActionDamageTables();
 }
 
-// --- Warrior chain end to end (combo state -> gauge comboOnly rows -> status row) ---
+// --- Warrior chain end to end (combo state -> status row); the gauge rows are the livescript's ---
 namespace WarriorCombo
 {
 constexpr uint8 WAR = 21;
@@ -602,31 +518,24 @@ struct WarriorFixture
     WarriorFixture()
     {
         FFXIV::Combat::SetFfxivActionDamageTables({}, { { 31, 35 }, { 31, 37 }, { 31, 5818 }, { 37, 42 }, { 37, 45 } });
-        FFXIV::Gauge::SetFfxivJobGaugeTables({ { WarriorCombo::WAR, BEAST, "Beast Gauge", 100 } },
-            { { 37, WarriorCombo::WAR, BEAST, 35, 10, true }, { 42, WarriorCombo::WAR, BEAST, 35, 20, true }, { 45, WarriorCombo::WAR, BEAST, 50, 10, true } });
         FFXIV::Status::SetFfxivStatusTables({ { SURGING_TEMPEST, 81814, 30000, 0, 0, 0 } },
                                      { { STORMS_EYE, SURGING_TEMPEST, 30000, true } });
-        FFXIV::Gauge::ClearFfxivGaugeState();
     }
 
     ~WarriorFixture()
     {
         FFXIV::Combat::ClearFfxivActionDamageTables();
-        FFXIV::Gauge::ClearFfxivJobGaugeTables();
         FFXIV::Status::ClearFfxivStatusTables();
-        FFXIV::Gauge::ClearFfxivGaugeState();
     }
 
     // One cast the way the hooks see it: the damage hook advances the chain (reading the predecessor
-    // the window still holds), then the gauge hook asks whether that step was correct and applies the row.
+    // the window still holds) and reports whether the step was the correct combo step.
     // `category` / `preservesCombo` are the Action sheet's columns 3 / 37 (ffxiv_action_spell).
     bool Cast(uint32 actionId, uint32 nowMs, uint8 category = WEAPONSKILL, bool preservesCombo = false)
     {
         uint32 const last = FFXIV::Combat::GetFfxivLastActionId(Caster, nowMs);
         FFXIV::Combat::AdvanceFfxivComboState(Caster, actionId, last, nowMs, category, preservesCombo);
-        bool const comboCorrect = FFXIV::Combat::WasFfxivCorrectComboStep(Caster, actionId, nowMs);
-        FFXIV::Gauge::ApplyFfxivActionGauge(Caster, WarriorCombo::WAR, 50, actionId, comboCorrect);
-        return comboCorrect;
+        return FFXIV::Combat::WasFfxivCorrectComboStep(Caster, actionId, nowMs);
     }
 };
 }
@@ -636,11 +545,8 @@ TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: Heavy Swing -> Ma
 {
     CHECK_FALSE(Cast(HEAVY_SWING, 1000));
     CHECK(Cast(MAIM, 2500));
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 10);
     CHECK(Cast(STORMS_EYE, 4000));
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 20);
     CHECK(Cast(MAIM, 5500) == false);   // Storm's Eye is not a predecessor of Maim: chain broken
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 20);
 
     // Storm's Eye's status row: the caster gets Surging Tempest for its 30 s.
     CHECK(FFXIV::Status::GetFfxivActionStatusDuration(STORMS_EYE, SURGING_TEMPEST) == 30000);
@@ -684,17 +590,13 @@ TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: a step with no or
 {
     CHECK_FALSE(Cast(STORMS_EYE, 1000));              // no predecessor
     CHECK_FALSE(Cast(MAIM, 2000));                    // Maim straight after a stray step
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 0);
 
     CHECK_FALSE(Cast(HEAVY_SWING, 3000));
     CHECK_FALSE(Cast(STORMS_EYE, 4000));              // skipped Maim
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 0);
 
     CHECK_FALSE(Cast(HEAVY_SWING, 5000));
     CHECK(Cast(MAIM, 6000));
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 10);
     CHECK_FALSE(Cast(STORMS_EYE, 6000 + 13501));      // combo window (12.5 s) expired
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 10);
 }
 
 TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: only a weaponskill without PreservesCombo touches the chain", "[ffxiv]")
@@ -705,12 +607,10 @@ TEST_CASE_METHOD(WarriorCombo::WarriorFixture, "FFXIV warrior: only a weaponskil
     CHECK_FALSE(Cast(INNER_BEAST, 2000, WEAPONSKILL, true));
     CHECK(FFXIV::Combat::GetFfxivLastActionId(Caster, 2000) == HEAVY_SWING);
     CHECK(Cast(MAIM, 3000));
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 10);
 
     // A damaging oGCD (Upheaval, an ability) between steps: the chain survives.
     CHECK_FALSE(Cast(UPHEAVAL, 3500, ABILITY));
     CHECK(Cast(STORMS_EYE, 4000));
-    CHECK(FFXIV::Gauge::GetFfxivGauge(Caster, WarriorCombo::WAR) == 20);
 
     // The window still runs from the last chain step, not from the preserving action.
     CHECK_FALSE(Cast(HEAVY_SWING, 10000));

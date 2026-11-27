@@ -49,8 +49,8 @@
 #include "DisableMgr.h"
 #include "GameEventMgr.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
-#include "FFXIV/Charges/FFXIVActionCharges.h"
-#include "FFXIV/Gauge/FFXIVJobGauge.h"
+#include "FFXIV/Jobs/FFXIVJobSlot.h"
+#include "FFXIV/Mana/FFXIVClassMana.h"
 #include "FFXIV/Status/FFXIVStatus.h"
 #include "GameObjectModel.h"
 #include "GameTime.h"
@@ -1690,15 +1690,20 @@ void World::SetInitialWorldSettings()
     TC_LOG_INFO("server.loading", "Loading FFXIV status tables...");
     FFXIV::Status::LoadFfxivStatusTables();
 
-    // FFXIV job gauges (ffxiv_job_gauge / ffxiv_action_gauge): the deltas the once-per-cast gauge hook
-    // applies. A missing table leaves every job without a gauge.
-    TC_LOG_INFO("server.loading", "Loading FFXIV job gauge tables...");
-    FFXIV::Gauge::LoadFfxivJobGaugeTables();
+    // FFXIV job gauges / action charges (ffxiv_job_gauge, ffxiv_action_gauge,
+    // ffxiv_action_charges): the core holds no gauge value and no charge pool -- the job livescripts
+    // own both and read these tables themselves (livescripts/job-resources/jobgauge.ts,
+    // livescripts/systems/action-charges/ActionCharges.ts).
 
-    // FFXIV action charges (ffxiv_action_charges): the per-action pools the cast gate and the
-    // once-per-cast consume read. A missing table leaves every action on its stock cooldown.
-    TC_LOG_INFO("server.loading", "Loading FFXIV action charge table...");
-    FFXIV::Charges::LoadFfxivActionChargesTable();
+    // FFXIV MP (ffxiv_class_mana): which classes' mana is FFXIV MP and its regen. A missing table leaves
+    // every class on WoW's mana rules.
+    TC_LOG_INFO("server.loading", "Loading FFXIV class mana table...");
+    FFXIV::Mana::LoadFfxivClassManaTable();
+
+    // FFXIV hosted jobs (ffxiv_job_slot): which Soul of <Job> makes a class slot a job of its own.
+    // A missing table leaves every player on their class's ClassJob row.
+    TC_LOG_INFO("server.loading", "Loading FFXIV hosted job table...");
+    FFXIV::Jobs::LoadFfxivJobSlotTable();
 
     TC_LOG_INFO("server.loading", "Loading SpellInfo diminishing infos...");
     sSpellMgr->LoadSpellInfoDiminishing();

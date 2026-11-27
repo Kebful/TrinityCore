@@ -264,15 +264,15 @@ TEST_CASE("FFXIV stats snapshot sub-opcode is a free custom id", "[ffxiv]")
     // 0x51F is the custom channel itself (server CMSG_CUSTOM / client CLIENT_TO_SERVER_OPCODE)
     // and 0x7A00..0x7A51 are allocated feature blocks; 0x7A60 starts the stats block.
     // See work/ffxiv-stats-sheet-20261123/DESIGN.md §1.3.
-    CHECK(FFXIV_STATS_SNAPSHOT_OPCODE == 0x7A60);
+    CHECK(FFXIV_STATS_SNAPSHOT_OPCODE == uint16(FFXIV::Protocol::SubOpcode::STATS_SNAPSHOT));
     CHECK(FFXIV_STATS_SNAPSHOT_OPCODE > 0x7A51);
     CHECK(FFXIV_STATS_SNAPSHOT_OPCODE != 0x51F);
     CHECK(FFXIV_STATS_SNAPSHOT_OPCODE != 0x102);
 
     // GATE 7's second sub-opcode is its own id, one above the snapshot.
-    CHECK(FFXIV_ACTION_POTENCY_OPCODE == 0x7A61);
+    CHECK(FFXIV_ACTION_POTENCY_OPCODE == uint16(FFXIV::Protocol::SubOpcode::ACTION_POTENCY));
     CHECK(FFXIV_ACTION_POTENCY_OPCODE != FFXIV_STATS_SNAPSHOT_OPCODE);
-    CHECK(FFXIV_ACTION_POTENCY_SCHEMA == 1);
+    CHECK(FFXIV_ACTION_POTENCY_SCHEMA == 2);
 }
 
 TEST_CASE("FFXIV tooltip multiplier equals the damage test's non-crit mean value", "[ffxiv]")
@@ -423,41 +423,50 @@ TEST_CASE("FFXIV action potency list is the plain column for one job and level",
     {
         std::vector<FfxivActionPlainPotency> const warrior =
             FFXIV::Combat::CollectFfxivActionPlainPotencies(21, 80);
-        REQUIRE(warrior.size() == 3);
+        REQUIRE(warrior.size() == 4);
         CHECK(warrior[0].actionId == 31);
         CHECK(warrior[0].damage == 150);
-        CHECK(warrior[1].actionId == 7477);
-        CHECK(warrior[1].damage == 200);
-        CHECK(warrior[2].actionId == 70000);
+        CHECK(warrior[1].actionId == 133);
+        CHECK(warrior[1].damage == 0);
+        CHECK(warrior[1].cure == 500);
+        CHECK(warrior[2].actionId == 7477);
+        CHECK(warrior[2].damage == 200);
+        CHECK(warrior[3].actionId == 70000);
 
         // WHM never reads WAR's rows: action 31 falls back to the generic 100.
         std::vector<FfxivActionPlainPotency> const whm =
             FFXIV::Combat::CollectFfxivActionPlainPotencies(WHM, 80);
-        REQUIRE(whm.size() == 3);
+        REQUIRE(whm.size() == 4);
         CHECK(whm[0].damage == 100);
+        CHECK(whm[1].cure == 500);
 
         // Below the job row's minLevel the generic row wins again.
         std::vector<FfxivActionPlainPotency> const lowWarrior =
             FFXIV::Combat::CollectFfxivActionPlainPotencies(21, 49);
-        REQUIRE(lowWarrior.size() == 3);
+        REQUIRE(lowWarrior.size() == 4);
         CHECK(lowWarrior[0].damage == 100);
     }
 
-    SECTION("wire image: count u16, actionId u16 + damage u16 per entry, schema u8 last")
+    SECTION("wire image: count u16, actionId + damage + cure + dot u16 per entry, schema u8 last")
     {
         std::vector<FfxivActionPlainPotency> const warrior =
             FFXIV::Combat::CollectFfxivActionPlainPotencies(21, 80);
         std::vector<uint8> const payload = BuildFfxivActionPotencyPayload(warrior);
 
-        // 70000 is skipped, so the wire carries two entries, not three.
-        REQUIRE(payload.size() == FfxivActionPotencyPayloadBytes(2));
-        CHECK(payload.size() == 3 + 2 * 4);
-        CHECK(ReadU16(payload, 0) == 2);
+        // 70000 is skipped, so the wire carries three entries, not four.
+        REQUIRE(payload.size() == FfxivActionPotencyPayloadBytes(3));
+        CHECK(payload.size() == 3 + 3 * 8);
+        CHECK(ReadU16(payload, 0) == 3);
         CHECK(ReadU16(payload, 2) == 31);
         CHECK(ReadU16(payload, 4) == 150);
-        CHECK(ReadU16(payload, 6) == 7477);
-        CHECK(ReadU16(payload, 8) == 200);
-        CHECK(payload[10] == FFXIV_ACTION_POTENCY_SCHEMA);
+        CHECK(ReadU16(payload, 6) == 0);   // cure
+        CHECK(ReadU16(payload, 8) == 0);   // dot
+        CHECK(ReadU16(payload, 10) == 133);
+        CHECK(ReadU16(payload, 12) == 0);  // damage
+        CHECK(ReadU16(payload, 14) == 500); // cure
+        CHECK(ReadU16(payload, 18) == 7477);
+        CHECK(ReadU16(payload, 20) == 200);
+        CHECK(payload[26] == FFXIV_ACTION_POTENCY_SCHEMA);
     }
 
     SECTION("an empty table sends nothing the client could misread")

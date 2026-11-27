@@ -17,10 +17,8 @@
 
 #include "Player.h"
 #include "FFXIV/CFXIVCreation.h"
-#include "FFXIV/Combat/FFXIVActionDamage.h"
-#include "FFXIV/Charges/FFXIVActionCharges.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
-#include "FFXIV/Stats/FFXIVStatTables.h"
+#include "FFXIV/Mana/FFXIVClassMana.h"
 #include "FFXIV/Stats/FFXIVStatsSnapshot.h"
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
@@ -620,9 +618,6 @@ bool Player::Create(ObjectGuid::LowType guidlow, CharacterCreateInfo* createInfo
     // original spells
     LearnDefaultSkills();
     LearnCustomSpells();
-    // FFXIV action spells the module class and level qualify for: the starting bars hold action
-    // spell ids, so a fresh character must know them before the first cast.
-    LearnMissingFfxivActionSpells();
 
     // original action bar
     for (PlayerCreateInfoActions::const_iterator action_itr = info->action.begin(); action_itr != info->action.end(); ++action_itr)
@@ -1061,11 +1056,8 @@ void Player::Update(uint32 p_time)
         ClassSwitch::IsTransitionPending(this), false))
         return;
 
-    // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): a recharge that completes while the
-    // player does nothing would otherwise only be noticed on the next cast, so the tick refreshes the
-    // client's snapshot. It returns immediately when this player has no recharging pool and nothing
-    // was ever sent.
-    FFXIV::Charges::UpdateFfxivActionCharges(*this);
+    // FFXIV job gauges and action charges: both are the job livescripts' (they tick their own
+    // mirror/recharge from livescripts/job-resources/jobgauge.ts and systems/action-charges).
 
     // undelivered mail
     if (m_nextMailDelivereTime && m_nextMailDelivereTime <= GameTime::GetGameTime())
@@ -2670,9 +2662,6 @@ void Player::GiveLevel(uint8 level)
     // @tswow-begin
     ApplyAutolearnSpells(oldLevel+1);
     // @tswow-end
-
-    // FFXIV: a level-up can unlock further action spells (the reconcile is idempotent).
-    LearnMissingFfxivActionSpells();
 
     sScriptMgr->OnPlayerLevelChanged(this, oldLevel);
 }
@@ -4639,9 +4628,9 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
         SetHealth(uint32(GetMaxHealth()*restore_percent));
         SetPower(POWER_MANA, uint32(GetMaxPower(POWER_MANA)*restore_percent));
         SetPower(POWER_RAGE, 0);
-        // FFXIV: the Beast Gauge is the authority and rage is its display; the reset above would
-        // leave a resurrected module class showing an empty bar until the next gauge change.
-        FFXIV::Gauge::SyncFfxivRage(*this);
+        // FFXIV: the Beast Gauge is the authority and rage is its display (the job livescript writes
+        // it); the reset above would leave a resurrected module class showing an empty bar until the
+        // script's next mirror, so the script's tick re-sends within a second.
         SetPower(POWER_ENERGY, uint32(GetMaxPower(POWER_ENERGY)*restore_percent));
     }
 
@@ -18165,9 +18154,9 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     // between the profile write and the regular character-table save.
     RestoreActiveClassProfileAfterLoad();
 
-    // The profile restore above swaps the spell map, so the FFXIV action-spell reconcile has to
-    // run after it: a character's bars can name action spells the data build never taught.
-    LearnMissingFfxivActionSpells();
+    // spell_autolearn rows added by a later data build reach an existing character here. It runs
+    // after the profile restore above, which swaps the spell map, so the restored class gets them.
+    ApplyAutolearnSpells(0);
 
     TC_LOG_DEBUG("entities.player.loading", "Player::LoadFromDB: The value of player '{}' after load item and aura is: ", m_name);
     outDebugValues();
@@ -23286,11 +23275,8 @@ void Player::SendInitialPacketsAfterAddToMap()
     // gets its first snapshot here -- before the sheet can be drawn. The rebuild hook in
     // PlayerFFXIVStats.cpp keeps it fresh afterwards. Read-only presentation data.
     FFXIV::Stats::SendFfxivStatsSnapshot(*this);
-    // FFXIV job gauge (0x7A62): the client's readout starts from the server value, or "no gauge".
-    FFXIV::Gauge::SendFfxivJobGauge(*this);
-    // FFXIV action charges (0x7A64): the client's SpellCharge map starts from the server's pools, so
-    // a reloaded UI draws the same recharges and an empty pool is greyed from the first frame.
-    FFXIV::Charges::SendFfxivActionCharges(*this);
+    // FFXIV job gauge (0x7A62) and action charges (0x7A64): both are the job livescripts' (sent at
+    // Player.OnLogin and re-sent by their tick), so the core sends nothing here.
 }
 
 void Player::SendUpdateToOutOfRangeGroupMembers()
@@ -23469,38 +23455,6 @@ void Player::LearnCustomSpells()
             AddSpell(tspell, true, true, true, false);
         else                                                // but send in normal spell in game learn case
             LearnSpell(tspell, true);
-    }
-}
-
-void Player::LearnMissingFfxivActionSpells()
-{
-    // Stock WoW classes map to the neutral job id (0) and the FFXIV action tables describe only
-    // FFXIV jobs: a character outside the module is left exactly as it is.
-    uint8 const classJobId = FFXIV::Stats::GetFfxivClassJobId(GetClass());
-    if (classJobId == FFXIV::Stats::FFXIV_NEUTRAL_JOB_ID)
-        return;
-
-    // "Known" is presence in the spell map, not HasSpell: a disabled spell is known and must not
-    // be re-learned (that would re-enable it), and a removed one is not.
-    std::vector<uint32> const spellIds = FFXIV::Combat::SelectFfxivActionSpellsToLearn(
-        classJobId, GetLevel(),
-        [this](uint32 spellId)
-        {
-            auto const itr = m_spells.find(spellId);
-            return itr != m_spells.end() && itr->second.state != PLAYERSPELL_REMOVED;
-        });
-
-    for (uint32 spellId : spellIds)
-    {
-        // A row may name a spell this build does not have (half-landed data): skip it rather than
-        // assert inside AddSpell. The tables themselves are never modified here.
-        if (!sSpellMgr->GetSpellInfo(spellId))
-            continue;
-
-        if (!IsInWorld()) // sent in INITIAL_SPELLS at map add, like LearnCustomSpells
-            AddSpell(spellId, true, true, false, false); // learning=true: new row is persisted
-        else
-            LearnSpell(spellId, false);
     }
 }
 
@@ -24851,10 +24805,22 @@ void Player::ProcessTerrainStatusUpdate(ZLiquidStatus oldLiquidStatus, Optional<
         m_MirrorTimerFlags &= ~(UNDERWATER_INWATER | UNDERWATER_INLAVA | UNDERWATER_INSLIME | UNDERWATER_INDARKWATER);
 }
 
+void Player::AtEnterCombat()
+{
+    Unit::AtEnterCombat();
+    // FFXIV MP: the in-combat regen rate (FFXIV/Mana/FFXIVClassMana.h).
+    if (FFXIV::Mana::HasFfxivMana(*this))
+        UpdatePowerRegen(POWER_MANA);
+}
+
 void Player::AtExitCombat()
 {
     Unit::AtExitCombat();
     UpdatePotionCooldown();
+
+    // FFXIV MP: back to the out-of-combat regen rate.
+    if (FFXIV::Mana::HasFfxivMana(*this))
+        UpdatePowerRegen(POWER_MANA);
 
     // @tswow-begin
     if (HasRunes())

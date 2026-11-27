@@ -553,6 +553,9 @@ class TC_GAME_API Spell
         // Damage and healing in effects need just calculate
         int32 m_damage;           // Damage  in effects count here
         int32 m_healing;          // Healing in effects count here
+        // @ffxiv: the per-target crit the FFXIV effect handlers rolled (FFXIVCombatMath), recorded
+        // here so the hit event can mark it while the engine's own crit chance stays neutral.
+        bool m_ffxivActionCrit = false;
 
         // ******************************************
         // Spell trigger system

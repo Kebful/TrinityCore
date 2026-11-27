@@ -335,6 +335,23 @@ void Spell::EffectSchoolDMG()
 
     if (unitTarget && unitTarget->IsAlive())
     {
+        // @ffxiv-begin: a converted FFXIV action reaches this handler with its potency row and its own
+        // effect value (0 = the table). The number, per-target variance and crit are FFXIVCombatMath's;
+        // adding it to m_damage lets the normal hit path deal it (absorb/threat/log are real).
+        if (Player* ffxivCaster = m_caster->GetTypeId() == TYPEID_PLAYER ? m_caster->ToPlayer() : nullptr)
+        {
+            FFXIV::Combat::FfxivActionEffectResult const ffxivResult =
+                FFXIV::Combat::ComputeFfxivActionEffectDamage(*ffxivCaster, *unitTarget, m_spellInfo,
+                                                              damage > 1 ? damage : 0);
+            if (ffxivResult.handled)
+            {
+                m_damage += int32(ffxivResult.value);
+                m_ffxivActionCrit = ffxivResult.crit;
+                return;
+            }
+        }
+        // @ffxiv-end
+
         bool apply_direct_bonus = true;
         Unit* unitCaster = GetUnitCasterForEffectHandlers();
         switch (m_spellInfo->SpellFamilyName)
@@ -713,19 +730,21 @@ void Spell::EffectDummy()
         return;
 
     /*
-     * FFXIV action resolution -- the slice's ONE hook into the spell damage path.
+     * FFXIV action resolution -- the unconverted action's hook into the spell damage path.
      *
-     * This is EffectDummy, not EffectSchoolDMG, because the module ships every FFXIV Action as a
-     * single DUMMY effect (shared/ffxiv-action-spell.ts applyTargeting): an FFXIV action never
-     * reaches EffectSchoolDMG, and EffectDummy is the only handler that sees one with a target.
-     * The hook identifies an FFXIV action by having a row in ffxiv_action_potency -- never by name,
-     * icon or family -- and it runs before the vanilla DB-script dispatch so an FFXIV action never
-     * also fires a dummy script. With the tables missing or empty it returns false immediately and
-     * this function is exactly as it was before.
+     * A converted action carries a real effect (SCHOOL_DAMAGE / HEAL / APPLY_AURA / ENERGIZE) and
+     * its own handler computes the number (FFXIVCombatMath via FFXIVActionDamage.h). Everything
+     * still on the routing DUMMY reaches this handler: it applies the potency number and, below,
+     * the action's statuses. The hook identifies an FFXIV action by having a row in
+     * ffxiv_action_potency -- never by name, icon or family -- and it runs before the vanilla
+     * DB-script dispatch so an FFXIV action never also fires a dummy script. With the tables
+     * missing or empty it returns false immediately and this function is exactly as it was.
      *
      * Why it applies the number here instead of setting m_damage: the value FFXIVCombatMath returns
      * is already final (its own crit/direct-hit/variance/level stages are inside), so handing it to
-     * the vanilla path would apply the WoW spell-bonus and crit stages a second time.
+     * the vanilla path would apply the WoW spell-bonus and crit stages a second time. The converted
+     * path adds the same final number to m_damage and neutralises those stages once
+     * (FFXIV/Combat/FFXIVSpellStages.h), which is what gives the cast a real absorb/threat/log event.
      */
     bool const ffxivActionHandled = unitTarget && m_caster->GetTypeId() == TYPEID_PLAYER
         && FFXIV::Combat::TryApplyFfxivActionEffect(*m_caster->ToPlayer(), *unitTarget, m_spellInfo);
@@ -1127,6 +1146,20 @@ void Spell::EffectApplyAura()
         aurApp = unitTarget->_CreateAuraApplication(_spellAura, 1 << effectInfo->EffectIndex);
     else
         aurApp->UpdateApplyEffectMask(aurApp->GetEffectsToApply() | 1 << effectInfo->EffectIndex, false);
+
+    // @ffxiv-begin: the magnitude an FFXIV action's own aura carries is our number, computed now
+    // (periodic tick from ffxiv_action_dot, status-% from ffxiv_status_effect), not the DBC literal.
+    if (Player* ffxivCaster = m_caster->GetTypeId() == TYPEID_PLAYER ? m_caster->ToPlayer() : nullptr)
+    {
+        if (AuraEffect* aurEff = _spellAura->GetEffect(effectInfo->EffectIndex))
+        {
+            int32 amount = aurEff->GetAmount();
+            if (FFXIV::Combat::ComputeFfxivActionAuraAmount(*ffxivCaster, *unitTarget, m_spellInfo,
+                    uint32(aurEff->GetAuraType()), damage > 1 ? damage : 0, amount))
+                aurEff->SetAmount(amount);
+        }
+    }
+    // @ffxiv-end
 }
 
 void Spell::EffectUnlearnSpecialization()
@@ -1398,6 +1431,22 @@ void Spell::EffectHeal()
     // Skip if m_originalCaster not available
     if (!unitCaster)
         return;
+
+    // @ffxiv-begin: an FFXIV cure's amount is FFXIVCombatMath's f(HMP) chain; the spell row's value
+    // (0 = the cure column) is the tuning surface and the hit path deals the number.
+    if (Player* ffxivCaster = unitCaster->GetTypeId() == TYPEID_PLAYER ? unitCaster->ToPlayer() : nullptr)
+    {
+        FFXIV::Combat::FfxivActionEffectResult const ffxivResult =
+            FFXIV::Combat::ComputeFfxivActionEffectHeal(*ffxivCaster, *unitTarget, m_spellInfo,
+                                                        damage > 1 ? damage : 0);
+        if (ffxivResult.handled)
+        {
+            m_healing += int32(ffxivResult.value);
+            m_ffxivActionCrit = ffxivResult.crit;
+            return;
+        }
+    }
+    // @ffxiv-end
 
     int32 addhealth = damage;
 
@@ -1776,6 +1825,17 @@ void Spell::EffectEnergize()
 
     if (!unitTarget->IsAlive())
         return;
+
+    // @ffxiv-begin: an FFXIV action's resource grant is its data row (ffxiv_action_effect gauge
+    // delta), applied to the job gauge -- never WoW rage, which is only the gauge's display.
+    if (Player* ffxivCaster = m_caster->GetTypeId() == TYPEID_PLAYER ? m_caster->ToPlayer() : nullptr)
+    {
+        int32 applied = 0;
+        if (FFXIV::Combat::TryApplyFfxivActionEnergize(*ffxivCaster, m_spellInfo, damage > 1 ? damage : 0,
+                                                       applied))
+            return;
+    }
+    // @ffxiv-end
 
     if (effectInfo->MiscValue < 0 || effectInfo->MiscValue >= int8(MAX_POWERS))
         return;
@@ -3193,6 +3253,22 @@ void Spell::EffectWeaponDmg()
                 break;
         }
     }
+
+    // @ffxiv-begin: the FFXIV action's weapon damage is its potency row, not the WoW weapon roll.
+    // Same value, per-target rolls and event path as EffectSchoolDMG.
+    if (Player* ffxivCaster = m_caster->GetTypeId() == TYPEID_PLAYER ? m_caster->ToPlayer() : nullptr)
+    {
+        FFXIV::Combat::FfxivActionEffectResult const ffxivResult =
+            FFXIV::Combat::ComputeFfxivActionEffectDamage(*ffxivCaster, *unitTarget, m_spellInfo,
+                                                          damage > 1 ? damage : 0);
+        if (ffxivResult.handled)
+        {
+            m_damage += int32(ffxivResult.value);
+            m_ffxivActionCrit = ffxivResult.crit;
+            return;
+        }
+    }
+    // @ffxiv-end
 
     // some spell specific modifiers
     float totalDamagePercentMod  = 1.0f;                    // applied to final bonus+weapon damage

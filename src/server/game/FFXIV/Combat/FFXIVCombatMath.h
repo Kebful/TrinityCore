@@ -184,6 +184,16 @@ struct FfxivTraitState
     bool damageTrait = true;
 };
 
+// Guarantees a status grants a hit (Inner Release's "guaranteeing they are critical and direct
+// hits", ffxiv_status_effect kinds force_crit / force_direct_hit). They are inputs, not aura
+// semantics: the aura stays a DUMMY marker and our math forces the two rolls. A guarantee is a
+// forced *outcome*, not a 100 % chance, so it applies at any crit/DH stat.
+struct FfxivCombatGuarantees
+{
+    bool critical = false;
+    bool directHit = false;
+};
+
 // --------------------------------------------------------------------------
 // rolls
 // --------------------------------------------------------------------------
@@ -425,7 +435,8 @@ FfxivDirectDamageResult ComputeFfxivDirectDamage(FfxivDerivedStats const& stats,
                                                  int32 weaponDamage, uint8 targetLevel,
                                                  FfxivPartyComposition party, FfxivTraitState traits,
                                                  FfxivRollSource& rolls,
-                                                 std::span<FfxivPercentFactor const> buffs = {});
+                                                 std::span<FfxivPercentFactor const> buffs = {},
+                                                 FfxivCombatGuarantees guarantees = {});
 
 // Direct heal, published order of B §F16.1 / §F23.6 (f(HMP), +-3 %, no DH).
 // `weaponDamage` is f(WD) in percent, exactly as for direct damage: the published
@@ -446,7 +457,8 @@ FfxivHealResult ComputeFfxivHeal(FfxivDerivedStats const& stats, int32 curePoten
 int64 ComputeFfxivDotTick(FfxivDerivedStats const& stats, int32 potency, int32 weaponDamage,
                           uint8 targetLevel, FfxivPartyComposition party, FfxivTraitState traits,
                           FfxivRollSource& rolls, std::span<FfxivPercentFactor const> buffs = {},
-                          FfxivCombatTrace* trace = nullptr);
+                          FfxivCombatTrace* trace = nullptr,
+                          FfxivCombatGuarantees guarantees = {});
 
 // Same, with the damage type supplied by the caller (the published split is by
 // damage type, not by job).
@@ -454,7 +466,8 @@ int64 ComputeFfxivDotTickOfType(FfxivDerivedStats const& stats, int32 potency, i
                                 FfxivDotDamageType type, uint8 targetLevel, FfxivPartyComposition party,
                                 FfxivTraitState traits, FfxivRollSource& rolls,
                                 std::span<FfxivPercentFactor const> buffs = {},
-                                FfxivCombatTrace* trace = nullptr);
+                                FfxivCombatTrace* trace = nullptr,
+                                FfxivCombatGuarantees guarantees = {});
 
 // Auto-attack: direct damage with the job's auto potency, the auto f(WD) and the
 // trait forced to 1.0 (B §F24.2: "never applied to auto-attacks"). B §F14's

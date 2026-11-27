@@ -29,7 +29,7 @@
 #include "DynamicObject.h"
 #include "FFXIV/Combat/FFXIVActionDamage.h"
 #include "FFXIV/Combat/FFXIVActionShape.h"
-#include "FFXIV/Charges/FFXIVActionCharges.h"
+#include "FFXIV/Combat/FFXIVSpellStages.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
 #include "G3DPosition.hpp"
 #include "GameObjectAI.h"
@@ -2216,20 +2216,12 @@ void Spell::AddUnitTarget(Unit* target, uint32 effectMask, bool checkIfValid /*=
 
     // @ffxiv-begin: an FFXIV action never rolls a WoW avoidance (the damage is FFXIVCombatMath's and the
     // combo/gauge/status hooks live in the hit-target effect handlers, which a miss skips). Immunity,
-    // reflect and evade stay: they are not rolls.
-    switch (targetInfo.MissCondition)
+    // reflect and evade stay: they are not rolls. The predicate and the mapping live in one place
+    // (FFXIV/Combat/FFXIVSpellStages.h); see ENGINE-DEVIATIONS.md.
     {
-        case SPELL_MISS_MISS:
-        case SPELL_MISS_RESIST:
-        case SPELL_MISS_DODGE:
-        case SPELL_MISS_PARRY:
-        case SPELL_MISS_BLOCK:
-        case SPELL_MISS_DEFLECT:
-            if (FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id) != 0)
-                targetInfo.MissCondition = SPELL_MISS_NONE;
-            break;
-        default:
-            break;
+        uint8 miss = uint8(targetInfo.MissCondition);
+        FFXIV::Combat::NeutraliseFfxivAvoidance(m_spellInfo->Id, miss);
+        targetInfo.MissCondition = SpellMissInfo(miss);
     }
     // @ffxiv-end
 
@@ -2530,6 +2522,13 @@ void Spell::TargetInfo::DoDamageAndTriggers(Spell* spell)
     // Get original caster (if exist) and calculate damage/healing from him data
     // Skip if m_originalCaster not available
     Unit* caster = spell->m_originalCaster ? spell->m_originalCaster : spell->m_caster->ToUnit();
+
+    // @ffxiv-begin: the FFXIV effect handler rolled this target's crit; the engine's roll was
+    // neutralised (FFXIV/Combat/FFXIVSpellStages.h). The flag only marks the hit -- the value
+    // already includes the crit multiplier (ENGINE-DEVIATIONS.md).
+    if (FFXIV::Combat::IsFfxivActionSpell(spell->m_spellInfo))
+        IsCrit = spell->m_ffxivActionCrit;
+    // @ffxiv-end
 
     if (caster)
     {
@@ -3883,17 +3882,12 @@ void Spell::_handle_finish_phase()
             unitCaster->SetLastExtraAttackSpell(m_spellInfo->Id);
     }
 
-    // FFXIV job gauge (FFXIV/Gauge/FFXIVJobGauge.h): the slice's ONE hook. Once per successful cast,
-    // after every target went through the FFXIV action hook in EffectDummy, so an area spender pays
-    // once and an action with no potency (Infuriate) still counts. Inert while the gauge tables are
-    // empty or the spell is not a mapped FFXIV action.
+    // FFXIV job gauge / action charges (FFXIV/Gauge/FFXIVJobGauge.h): the slice's ONE hook. Once per
+    // successful cast, after every target went through the FFXIV action hook in EffectDummy, so an
+    // area spender pays once and an action with no potency (Infuriate) still counts. The livescripts
+    // apply their gauge rows, charge pools and procs from the event; the core reads no data here.
     if (Player* player = m_caster->ToPlayer())
         FFXIV::Gauge::OnFfxivActionResolved(*player, m_spellInfo);
-
-    // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): the same once-per-cast point, and
-    // the only place a charge is consumed. Inert for an action with no charge row.
-    if (Player* player = m_caster->ToPlayer())
-        FFXIV::Charges::OnFfxivActionResolved(*player, m_spellInfo);
 
     // Handle procs on finish
     if (!m_originalCaster)
@@ -4953,9 +4947,9 @@ void Spell::TakePower()
     if (!m_powerCost)
         return;
 
-    // @ffxiv-begin: a script-owned FFXIV job's gauge is spent by its script
-    // (TSPlayer::AddFfxivJobGauge), which also rewrites the rage mirror, so the core takes no WoW
-    // rage for it.
+    // @ffxiv-begin: rage is the job gauge's display, not a resource (FFXIV/Gauge/FFXIVJobGauge.h).
+    // The gauge lives in the livescript, which also rewrites the mirror, so the core takes no WoW
+    // rage for an FFXIV module class. A status that makes an action free is an engine spell mod.
     if (m_spellInfo->PowerType == POWER_RAGE && unitCaster->IsPlayer())
         if (FFXIV::Gauge::IsFfxivActionRageCostWaived(*unitCaster->ToPlayer()))
             return;
@@ -5616,35 +5610,8 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* param1 /*= nullptr*/, uint
         castResult = CheckPower();
         if (castResult != SPELL_CAST_OK)
             return castResult;
-
-        // @ffxiv-begin: FFXIV job-gauge cost. A Warrior spender's Spell.dbc rage cost is the same
-        // number as its Beast Gauge cost, but rage is only the gauge's display: the gauge is the
-        // authority, and a spender must not start at 0 even if the two ever disagreed. Still inert
-        // while no ffxiv_action_gauge row names the action (Cost 0 = free), and always true for a
-        // script-owned job: its script refuses from Spell.OnCheckCast (CallScriptCheckCastHandlers).
-        if (Player* player = m_caster->ToPlayer())
-        {
-            uint32 const actionId = FFXIV::Combat::ResolveFfxivActionIdFromSpell(m_spellInfo->Id);
-            if (actionId != 0)
-            {
-                if (!FFXIV::Gauge::CanAffordFfxivActionGauge(*player, actionId))
-                {
-                    TC_LOG_DEBUG("spells", "FFXIV action {}: {} Beast Gauge < cost, cast refused", actionId,
-                                 uint32(FFXIV::Gauge::GetFfxivGauge(*player)));
-                    return SPELL_FAILED_NO_POWER;
-                }
-                // FFXIV action charges (FFXIV/Charges/FFXIVActionCharges.h): the action's own pool is
-                // the timing, because the flat cooldown was cleared in the data. No row ->
-                // HasFfxivChargeAvailable is true, so nothing changes for every other spell. A
-                // status-gated action (Inner Chaos under Nascent Chaos) is gated by its livescript
-                // (OnCheckCast), not here.
-                if (!FFXIV::Charges::HasFfxivChargeAvailable(*player, actionId))
-                {
-                    TC_LOG_DEBUG("spells", "FFXIV action {}: no charge left, cast refused", actionId);
-                    return SPELL_FAILED_NOT_READY;
-                }
-            }
-        }
+        // @ffxiv-begin: the FFXIV job-gauge cost and the action charge pool are the livescripts'
+        // (Spell.OnCheckCast: FAILED_NO_POWER / FAILED_NOT_READY); the core reads neither table.
         // @ffxiv-end
     }
 
@@ -6814,10 +6781,10 @@ SpellCastResult Spell::CheckPower() const
     // Check power amount
     Powers powerType = m_spellInfo->PowerType;
 
-    // @ffxiv-begin: a script-owned job's script is the cost authority (its OnCheckCast refuses what
-    // the gauge cannot pay), so the WoW rage check is not a second opinion here. A status that makes
-    // an action free is an engine spell mod: m_powerCost is already 0 from CalcPowerCost, so the
-    // comparison below passes without a branch.
+    // @ffxiv-begin: rage is the job gauge's display, not a resource (FFXIV/Gauge/FFXIVJobGauge.h).
+    // The livescript's OnCheckCast is the cost authority, so the WoW rage check is not a second
+    // opinion here. A status that makes an action free is an engine spell mod: m_powerCost is
+    // already 0 from CalcPowerCost, so the comparison below passes without a branch.
     if (m_powerCost > 0 && powerType == POWER_RAGE && m_caster->IsPlayer()
         && FFXIV::Gauge::IsFfxivActionRageCostWaived(*m_caster->ToPlayer()))
         return SPELL_CAST_OK;
@@ -7920,6 +7887,10 @@ void Spell::PreprocessSpellLaunch(TargetInfo& targetInfo)
         , TSMutableNumber<float>(&critChance)
     );
     // @tswow-end
+    // @ffxiv-begin: the engine crit roll is off for an FFXIV action; the per-target roll is
+    // FFXIVCombatMath's and is recorded by the effect handler (ENGINE-DEVIATIONS.md).
+    FFXIV::Combat::NeutraliseFfxivCritChance(m_spellInfo->Id, critChance);
+    // @ffxiv-end
     targetInfo.IsCrit = roll_chance_f(critChance);
 }
 
@@ -7938,24 +7909,31 @@ void Spell::DoEffectOnLaunchTarget(TargetInfo& targetInfo, float multiplier, Spe
 
     m_damage = 0;
     m_healing = 0;
+    m_ffxivActionCrit = false;
 
     HandleEffects(unit, nullptr, nullptr, nullptr, spellEffectInfo, SPELL_EFFECT_HANDLE_LAUNCH_TARGET);
 
     if (m_originalCaster && m_damage > 0)
     {
+        // @ffxiv-begin: an FFXIV area action's number is final; the engine's per-target AoE
+        // avoidance/damage scaling is not applied (ENGINE-DEVIATIONS.md, D5/D6).
         if (spellEffectInfo.IsTargetingArea() || spellEffectInfo.IsAreaAuraEffect() || spellEffectInfo.IsEffect(SPELL_EFFECT_PERSISTENT_AREA_AURA))
         {
-            m_damage = unit->CalculateAOEAvoidance(m_damage, m_spellInfo->SchoolMask, m_originalCaster->GetGUID());
-
-            if (m_originalCaster->GetTypeId() == TYPEID_PLAYER)
+            if (!FFXIV::Combat::FfxivActionOwnsCombatStages(m_spellInfo))
             {
-                // cap damage of player AOE
-                uint32 targetAmount = m_UniqueTargetInfo.size();
-                if (targetAmount > 10)
-                    m_damage = m_damage * 10 / targetAmount;
+                m_damage = unit->CalculateAOEAvoidance(m_damage, m_spellInfo->SchoolMask, m_originalCaster->GetGUID());
+
+                if (m_originalCaster->GetTypeId() == TYPEID_PLAYER)
+                {
+                    // cap damage of player AOE
+                    uint32 targetAmount = m_UniqueTargetInfo.size();
+                    if (targetAmount > 10)
+                        m_damage = m_damage * 10 / targetAmount;
+                }
             }
         }
     }
+    // @ffxiv-end
 
     if (m_applyMultiplierMask & (1 << spellEffectInfo.EffectIndex))
     {

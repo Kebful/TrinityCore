@@ -16,7 +16,6 @@
 #include "CustomPacketWrite.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
-#include "FFXIV/Combat/FFXIVActionDamage.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
 #include "GameTime.h"
 #include "Item.h"
@@ -208,18 +207,26 @@ bool IsDeathKnightExcludedStarterSpell(uint32 spellId)
 
 // FFXIV action spells carry their owner's SPELLFAMILY_FFXIV_* value (100..), not the class's
 // ChrClasses.SpellClassSet, and one action serves every ClassJob that uses it (Heavy Swing is
-// SPELLFAMILY_FFXIV_WAR for both Marauder and Warrior). For those spells the FFXIV action tables
-// are the ownership rule: a class owns every action its ClassJob has a row for at any level, the
-// same selection Player::LearnMissingFfxivActionSpells applies (level-gated) at login. Empty for a
-// class outside the module.
+// SPELLFAMILY_FFXIV_WAR for both Marauder and Warrior). For those spells the rows the datascripts
+// write are the ownership rule: a class owns every spell a spell_autolearn row names its class bit
+// for, at any level (a classmask 0 row is universal, not class-owned), and every spell whose
+// SkillLineAbility row names that bit -- a quest-learned action has no autolearn row but keeps its
+// (TRAINER) skill-line row, so a GM-taught one survives a switch. This decides what a profile may
+// keep; it never teaches anything. Empty for a class outside the module.
 std::set<uint32> CollectFfxivClassActionSpells(uint8 classId)
 {
-    uint8 const classJobId = FFXIV::Stats::GetFfxivClassJobId(classId);
-    if (classJobId == FFXIV::Stats::FFXIV_NEUTRAL_JOB_ID)
+    if (FFXIV::Stats::GetFfxivClassJobId(classId) == FFXIV::Stats::FFXIV_NEUTRAL_JOB_ID)
         return {};
-    std::vector<uint32> const spellIds = FFXIV::Combat::SelectFfxivActionSpellsToLearn(
-        classJobId, std::numeric_limits<uint8>::max(), [](uint32) { return false; });
-    return { spellIds.begin(), spellIds.end() };
+    std::set<uint32> spellIds;
+    uint32 const classMask = ClassIdToMask(classId);
+    for (std::vector<SpellAutoLearn> const& level : sObjectMgr->GetSpellAutolearns())
+        for (SpellAutoLearn const& spell : level)
+            if ((spell.classmask & classMask) && sSpellMgr->GetSpellInfo(spell.spell))
+                spellIds.insert(spell.spell);
+    for (SkillLineAbilityEntry const* ability : sSkillLineAbilityStore)
+        if ((ability->ClassMask & classMask) && sSpellMgr->GetSpellInfo(ability->Spell))
+            spellIds.insert(ability->Spell);
+    return spellIds;
 }
 
 }
@@ -1689,6 +1696,7 @@ private:
         uint32 fromLevel, uint32 toLevel, std::set<uint32>* out)
     {
         SpellAutoLearns const& autolearn = sObjectMgr->GetSpellAutolearns();
+        std::set<uint32> const ffxivActions = CollectFfxivClassActionSpells(classId);
         for (uint32 level = fromLevel; level <= toLevel && level < autolearn.size(); ++level)
         {
             for (SpellAutoLearn const& spell : autolearn[level])
@@ -1697,7 +1705,8 @@ private:
                     (spell.racemask && !(spell.racemask & ClassIdToMask(player->GetRace()))))
                     continue;
                 SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.spell);
-                if (!info || (info->SpellFamilyName && info->SpellFamilyName != spellClassSet))
+                if (!info || (info->SpellFamilyName && info->SpellFamilyName != spellClassSet &&
+                    !ffxivActions.count(spell.spell)))
                     continue;
                 out->insert(spell.spell);
             }
@@ -1904,7 +1913,8 @@ private:
                     (spell.racemask && !(spell.racemask & ClassIdToMask(player->GetRace()))))
                     continue;
                 SpellInfo const* info = sSpellMgr->GetSpellInfo(spell.spell);
-                if (!info || (info->SpellFamilyName && info->SpellFamilyName != definition->SpellClassSet))
+                if (!info || (info->SpellFamilyName && info->SpellFamilyName != definition->SpellClassSet &&
+                    !ffxivActions.count(spell.spell)))
                     continue;
                 spellIds.insert(spell.spell);
             }
@@ -1922,10 +1932,12 @@ private:
                 continue;
             spellIds.insert(spellId);
         }
+        // A starting-bar spell of the class's own family. An FFXIV action is taught only by its
+        // spell_autolearn row (gathered above), never because a bar names it: a quest-learned
+        // action has no row and must stay unlearned.
         for (uint32 spellId : sObjectMgr->GetClassCreateActionSpells(classId))
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
-                info && (info->SpellFamilyName == definition->SpellClassSet ||
-                    ffxivActions.count(spellId)))
+                info && info->SpellFamilyName == definition->SpellClassSet)
                 spellIds.insert(spellId);
         for (PlayerCreateInfoAction const& action : createInfo->action)
         {
@@ -3128,6 +3140,9 @@ private:
         }
         else if (!ApplyEquipmentProfile(player, runtimeProfile, error, rollbackPlan))
             return false;
+        // The restored trinkets decide the job on this slot (a Soul of <Job>). Re-derive the power
+        // bar and the snapshot before the stats pass, so a Dark Knight switch shows MP at once.
+        player->UpdateDisplayPower();
         player->UpdateAllStats();
         player->UpdateAllCritPercentages();
         player->SetHealth(std::max<uint32>(1,
@@ -3149,11 +3164,11 @@ private:
         {
             result = ApplyProfileData(
                 player, target, error, detachPet, rollbackPlan, restorePlan);
-            // The target profile's stored spell list is what it was last saved with; the FFXIV
-            // action spells the new ClassJob and level qualify for are reconciled from the tables
-            // here, while per-spell notifications stay suppressed (the switch sends INITIAL_SPELLS).
+            // The target profile's stored spell list is what it was last saved with; spell_autolearn
+            // rows a later data build added for the new class and level are applied here, while
+            // per-spell notifications stay suppressed (the switch sends INITIAL_SPELLS).
             if (result)
-                player->LearnMissingFfxivActionSpells();
+                player->ApplyAutolearnSpells(0);
         }
         catch (...)
         {

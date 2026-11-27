@@ -25,6 +25,7 @@
 #include "Pet.h"
 #include "Player.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
+#include "FFXIV/Mana/FFXIVClassMana.h"
 #include "SharedDefines.h"
 #include "SpellAuras.h"
 #include "SpellAuraEffects.h"
@@ -475,7 +476,10 @@ void Player::UpdateMaxPower(Powers power)
 {
     UnitMods unitMod = UnitMods(UNIT_MOD_POWER_START + AsUnderlyingType(power));
 
-    float bonusPower = (power == POWER_MANA && GetCreatePowerValue(power) > 0) ? GetManaBonusFromIntellect() : 0;
+    // FFXIV: an FFXIV MP class's pool is its base mana (the ParamGrow MP in player_classlevelstats);
+    // Intellect adds nothing (FFXIV/Mana/FFXIVClassMana.h).
+    float bonusPower = (power == POWER_MANA && GetCreatePowerValue(power) > 0 && !FFXIV::Mana::HasFfxivMana(*this))
+        ? GetManaBonusFromIntellect() : 0;
 
     float value = GetFlatModifierValue(unitMod, BASE_VALUE) + GetCreatePowerValue(power);
     value *= GetPctModifierValue(unitMod, BASE_PCT);
@@ -1236,9 +1240,8 @@ void Player::UpdatePowerRegen(Powers power)
         return;
 
     // FFXIV: the client predicts nothing for a module class's rage -- the job gauge is the authority
-    // and the server writes gauge -> rage. The bit is PLAYER_FIELD_BYTES2's ignore-prediction mask
-    // (FFXIV::Gauge::SyncFfxivRage sets it as well); the two regen fields are zeroed so no other
-    // reader sees a rate either.
+    // and its livescript writes gauge -> rage, setting the same PLAYER_FIELD_BYTES2 bit; the two
+    // regen fields are zeroed so no other reader sees a rate either.
     if (power == POWER_RAGE && FFXIV::Gauge::SuppressesWowRage(*this))
     {
         SetFloatValue(UNIT_FIELD_POWER_REGEN_FLAT_MODIFIER + AsUnderlyingType(POWER_RAGE), 0.f);
@@ -1261,6 +1264,22 @@ void Player::UpdatePowerRegen(Powers power)
         SetFloatValue(UNIT_FIELD_POWER_REGEN_FLAT_MODIFIER + AsUnderlyingType(power), power == POWER_ENERGY ? -10.f : 0.f);
         SetFloatValue(UNIT_FIELD_POWER_REGEN_INTERRUPTED_FLAT_MODIFIER + AsUnderlyingType(power), power == POWER_ENERGY ? -10.f : 0.f);
         return;
+    }
+
+    // FFXIV: an FFXIV MP class regenerates its row's rate (FFXIV/Mana/FFXIVClassMana.h) in or out of
+    // combat, plus mana MOD_POWER_REGEN auras. Both fields carry the same value, so the five-second rule
+    // changes nothing and the client's prediction (CGUnit_C::DoPowerRegen) matches Player::Regenerate.
+    // No Spirit/Intellect term, no level < 15 bonus, no Rate.Mana.
+    if (power == POWER_MANA)
+    {
+        if (FFXIV::Mana::FfxivClassManaRow const* row = FFXIV::Mana::GetFfxivManaRow(*this))
+        {
+            float const regen = FFXIV::Mana::FfxivManaRegenPerSecond(*row, IsInCombat())
+                + GetTotalAuraModifierByMiscValue(SPELL_AURA_MOD_POWER_REGEN, POWER_MANA) / 5.0f;
+            SetFloatValue(UNIT_FIELD_POWER_REGEN_FLAT_MODIFIER + AsUnderlyingType(POWER_MANA), regen);
+            SetFloatValue(UNIT_FIELD_POWER_REGEN_INTERRUPTED_FLAT_MODIFIER + AsUnderlyingType(POWER_MANA), regen);
+            return;
+        }
     }
 
     switch (power)

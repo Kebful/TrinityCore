@@ -22,6 +22,7 @@
 #include "Log.h"
 #include "Player.h"
 #include "SpellAuras.h"
+#include "SpellAuraEffects.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Timer.h"
@@ -37,9 +38,15 @@ namespace FFXIV::Status
 namespace
 {
 std::unordered_map<uint32, FfxivStatusRow> Statuses;
+std::unordered_map<uint32, uint32> StatusBySpell;                  // aura spell id -> status id
+std::unordered_map<uint32, std::vector<FfxivStatusEffectRow>> StatusEffects;
+std::unordered_map<uint64, FfxivActionDotRow> ActionDots;         // (action, status) -> tick model
+std::unordered_map<uint32, uint64> ActionDotByAction;              // action -> its (action, status) key
 std::unordered_map<uint64, int32> ActionStatusDurations;
 std::unordered_map<uint32, std::vector<uint32>> ActionStatuses;   // action -> status ids, table order
 std::unordered_set<uint64> ComboOnlyActionStatuses;               // (action, status) granted only by a correct combo
+std::unordered_map<uint64, uint32> ActionStatusTraits;            // (action, status) -> the trait the grant waits for
+std::unordered_map<uint32, uint32> TraitSpells;                   // trait -> its passive spell
 
 uint64 ActionStatusKey(uint32 actionId, uint32 statusId)
 {
@@ -48,7 +55,8 @@ uint64 ActionStatusKey(uint32 actionId, uint32 statusId)
 
 void LoadFfxivActionStatusRows(std::vector<FfxivActionStatusRow>& rows)
 {
-    QueryResult result = WorldDatabase.Query("SELECT actionId, statusId, duration, comboOnly FROM ffxiv_action_status");
+    QueryResult result = WorldDatabase.Query(
+        "SELECT actionId, statusId, duration, comboOnly, traitId FROM ffxiv_action_status");
     if (!result)
     {
         TC_LOG_INFO("server.loading", ">> Loaded 0 FFXIV action status durations. DB table `ffxiv_action_status` "
@@ -64,10 +72,37 @@ void LoadFfxivActionStatusRows(std::vector<FfxivActionStatusRow>& rows)
         row.statusId = fields[1].GetUInt32();
         row.duration = fields[2].GetInt32();
         row.comboOnly = fields[3].GetUInt8() != 0;
+        row.traitId = fields[4].GetUInt16();
         if (row.duration <= 0)
         {
             TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_status` has action {} status {} with duration {}, ignored.",
                          row.actionId, row.statusId, row.duration);
+            continue;
+        }
+        rows.push_back(row);
+    } while (result->NextRow());
+}
+
+void LoadFfxivTraitRows(std::vector<FfxivTraitRow>& rows)
+{
+    QueryResult result = WorldDatabase.Query("SELECT traitId, spellId FROM ffxiv_trait");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 FFXIV traits. DB table `ffxiv_trait` is missing or empty; "
+                                      "an action status that waits for a trait never applies.");
+        return;
+    }
+
+    do
+    {
+        Field* fields = result->Fetch();
+        FfxivTraitRow row;
+        row.traitId = fields[0].GetUInt16();
+        row.spellId = fields[1].GetUInt32();
+        if (!sSpellMgr->GetSpellInfo(row.spellId))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `ffxiv_trait` has trait {} with missing spell {}, ignored.",
+                         row.traitId, row.spellId);
             continue;
         }
         rows.push_back(row);
@@ -125,26 +160,52 @@ private:
 };
 }
 
-void SetFfxivStatusTables(std::vector<FfxivStatusRow> statuses, std::vector<FfxivActionStatusRow> actionStatuses)
+void SetFfxivStatusTables(std::vector<FfxivStatusRow> statuses, std::vector<FfxivActionStatusRow> actionStatuses,
+                          std::vector<FfxivTraitRow> traits, std::vector<FfxivStatusEffectRow> effects,
+                          std::vector<FfxivActionDotRow> dots)
 {
     ClearFfxivStatusTables();
     for (FfxivStatusRow const& row : statuses)
+    {
         Statuses[row.statusId] = row;
+        StatusBySpell[row.spellId] = row.statusId;
+    }
     for (FfxivActionStatusRow const& row : actionStatuses)
     {
         ActionStatusDurations[ActionStatusKey(row.actionId, row.statusId)] = row.duration;
         ActionStatuses[row.actionId].push_back(row.statusId);
         if (row.comboOnly)
             ComboOnlyActionStatuses.insert(ActionStatusKey(row.actionId, row.statusId));
+        if (row.traitId)
+            ActionStatusTraits[ActionStatusKey(row.actionId, row.statusId)] = row.traitId;
+    }
+    for (FfxivTraitRow const& row : traits)
+        TraitSpells[row.traitId] = row.spellId;
+    for (FfxivStatusEffectRow const& row : effects)
+        StatusEffects[row.statusId].push_back(row);
+    for (auto& [statusId, rows] : StatusEffects)
+        std::sort(rows.begin(), rows.end(),
+                  [](FfxivStatusEffectRow const& left, FfxivStatusEffectRow const& right)
+                  { return left.kind < right.kind; });
+    for (FfxivActionDotRow const& row : dots)
+    {
+        ActionDots[ActionStatusKey(row.actionId, row.statusId)] = row;
+        ActionDotByAction.emplace(row.actionId, ActionStatusKey(row.actionId, row.statusId));
     }
 }
 
 void ClearFfxivStatusTables()
 {
     Statuses.clear();
+    StatusBySpell.clear();
+    StatusEffects.clear();
+    ActionDots.clear();
+    ActionDotByAction.clear();
     ActionStatusDurations.clear();
     ActionStatuses.clear();
     ComboOnlyActionStatuses.clear();
+    ActionStatusTraits.clear();
+    TraitSpells.clear();
 }
 
 void LoadFfxivStatusTables()
@@ -198,16 +259,136 @@ void LoadFfxivStatusTables()
 
     std::vector<FfxivActionStatusRow> actionRows;
     LoadFfxivActionStatusRows(actionRows);
+    std::vector<FfxivTraitRow> traitRows;
+    LoadFfxivTraitRows(traitRows);
 
-    TC_LOG_INFO("server.loading", ">> Loaded {} FFXIV statuses and {} action status durations in {} ms",
-                uint32(rows.size()), uint32(actionRows.size()), GetMSTimeDiffToNow(oldMSTime));
-    SetFfxivStatusTables(std::move(rows), std::move(actionRows));
+    // ffxiv_status_effect: the hand-authored magnitudes (ffxiv-effect-values.ts). A status without a
+    // row is a marker; the aura stays the identity DUMMY and a livescript owns its behaviour.
+    std::vector<FfxivStatusEffectRow> effectRows;
+    QueryResult effectResult = WorldDatabase.Query("SELECT statusId, kind, value FROM ffxiv_status_effect");
+    if (!effectResult)
+        TC_LOG_INFO("server.loading", ">> Loaded 0 FFXIV status effects. DB table `ffxiv_status_effect` is "
+                                      "missing or empty; every status is a marker and our damage math reads no buffs.");
+    else
+    {
+        do
+        {
+            Field* fields = effectResult->Fetch();
+            FfxivStatusEffectRow row;
+            row.statusId = fields[0].GetUInt32();
+            row.kind = fields[1].GetUInt8();
+            row.value = fields[2].GetInt16();
+            if (row.statusId == 0 || row.kind > FFXIV_STATUS_EFFECT_FORCE_DIRECT_HIT)
+            {
+                TC_LOG_ERROR("sql.sql", "Table `ffxiv_status_effect` has (%u, kind %u, %d) with an unknown "
+                                        "status or kind, ignored.", row.statusId, uint32(row.kind), row.value);
+                continue;
+            }
+            effectRows.push_back(row);
+        } while (effectResult->NextRow());
+    }
+
+    // ffxiv_action_dot: the tick model the status apply path writes into the carrier aura. periodMs
+    // defaults to the 3 s base clock (INFERRED, no sheet column states it); a row that needs another
+    // cadence overrides it explicitly.
+    std::vector<FfxivActionDotRow> dotRows;
+    QueryResult dotResult = WorldDatabase.Query(
+        "SELECT actionId, statusId, potency, durationMs, comboOnly, traitId FROM ffxiv_action_dot");
+    if (!dotResult)
+        TC_LOG_INFO("server.loading", ">> Loaded 0 FFXIV action DoTs. DB table `ffxiv_action_dot` is missing "
+                                      "or empty; periodic statuses tick the aura's own 0.");
+    else
+    {
+        do
+        {
+            Field* fields = dotResult->Fetch();
+            FfxivActionDotRow row;
+            row.actionId = fields[0].GetUInt32();
+            row.statusId = fields[1].GetUInt32();
+            row.potency = fields[2].GetUInt16();
+            row.durationMs = fields[3].GetUInt32();
+            row.comboOnly = fields[4].GetUInt8() != 0;
+            row.traitId = fields[5].GetUInt16();
+            if (row.actionId == 0 || row.statusId == 0 || row.potency == 0)
+            {
+                TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_dot` has (%u, %u, potency %u), ignored: a DoT "
+                                        "row needs an action, a status and a potency.", row.actionId,
+                             row.statusId, uint32(row.potency));
+                continue;
+            }
+            dotRows.push_back(row);
+        } while (dotResult->NextRow());
+    }
+
+    uint32 traitGates = 0;
+    for (FfxivActionStatusRow const& row : actionRows)
+    {
+        if (!row.traitId)
+            continue;
+        ++traitGates;
+        if (std::none_of(traitRows.begin(), traitRows.end(),
+                         [&row](FfxivTraitRow const& trait) { return trait.traitId == row.traitId; }))
+            TC_LOG_ERROR("sql.sql", "Table `ffxiv_action_status` has action {} status {} waiting for trait {}, which "
+                                    "`ffxiv_trait` does not carry; the status will never apply.",
+                         row.actionId, row.statusId, row.traitId);
+    }
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} FFXIV statuses, {} action status durations ({} trait-gated), {} "
+                                  "traits, {} status effects and {} action DoTs in {} ms", uint32(rows.size()),
+                uint32(actionRows.size()), traitGates, uint32(traitRows.size()), uint32(effectRows.size()),
+                uint32(dotRows.size()), GetMSTimeDiffToNow(oldMSTime));
+    SetFfxivStatusTables(std::move(rows), std::move(actionRows), std::move(traitRows), std::move(effectRows),
+                         std::move(dotRows));
 }
 
 FfxivStatusRow const* GetFfxivStatus(uint32 statusId)
 {
     auto itr = Statuses.find(statusId);
     return itr == Statuses.end() ? nullptr : &itr->second;
+}
+
+std::vector<FfxivStatusEffectRow> const* GetFfxivStatusEffects(uint32 statusId)
+{
+    auto itr = StatusEffects.find(statusId);
+    return itr == StatusEffects.end() ? nullptr : &itr->second;
+}
+
+std::vector<FfxivStatusEffectRow> CollectActiveFfxivStatusEffects(Unit& unit)
+{
+    std::vector<uint32> active;
+    for (auto const& pair : unit.GetAppliedAuras())
+    {
+        AuraApplication const* application = pair.second;
+        Aura const* aura = application ? application->GetBase() : nullptr;
+        if (!aura)
+            continue;
+        auto const itr = StatusBySpell.find(aura->GetId());
+        if (itr != StatusBySpell.end())
+            active.push_back(itr->second);
+    }
+    std::sort(active.begin(), active.end());
+    active.erase(std::unique(active.begin(), active.end()), active.end());
+
+    std::vector<FfxivStatusEffectRow> rows;
+    for (uint32 statusId : active)
+        if (std::vector<FfxivStatusEffectRow> const* effects = GetFfxivStatusEffects(statusId))
+            rows.insert(rows.end(), effects->begin(), effects->end());
+    return rows;
+}
+
+FfxivActionDotRow const* GetFfxivActionDot(uint32 actionId, uint32 statusId)
+{
+    auto itr = ActionDots.find(ActionStatusKey(actionId, statusId));
+    return itr == ActionDots.end() ? nullptr : &itr->second;
+}
+
+FfxivActionDotRow const* GetFfxivActionDotForAction(uint32 actionId)
+{
+    auto const key = ActionDotByAction.find(actionId);
+    if (key == ActionDotByAction.end())
+        return nullptr;
+    auto const itr = ActionDots.find(key->second);
+    return itr == ActionDots.end() ? nullptr : &itr->second;
 }
 
 int32 GetFfxivActionStatusDuration(uint32 actionId, uint32 statusId)
@@ -232,6 +413,27 @@ bool ShouldApplyFfxivActionStatus(uint32 actionId, uint32 statusId, bool comboCo
     return comboCorrect || !IsFfxivActionStatusComboOnly(actionId, statusId);
 }
 
+uint32 GetFfxivActionStatusTrait(uint32 actionId, uint32 statusId)
+{
+    auto itr = ActionStatusTraits.find(ActionStatusKey(actionId, statusId));
+    return itr == ActionStatusTraits.end() ? 0 : itr->second;
+}
+
+uint32 GetFfxivTraitSpell(uint32 traitId)
+{
+    auto itr = TraitSpells.find(traitId);
+    return itr == TraitSpells.end() ? 0 : itr->second;
+}
+
+bool IsFfxivActionStatusTraitMet(uint32 actionId, uint32 statusId, std::function<bool(uint32 spellId)> const& hasSpell)
+{
+    uint32 const traitId = GetFfxivActionStatusTrait(actionId, statusId);
+    if (!traitId)
+        return true;
+    uint32 const spellId = GetFfxivTraitSpell(traitId);
+    return spellId && hasSpell(spellId);
+}
+
 namespace
 {
 // Caster buffs are applied once per cast: an area effect calls EffectDummy once per target, and a
@@ -253,6 +455,56 @@ bool FirstCasterBuffThisCast(uint64 casterGuid, uint32 actionId, uint32 statusId
     last = CasterBuffApplication{actionId, statusId, nowMs};
     return true;
 }
+
+// Write the tick FFXIVCombatMath computes into the aura's periodic effect. The amount is snapshotted
+// once per application from the casting player's current stats (a re-apply overwrites it), and the
+// engine then ticks that number on the aura's own cadence: no second timer, no per-tick recompute.
+// Retail snapshots 500 ms before cast finish (B-FORMULA §F23.13); this slice uses the apply-time
+// snapshot, an INFERRED simplification stated in the report.
+void WriteFfxivActionDotTick(Player& caster, Unit& target, uint32 actionId, uint32 statusId, Aura& aura)
+{
+    FfxivActionDotRow const* dot = GetFfxivActionDot(actionId, statusId);
+    if (!dot || dot->potency == 0)
+        return;
+
+    AuraEffect* periodic = nullptr;
+    for (uint8 index = 0; index < MAX_SPELL_EFFECTS; ++index)
+    {
+        AuraEffect* effect = aura.GetEffect(index);
+        if (effect && effect->GetAuraType() == SPELL_AURA_PERIODIC_DAMAGE)
+        {
+            periodic = effect;
+            break;
+        }
+    }
+    if (!periodic)
+    {
+        TC_LOG_ERROR("sql.sql", "[ffxiv-debug] action {} status {}: ffxiv_action_dot has potency {} but the "
+                                "aura carries no PERIODIC_DAMAGE effect", actionId, statusId, uint32(dot->potency));
+        return;
+    }
+    if (dot->durationMs && aura.GetMaxDuration() != int32(dot->durationMs))
+        TC_LOG_ERROR("sql.sql", "[ffxiv-debug] action {} status {}: aura duration {} != ffxiv_action_dot.durationMs {}",
+                     actionId, statusId, aura.GetMaxDuration(), dot->durationMs);
+
+    auto const& stats = caster.GetFFXIVStats();
+    std::vector<Combat::FfxivPercentFactor> buffs;
+    Combat::FfxivCombatGuarantees guarantees;
+    Combat::CollectFfxivStatusCombatModifiers(caster, target, buffs, guarantees);
+    Combat::FfxivSeededRollSource rolls(uint64(caster.GetGUID().GetRawValue()) * 0x9E3779B97F4A7C15ull
+                                        + uint64(actionId) * 0xBF58476D1CE4E5B9ull
+                                        + uint64(statusId) * 0x94D049BB133111EBull
+                                        + uint64(GameTime::GetGameTimeMS()));
+    uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
+    int32 const weaponDamagePercent = Combat::ComputeFfxivActionWeaponDamagePercent(stats);
+    int64 const tick = Combat::ComputeFfxivDotTick(stats, dot->potency, weaponDamagePercent, targetLevel,
+                                                   Combat::FfxivPartyFromGroup(caster), Combat::FfxivTraitState{},
+                                                   rolls, buffs, nullptr, guarantees);
+    periodic->SetAmount(int32(std::min<int64>(tick, std::numeric_limits<int32>::max())));
+    TC_LOG_ERROR("sql.sql", "[ffxiv-debug] action {} status {}: DoT potency {} every {} ms -> tick {}",
+                 actionId, statusId, uint32(dot->potency), uint32(periodic->GetAmplitude()),
+                 periodic->GetAmount());
+}
 }
 
 int ApplyFfxivActionStatuses(Player& caster, Unit& effectTarget, uint32 actionId)
@@ -272,6 +524,14 @@ int ApplyFfxivActionStatuses(Player& caster, Unit& effectTarget, uint32 actionId
         FfxivStatusRow const* row = GetFfxivStatus(statusId);
         if (!row)
             continue;
+        // A grant that waits for a trait (Infuriate -> Nascent Chaos waits for trait 267) needs the trait's passive.
+        if (!IsFfxivActionStatusTraitMet(actionId, statusId, [&caster](uint32 spellId) { return caster.HasSpell(spellId); }))
+        {
+            uint32 const traitId = GetFfxivActionStatusTrait(actionId, statusId);
+            TC_LOG_ERROR("sql.sql", "[ffxiv-debug] status {} from action {} skipped: trait {} (spell {}) not learned",
+                         statusId, actionId, traitId, GetFfxivTraitSpell(traitId));
+            continue;
+        }
         if (IsFfxivActionStatusComboOnly(actionId, statusId))
         {
             if (!comboCorrect)
@@ -296,9 +556,12 @@ int ApplyFfxivActionStatuses(Player& caster, Unit& effectTarget, uint32 actionId
         bool const ok = ApplyFfxivStatus(destination, statusId, &caster,
                                          GetFfxivActionStatusDuration(actionId, statusId));
         uint32 stacks = 0;
-        if (ok)
-            if (Aura const* aura = destination->GetAura(row->spellId, caster.GetGUID()))
-                stacks = aura->GetStackAmount();
+        if (Aura* aura = ok ? destination->GetAura(row->spellId, caster.GetGUID()) : nullptr)
+        {
+            stacks = aura->GetStackAmount();
+            // The DoT's tick is ours; write it into the periodic effect the engine ticks.
+            WriteFfxivActionDotTick(caster, *destination, actionId, statusId, *aura);
+        }
         TC_LOG_ERROR("sql.sql", "[ffxiv-debug] status {} from action {} -> {} (applied {}, stacks {})",
                      statusId, actionId, destination == &caster ? "caster" : "effect target", ok, stacks);
         if (ok)

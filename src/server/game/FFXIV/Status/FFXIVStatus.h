@@ -19,6 +19,7 @@
 #define TRINITYCORE_FFXIV_STATUS_H
 
 #include "Define.h"
+#include <functional>
 #include <vector>
 
 class Unit;
@@ -38,12 +39,18 @@ class Player;
  *     refreshPolicy  FfxivStatusRefreshPolicy; no sheet states it, the module writes Reset
  *     flags          FfxivStatusFlag, one Status column each
  *
- * `ffxiv_action_status` (actionId, statusId, duration, comboOnly) holds each duration an action's
+ * `ffxiv_action_status` (actionId, statusId, duration, comboOnly, traitId) holds each duration an action's
  * ActionTransient text states: the duration belongs to the action, not the status (Stun is 4 s
  * from Holy and 6 s from Shield Bash). comboOnly is 1 when the action's text grants the status only
  * on a line that starts "Combo Bonus:" (Storm's Eye -> Surging Tempest, Disembowel -> Power Surge):
  * such a status is applied only when the cast was the correct step of its combo chain
  * (Combat::WasFfxivCorrectComboStep, the same test the job gauge's comboOnly rows use).
+ *
+ * traitId (0 = none) is the Trait the grant waits for: Infuriate 52 grants Nascent Chaos 1897 only once the
+ * Warrior has trait 267 (level 72). `ffxiv_trait` (traitId, spellId, ...; release/modules/ffxivhaven/
+ * datascripts/classes/spells/ffxiv-traits.ts) maps each trait to its passive spell, and "has trait N" is
+ * Player::HasSpell(that spell). A row whose trait has no ffxiv_trait row (or whose passive is missing) never
+ * applies: the sheets say the status needs the trait, and no passive can be learned.
  *
  * An empty or missing table changes nothing: every lookup misses and ApplyFfxivStatus returns false
  * without touching the target.
@@ -57,9 +64,16 @@ class Player;
  * Implemented as ApplyFfxivActionStatuses below and called from Spell::EffectDummy (the module ships
  * every Action as one DUMMY effect), before the potency hook: a pure buff such as Inner Release 7389
  * has no potency row, so the damage hook returns early and would never apply it.
- * Not in this slice: ticks (a DoT's potency), the Lock* flags (recorded, not enforced), and the
- * player's click-off packet (CMSG_CANCEL_AURA keeps its WoW rule; RequestRemoveFfxivStatus is the
- * sheet rule for it).
+ * Not in this slice: the Lock* flags (recorded, not enforced), and the player's click-off packet
+ * (CMSG_CANCEL_AURA keeps its WoW rule; RequestRemoveFfxivStatus is the sheet rule for it).
+ *
+ * DoT ticks: a status whose (action, status) has an ffxiv_action_dot row is applied exactly as
+ * above, then the core computes FFXIVCombatMath::ComputeFfxivDotTick from that row (potency, the
+ * caster's apply-time stat snapshot, the party, the active ffxiv_status_effect buffs) and writes the
+ * amount into the aura's SPELL_AURA_PERIODIC_DAMAGE effect. The engine ticks that stored number on
+ * the aura's own period: there is no second timer and no per-tick recompute. A re-application
+ * overwrites the amount, i.e. it re-snapshots; retail's 500 ms pre-cast-finish snapshot
+ * (B-FORMULA-REFERENCE §F23.13) is not modelled (INFERRED simplification).
  */
 
 namespace FFXIV::Status
@@ -87,6 +101,42 @@ enum FfxivStatusFlag : uint32
     FFXIV_STATUS_FLAG_LOCK_CONTROL   = 0x40, // LockControl (col 12)
 };
 
+// The `kind` of an ffxiv_status_effect row: the hand-authored magnitude a status carries while it
+// is up (datascripts/classes/spells/ffxiv-effect-values.ts FfxivStatusEffectKind). Append new
+// kinds in the same order; never renumber a shipped one.
+enum FfxivStatusEffectKind : uint8
+{
+    FFXIV_STATUS_EFFECT_DAMAGE_DONE_PCT   = 0, // MOD_DAMAGE_PERCENT_DONE, our damage buff factor
+    FFXIV_STATUS_EFFECT_DAMAGE_TAKEN_PCT  = 1, // MOD_DAMAGE_PERCENT_TAKEN, our damage buff factor
+    FFXIV_STATUS_EFFECT_MAX_HP_PCT        = 2, // MOD_INCREASE_HEALTH_PERCENT (engine/client)
+    FFXIV_STATUS_EFFECT_MOVE_SPEED_PCT    = 3, // MOD_DECREASE_SPEED (engine/client)
+    FFXIV_STATUS_EFFECT_FORCE_CRIT        = 4, // no aura semantic; our math forces the crit
+    FFXIV_STATUS_EFFECT_FORCE_DIRECT_HIT  = 5, // no aura semantic; our math forces the direct hit
+};
+
+// One ffxiv_status_effect row.
+struct FfxivStatusEffectRow
+{
+    uint32 statusId = 0;
+    uint8 kind = 0;   // FfxivStatusEffectKind
+    int16 value = 0;  // percent (10 == 10 %), or a boolean (1 == forced)
+};
+
+// One ffxiv_action_dot row: the tick the action's carrier status deals. `potency` is the
+// ActionTransient DoT slot and `durationMs` the action's stated duration. The cadence is NOT here:
+// it is the aura effect's own DamagePeriod (the spell chain), so the number has one home.
+// These are the inputs FFXIVCombatMath::ComputeFfxivDotTick consumes at apply time; the row never
+// carries a computed total.
+struct FfxivActionDotRow
+{
+    uint32 actionId = 0;
+    uint32 statusId = 0;
+    uint16 potency = 0;
+    uint32 durationMs = 0;
+    bool comboOnly = false;
+    uint32 traitId = 0;
+};
+
 constexpr int32 FFXIV_STATUS_UNTIL_REMOVED = -1; // the aura container's "no timer"
 
 // One ffxiv_status row.
@@ -109,6 +159,14 @@ struct FfxivActionStatusRow
     uint32 statusId = 0;
     int32 duration = 0;
     bool comboOnly = false; // granted only by a correct combo step ("Combo Bonus: Grants ...")
+    uint32 traitId = 0;     // the Trait the grant waits for, 0 = none
+};
+
+// One ffxiv_trait row (only the columns the core reads).
+struct FfxivTraitRow
+{
+    uint32 traitId = 0;
+    uint32 spellId = 0; // the trait's passive spell
 };
 
 // --- table access ---------------------------------------------------------------------------
@@ -117,11 +175,33 @@ struct FfxivActionStatusRow
 void LoadFfxivStatusTables();
 
 // Replace / clear the tables (the loader and tests use these).
-void SetFfxivStatusTables(std::vector<FfxivStatusRow> statuses, std::vector<FfxivActionStatusRow> actionStatuses);
+void SetFfxivStatusTables(std::vector<FfxivStatusRow> statuses, std::vector<FfxivActionStatusRow> actionStatuses,
+                          std::vector<FfxivTraitRow> traits = {},
+                          std::vector<FfxivStatusEffectRow> effects = {},
+                          std::vector<FfxivActionDotRow> dots = {});
 void ClearFfxivStatusTables();
 
 // The row for a status, or nullptr when the table does not carry it.
 FfxivStatusRow const* GetFfxivStatus(uint32 statusId);
+
+// The hand-authored magnitude rows of a status (ffxiv_status_effect), or nullptr when it has none.
+// A status with no row is a marker: its aura is the identity DUMMY and its behaviour is a script's.
+std::vector<FfxivStatusEffectRow> const* GetFfxivStatusEffects(uint32 statusId);
+
+// Every active ffxiv_status_effect row on `unit`, one per (status, kind). The unit's applied auras
+// are mapped back through ffxiv_status (the aura spell id) and deduplicated by status id, so a
+// refreshed or re-applied aura contributes once. Deterministic order (status id, then kind); empty
+// when the tables are missing or the unit carries no FFXIV status.
+std::vector<FfxivStatusEffectRow> CollectActiveFfxivStatusEffects(Unit& unit);
+
+// The ffxiv_action_dot row for (action, status), or nullptr. The status apply path uses it to write
+// the tick into the aura's periodic effect.
+FfxivActionDotRow const* GetFfxivActionDot(uint32 actionId, uint32 statusId);
+
+// The first ffxiv_action_dot row for an action (one action ships one carrier status today). A spell
+// that applies its periodic aura itself (Bio) has no status application to carry the lookup, so the
+// EffectApplyAura path asks by action id.
+FfxivActionDotRow const* GetFfxivActionDotForAction(uint32 actionId);
 
 // The duration the action's text states for this status, or 0 (the status's default applies).
 int32 GetFfxivActionStatusDuration(uint32 actionId, uint32 statusId);
@@ -136,11 +216,23 @@ bool IsFfxivActionStatusComboOnly(uint32 actionId, uint32 statusId);
 // `comboCorrect` (the cast was the correct step of its chain). Pure; ApplyFfxivActionStatuses asks it.
 bool ShouldApplyFfxivActionStatus(uint32 actionId, uint32 statusId, bool comboCorrect);
 
+// The trait the (action, status) row waits for, or 0 when it waits for none.
+uint32 GetFfxivActionStatusTrait(uint32 actionId, uint32 statusId);
+
+// The passive spell of a trait, or 0 when ffxiv_trait does not carry it.
+uint32 GetFfxivTraitSpell(uint32 traitId);
+
+// The trait rule for one listed status: a row with no trait always applies; a trait row applies only when
+// the trait's passive is known (`hasSpell`, Player::HasSpell in the game), and never when the trait has no
+// passive. Pure; ApplyFfxivActionStatuses asks it.
+bool IsFfxivActionStatusTraitMet(uint32 actionId, uint32 statusId, std::function<bool(uint32 spellId)> const& hasSpell);
+
 // Apply every status the action lists (a comboOnly one only after a correct combo step: the damage hook of the same
 // EffectDummy has already advanced the chain), from `caster`, using the action's stated duration. `effectTarget` is the unit the
 // action's effect resolved on (the caster for a self effect, the enemy/ally for a targeted one): a debuff goes there, a
 // buff goes there only when it is friendly, else to the caster. A caster buff is applied once per cast (an area effect
-// calls its dummy effect once per target), so a stacking buff does not gain a stack per target.
+// calls its dummy effect once per target), so a stacking buff does not gain a stack per target. A row whose
+// trait the caster has not learned is skipped (IsFfxivActionStatusTraitMet).
 // Returns the number of statuses the container accepted. The gate is the table: no row, no apply.
 int ApplyFfxivActionStatuses(Player& caster, Unit& effectTarget, uint32 actionId);
 

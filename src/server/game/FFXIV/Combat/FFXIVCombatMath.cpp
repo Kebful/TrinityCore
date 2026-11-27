@@ -326,7 +326,8 @@ FfxivDirectDamageResult ComputeFfxivDirectDamage(FfxivDerivedStats const& stats,
                                                  int32 weaponDamage, uint8 targetLevel,
                                                  FfxivPartyComposition party, FfxivTraitState traits,
                                                  FfxivRollSource& rolls,
-                                                 std::span<FfxivPercentFactor const> buffs)
+                                                 std::span<FfxivPercentFactor const> buffs,
+                                                 FfxivCombatGuarantees guarantees)
 {
     FfxivDirectDamageResult result;
     FfxivAttackTerms const terms = BuildAttackTerms(stats, weaponDamage, party, traits);
@@ -355,13 +356,13 @@ FfxivDirectDamageResult ComputeFfxivDirectDamage(FfxivDerivedStats const& stats,
     result.dhChanceBp = stats.rate.dhBp;
     uint32 const critRoll = rolls.Roll100();
     result.trace.Add(FfxivCombatStageId::CriticalRoll, critRoll);
-    result.crit = int64(critRoll) * 100 < result.critChanceBp;
+    result.crit = guarantees.critical || int64(critRoll) * 100 < result.critChanceBp;
     int64 const critPermille = result.crit ? stats.rate.critDamageBp / 10 : 1000;
     result.trace.Add(FfxivCombatStageId::CriticalMultiplierPermille, critPermille);
 
     uint32 const dhRoll = rolls.Roll100();
     result.trace.Add(FfxivCombatStageId::DirectHitRoll, dhRoll);
-    result.directHit = int64(dhRoll) * 100 < result.dhChanceBp;
+    result.directHit = guarantees.directHit || int64(dhRoll) * 100 < result.dhChanceBp;
     int64 const dhPercent = result.directHit ? FFXIV_DIRECT_HIT_MULTIPLIER_PERCENT : 100;
     result.trace.Add(FfxivCombatStageId::DirectHitMultiplierPercent, dhPercent);
 
@@ -463,7 +464,8 @@ namespace
 int64 ComputeFfxivDotTickInternal(FfxivDerivedStats const& stats, int32 potency, int32 weaponDamage,
                                   FfxivDotDamageType type, uint8 targetLevel, FfxivPartyComposition party,
                                   FfxivTraitState traits, FfxivRollSource& rolls,
-                                  std::span<FfxivPercentFactor const> buffs, FfxivCombatTrace& trace)
+                                  std::span<FfxivPercentFactor const> buffs, FfxivCombatTrace& trace,
+                                  FfxivCombatGuarantees guarantees)
 {
     FfxivAttackTerms const terms = BuildAttackTerms(stats, weaponDamage, party, traits);
     // f(SPD) is a per-tick term; its exact position is what B §F23.7 marks
@@ -510,13 +512,13 @@ int64 ComputeFfxivDotTickInternal(FfxivDerivedStats const& stats, int32 potency,
 
     uint32 const critRoll = rolls.Roll100();
     trace.Add(FfxivCombatStageId::CriticalRoll, critRoll);
-    bool const crit = int64(critRoll) * 100 < stats.rate.critBp;
+    bool const crit = guarantees.critical || int64(critRoll) * 100 < stats.rate.critBp;
     int64 const critPermille = crit ? stats.rate.critDamageBp / 10 : 1000;
     trace.Add(FfxivCombatStageId::CriticalMultiplierPermille, critPermille);
 
     uint32 const dhRoll = rolls.Roll100();
     trace.Add(FfxivCombatStageId::DirectHitRoll, dhRoll);
-    bool const directHit = int64(dhRoll) * 100 < stats.rate.dhBp;
+    bool const directHit = guarantees.directHit || int64(dhRoll) * 100 < stats.rate.dhBp;
     int64 const dhPercent = directHit ? FFXIV_DIRECT_HIT_MULTIPLIER_PERCENT : 100;
     trace.Add(FfxivCombatStageId::DirectHitMultiplierPercent, dhPercent);
 
@@ -535,21 +537,23 @@ int64 ComputeFfxivDotTickInternal(FfxivDerivedStats const& stats, int32 potency,
 
 int64 ComputeFfxivDotTick(FfxivDerivedStats const& stats, int32 potency, int32 weaponDamage, uint8 targetLevel,
                           FfxivPartyComposition party, FfxivTraitState traits, FfxivRollSource& rolls,
-                          std::span<FfxivPercentFactor const> buffs, FfxivCombatTrace* trace)
+                          std::span<FfxivPercentFactor const> buffs, FfxivCombatTrace* trace,
+                          FfxivCombatGuarantees guarantees)
 {
     FfxivCombatTrace ignored;
     return ComputeFfxivDotTickInternal(stats, potency, weaponDamage, GetFfxivDotType(stats.jobId), targetLevel,
-                                       party, traits, rolls, buffs, trace ? *trace : ignored);
+                                       party, traits, rolls, buffs, trace ? *trace : ignored, guarantees);
 }
 
 int64 ComputeFfxivDotTickOfType(FfxivDerivedStats const& stats, int32 potency, int32 weaponDamage,
                                 FfxivDotDamageType type, uint8 targetLevel, FfxivPartyComposition party,
                                 FfxivTraitState traits, FfxivRollSource& rolls,
-                                std::span<FfxivPercentFactor const> buffs, FfxivCombatTrace* trace)
+                                std::span<FfxivPercentFactor const> buffs, FfxivCombatTrace* trace,
+                                FfxivCombatGuarantees guarantees)
 {
     FfxivCombatTrace ignored;
     return ComputeFfxivDotTickInternal(stats, potency, weaponDamage, type, targetLevel, party, traits, rolls,
-                                       buffs, trace ? *trace : ignored);
+                                       buffs, trace ? *trace : ignored, guarantees);
 }
 
 // --------------------------------------------------------------------------

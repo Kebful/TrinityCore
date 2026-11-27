@@ -176,12 +176,12 @@
     { 3595, 0xFFFF, 0xFFFF, 2 },  // Aspected Benefic
     { 3596, 150, 0xFFFF, 1 },  // Malefic
     { 3598, 160, 0xFFFF, 1 },  // Malefic II
-    { 3599, 50, 0xFFFF, 1 },  // Combust
+    { 3599, 0xFFFF, 0xFFFF, 0 },  // Combust
     { 3600, 0xFFFF, 0xFFFF, 2 },  // Helios
     { 3601, 0xFFFF, 0xFFFF, 2 },  // Aspected Helios
     { 3603, 0xFFFF, 0xFFFF, 0 },  // Ascend
     { 3606, 0xFFFF, 0xFFFF, 0 },  // Lightspeed
-    { 3608, 60, 0xFFFF, 1 },  // Combust II
+    { 3608, 0xFFFF, 0xFFFF, 0 },  // Combust II
     { 3610, 0xFFFF, 0xFFFF, 2 },  // Benefic II
     { 3612, 0xFFFF, 0xFFFF, 0 },  // Synastry
     { 3613, 0xFFFF, 100, 2 },  // Collective Unconscious
@@ -235,7 +235,7 @@
     { 7413, 0xFFFF, 0xFFFF, 3 },  // Heated Clean Shot
     { 7414, 0xFFFF, 0xFFFF, 0 },  // Barrel Stabilizer
     { 7415, 0xFFFF, 0xFFFF, 3 },  // Rook Overdrive
-    { 7418, 120, 0xFFFF, 1 },  // Flamethrower
+    { 7418, 0xFFFF, 0xFFFF, 0 },  // Flamethrower
     { 7419, 0xFFFF, 0xFFFF, 0 },  // Between the Lines
     { 7420, 80, 0xFFFF, 1 },  // Thunder IV
     { 7421, 0xFFFF, 0xFFFF, 0 },  // Triplecast
@@ -311,7 +311,7 @@
     { 7559, 0xFFFF, 0xFFFF, 0 },  // Surecast
     { 7560, 0xFFFF, 0xFFFF, 0 },  // Addle
     { 7561, 0xFFFF, 0xFFFF, 0 },  // Swiftcast
-    { 7562, 55, 0xFFFF, 1 },  // Lucid Dreaming
+    { 7562, 0xFFFF, 0xFFFF, 0 },  // Lucid Dreaming
     { 7568, 0xFFFF, 0xFFFF, 0 },  // Esuna
     { 7571, 0xFFFF, 0xFFFF, 0 },  // Rescue
     { 7863, 0xFFFF, 0xFFFF, 0 },  // Leg Sweep
@@ -419,7 +419,7 @@
     { 16537, 0xFFFF, 80, 2 },  // Whispering Dawn
     { 16538, 0xFFFF, 0xFFFF, 0 },  // Fey Illumination
     { 16539, 0xFFFF, 0xFFFF, 3 },  // Art of War
-    { 16540, 0xFFFF, 0xFFFF, 3 },  // Biolysis
+    { 16540, 0xFFFF, 0xFFFF, 0 },  // Biolysis
     { 16541, 255, 0xFFFF, 1 },  // Broil III
     { 16542, 0xFFFF, 0xFFFF, 0 },  // Recitation
     { 16543, 0xFFFF, 320, 2 },  // Fey Blessing
@@ -427,7 +427,7 @@
     { 16546, 0xFFFF, 250, 2 },  // Consolation
     { 16552, 0xFFFF, 0xFFFF, 0 },  // Divination
     { 16553, 0xFFFF, 200, 2 },  // Celestial Opposition
-    { 16554, 0xFFFF, 0xFFFF, 3 },  // Combust III
+    { 16554, 0xFFFF, 0xFFFF, 0 },  // Combust III
     { 16555, 230, 0xFFFF, 1 },  // Malefic IV
     { 16556, 0xFFFF, 200, 2 },  // Celestial Intersection
     { 16557, 0xFFFF, 200, 2 },  // Horoscope
@@ -436,8 +436,8 @@
     { 16889, 0xFFFF, 0xFFFF, 0 },  // Tactician
     { 17209, 0xFFFF, 0xFFFF, 0 },  // Hypercharge
     { 17215, 0xFFFF, 0xFFFF, 0 },  // Summon Eos
-    { 17864, 20, 0xFFFF, 1 },  // Bio
-    { 17865, 40, 0xFFFF, 1 },  // Bio II
+    { 17864, 0xFFFF, 0xFFFF, 0 },  // Bio
+    { 17865, 0xFFFF, 0xFFFF, 0 },  // Bio II
     { 17869, 150, 0xFFFF, 1 },  // Ruin
     { 17870, 0xFFFF, 0xFFFF, 3 },  // Ruin II
     { 24283, 0xFFFF, 0xFFFF, 3 },  // Dosis
@@ -656,7 +656,7 @@
     { 37009, 640, 0xFFFF, 1 },  // Glare IV
     { 37010, 0xFFFF, 250, 2 },  // Medica III
     { 37011, 0xFFFF, 200, 2 },  // Divine Caress
-    { 37012, 140, 0xFFFF, 1 },  // Baneful Impaction
+    { 37012, 0xFFFF, 0xFFFF, 0 },  // Baneful Impaction
     { 37013, 0xFFFF, 200, 2 },  // Concitation
     { 37014, 0xFFFF, 100, 2 },  // Seraphism
     { 37017, 0xFFFF, 0xFFFF, 0 },  // Astral Draw

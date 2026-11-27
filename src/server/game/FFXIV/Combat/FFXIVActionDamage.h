@@ -20,7 +20,6 @@
 
 #include "FFXIV/Combat/FFXIVCombatMath.h"
 #include "ObjectGuid.h"
-#include <functional>
 #include <vector>
 
 /*
@@ -34,7 +33,7 @@
  * ----
  * Three world tables, all owned by the data slice (FFXIVActionPotency's sibling):
  *
- *   ffxiv_action_potency(actionId, classJob, minLevel, kind, damage, cure, combo, flank, front, rear)
+ *   ffxiv_action_potency(actionId, classJob, minLevel, kind, damage, cure, dot, combo, flank, front, rear)
  *   ffxiv_action_combo(actionId, nextActionId)
  *   ffxiv_action_spell(actionId, spellId, category, preservesCombo)
  *
@@ -85,7 +84,9 @@ class SpellInfo;
 namespace FFXIV::Combat
 {
 // One ffxiv_action_potency row. `kind` is FfxivActionPotencyKind; 0 is accepted for a row that
-// only states a value.
+// only states a value. `dot` is the action's damage-over-time potency from the same description
+// (the generator's ffxiv_action_dot carries the same number plus the cadence): a pure DoT row has
+// `damage == 0` and `dot > 0`, so the direct-damage hook does not hit with it.
 struct FfxivActionPotencyRow
 {
     uint32 actionId = 0;
@@ -94,6 +95,7 @@ struct FfxivActionPotencyRow
     uint8 kind = 0;       // FfxivActionPotencyKind
     uint16 damage = 0;
     uint16 cure = 0;
+    uint16 dot = 0;       // damage-over-time tick potency (0 when the action states none)
     uint16 combo = 0;     // potency when the previous action forms a correct combo
     uint16 flank = 0;     // potency when the attacker is on the target's flank
     uint16 front = 0;     // potency when the attacker is in front of the target
@@ -191,6 +193,16 @@ void ClearFfxivActionDamageTables();
 bool HasFfxivActionPotencyRows();
 bool HasFfxivActionSpellRows();
 
+// True when the retail Action has at least one ffxiv_action_potency row (any job, any level). This
+// is the data test a spell's membership in the action model is made of: it is what
+// FFXIVSpellStages uses to decide whether the engine's own stages own the spell or not.
+bool HasFfxivActionPotencyRowForAction(uint32 actionId);
+
+// The lowest minLevel any ffxiv_action_potency row for the action starts at. This is the action's
+// base band: the spell chain's own literal is that band's number, and a winning row with a higher
+// minLevel is a per-level band the table owns (Heavy Swing 150 base, 200 at 84, 240 at 94).
+uint8 FfxivActionPotencyBaseLevel(uint32 actionId);
+
 // The retail Action id the module created `spellId` for, or 0 when this spell is not a mapped
 // FFXIV action (including spellId 0). The potency and combo tables are keyed by the returned id;
 // 0 means the hook must leave the cast on its existing path.
@@ -211,14 +223,16 @@ FfxivPartyComposition FfxivPartyFromGroup(::Player& player);
 // --- the plain damage column, for the tooltip (GATE 7) ---------------------------------------
 //
 // One entry per action id that has a usable row for (classJobId, level), holding the row's *plain*
-// damage column only. Combo/flank/front/rear are contextual and are not part of the tooltip, so
-// they are not sent. A cure-only row has damage 0 and is omitted. Sorted by action id, no
-// duplicates. Empty when the potency table is empty -- the same condition that keeps every cast on
-// its existing damage path.
+// damage column, its cure column and its DoT tick potency. Combo/flank/front/rear are contextual and
+// are not part of the tooltip, so they are not sent. An entry with all three 0 is omitted. Sorted by
+// action id, no duplicates. Empty when the potency table is empty -- the same condition that keeps
+// every cast on its existing damage path.
 struct FfxivActionPlainPotency
 {
     uint32 actionId = 0;
     uint16 damage = 0;
+    uint16 cure = 0;
+    uint16 dot = 0;
 };
 
 std::vector<FfxivActionPlainPotency> CollectFfxivActionPlainPotencies(uint8 classJobId, uint8 level);
@@ -252,20 +266,6 @@ uint32 NextFfxivComboActionId(uint32 actionId);
 // The spell the module created for `actionId` (ffxiv_action_spell), or 0 when there is no row.
 // The reverse of ResolveFfxivActionIdFromSpell; both sides of the map are unique.
 uint32 ResolveFfxivSpellFromActionId(uint32 actionId);
-
-// --- action knowledge -----------------------------------------------------------------------
-//
-// The reconcile selection (Player::LearnMissingFfxivActionSpells): the player knows the action
-// spells their ClassJob and level qualify for, whether or not a data build wrote autolearn rows.
-//
-// The spells to learn for (classJobId, level): for each action with a selected potency row for
-// that job and level (exact classJob, or generic 0/255) and a mapped, nonzero spell id, the spell
-// id, unless `isKnown` returns true. Sorted and unique. Empty when the potency or spell table is
-// empty, which is the shipping state until the data slice lands -- a missing table changes
-// nothing. A row whose minLevel is above the level is not selected, and a potency row with no
-// spell row contributes nothing.
-std::vector<uint32> SelectFfxivActionSpellsToLearn(uint8 classJobId, uint8 level,
-    std::function<bool(uint32)> const& isKnown);
 
 // The last action `caster` cast that can still continue a chain: recorded inside the combo window.
 // 0 means the chain is broken, expired, or not active. The in-combat gate is the caller's, because
@@ -304,22 +304,97 @@ FfxivPotencySelection SelectFfxivActionPotency(uint32 actionId, uint8 classJobId
                                                uint32 lastActionId, int32 targetAngleDegrees,
                                                bool hostileTarget);
 
-// The published damage pipeline for a resolved selection. `weaponDamagePercent` is f(WD) (see
-// ComputeFfxivWeaponDamagePercent), not the raw weapon damage.
+// The published damage pipeline for a resolved selection. `weaponDamage` is f(WD) (see
+// ComputeFfxivWeaponDamagePercent), not the raw weapon damage. `buffs` are the caster's active
+// ffxiv_status_effect damage_done_pct rows and the target's damage_taken_pct rows, and
+// `guarantees` the caster's force_crit / force_direct_hit rows: the live hook builds both from the
+// auras, the same rows the client shows.
 FfxivDirectDamageResult ComputeFfxivActionDamage(FfxivDerivedStats const& stats,
                                                  FfxivPotencySelection const& selection,
                                                  int32 weaponDamagePercent, uint8 targetLevel,
-                                                 FfxivPartyComposition party, FfxivRollSource& rolls);
+                                                 FfxivPartyComposition party, FfxivRollSource& rolls,
+                                                 std::span<FfxivPercentFactor const> buffs = {},
+                                                 FfxivCombatGuarantees guarantees = {});
 
 // The published heal pipeline for a cure selection (same inputs; no direct-hit term inside).
 FfxivHealResult ComputeFfxivActionHeal(FfxivDerivedStats const& stats,
                                        FfxivPotencySelection const& selection,
                                        int32 weaponDamagePercent, uint8 targetLevel,
-                                       FfxivPartyComposition party, FfxivRollSource& rolls);
+                                       FfxivPartyComposition party, FfxivRollSource& rolls,
+                                       std::span<FfxivPercentFactor const> buffs = {});
+
+// The active ffxiv_status_effect rows as the pipeline's inputs: damage_done_pct on `caster` and
+// damage_taken_pct on `target` become buff factors; force_crit / force_direct_hit become guarantees.
+// The status apply path uses the same function for a DoT tick, so an aura and our math read one row.
+void CollectFfxivStatusCombatModifiers(::Unit& caster, ::Unit& target,
+                                       std::vector<FfxivPercentFactor>& buffs,
+                                       FfxivCombatGuarantees& guarantees);
+
+// --- the effect-driven cast path (the one-time spine) ---------------------------------------
+//
+// A converted FFXIV action carries a real WoW effect (SCHOOL_DAMAGE / WEAPON_DAMAGE / HEAL /
+// APPLY_AURA / ENERGIZE) instead of the routing DUMMY. The effect handler asks these functions for
+// the number; the spell's own effect row is the tuning surface and the table is the default:
+//
+//     explicit value (effectInfo.BasePoints, written from shared/ffxiv-hand-authored.ts)
+//         || ffxiv_action_potency / ffxiv_action_dot (per job and level)
+//
+// `handled` says the spell is an FFXIV action at all (the same data test FFXIVSpellStages uses), so
+// an unconverted spell never enters this path. `crit` is the per-target FFXIV roll and is what the
+// caller records for the hit event; the engine's own crit chance is neutral (FFXIVSpellStages).
+struct FfxivActionEffectResult
+{
+    bool handled = false;
+    int64 value = 0;
+    bool crit = false;
+};
+
+// The action id behind the cast, or 0 when the spell is not a mapped FFXIV action. The effect path
+// uses it for the table lookups; the dummy hook uses ResolveFfxivActionIdFromSpell directly.
+uint32 FfxivActionIdForSpell(SpellInfo const* spellInfo);
+
+// Direct damage for one target of one cast. The combo/positional selection is the same one the
+// DUMMY hook uses (last action, target angle); the roll seed includes the target guid, so each
+// target draws its own variance and crit.
+FfxivActionEffectResult ComputeFfxivActionEffectDamage(::Player& caster, ::Unit& target,
+                                                       ::SpellInfo const* spellInfo,
+                                                       int32 explicitPotency);
+
+// Direct heal for one target. `explicitCure` is the effect row's BasePoints (0 = the cure column).
+FfxivActionEffectResult ComputeFfxivActionEffectHeal(::Player& caster, ::Unit& target,
+                                                     ::SpellInfo const* spellInfo, int32 explicitCure);
+
+// One tick of a periodic aura the action applies itself (Bio). `explicitPotency` is the aura
+// effect's BasePoints (0 = the ffxiv_action_dot row). The returned value is the tick FFXIVCombatMath
+// computes now, from the caster's apply-time snapshot; the aura stores it and the engine ticks it on
+// the effect's own period (the chain's DamagePeriod), not a table column.
+int64 ComputeFfxivActionEffectDotTick(::Player& caster, ::Unit& target, ::SpellInfo const* spellInfo,
+                                      int32 explicitPotency);
+
+// The action's one-shot resource grant (ffxiv_action_effect kind gauge delta). For an action with no
+// grant row this returns false and the caller keeps the vanilla power path. For a grant it applies
+// the value to the caster's FFXIV job gauge and returns true; the spell never energizes WoW rage
+// (that is the gauge's display, see FFXIV/Gauge/FFXIVJobGauge.h).
+bool TryApplyFfxivActionEnergize(::Player& caster, ::SpellInfo const* spellInfo,
+                                 int32 explicitAmount, int32& appliedAmount);
+
+// The magnitude an aura the action applies itself must carry. Two sources, in order:
+//   * a periodic damage aura (Bio): the tick FFXIVCombatMath computes now, from ffxiv_action_dot
+//     (or the aura effect's own value when the spell row tunes one);
+//   * a status-shaped aura (damage-%, max HP, move speed): the action's ffxiv_status_effect row.
+// Returns false for an aura this rule does not own; `amount` is then untouched.
+bool ComputeFfxivActionAuraAmount(::Player& caster, ::Unit& target, ::SpellInfo const* spellInfo,
+                                  uint32 auraType, int32 explicitValue, int32& amount);
+
+// One action effect row's value, 0 when the table does not carry it.
+int32 GetFfxivActionEffectValue(uint32 actionId, uint8 kind);
+
+// ffxiv_action_effect kind 0: the "Increases <gauge> by N" grant its ActionTransient text states.
+constexpr uint8 FFXIV_ACTION_EFFECT_GAUGE_DELTA = 0;
 
 // --- the live hook --------------------------------------------------------------------------
 //
-// Called from Spell::EffectDummy, the only effect handler the module's FFXIV action spells reach
+// Called from Spell::EffectDummy, the only effect handler an unconverted FFXIV action spell reaches
 // (every one of them ships a single DUMMY effect). Returns true when the cast was handled here and
 // the vanilla DUMMY handling must be skipped. False means "not an FFXIV action cast", which is every
 // cast while the tables are empty.
