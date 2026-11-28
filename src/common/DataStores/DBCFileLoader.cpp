@@ -83,7 +83,17 @@ bool DBCFileLoader::Load(char const* filename, char const* fmt)
 
     EndianConvert(stringSize);
 
-    if (fieldCount != strlen(fmt) || !fieldCount)
+    // The widened (64-bit class mask) formats are the only ones this file may reject: every stock
+    // WDBC keeps its own padding rules, and some (PowerDisplay's "nixxxx", 15-byte records) do not
+    // sum to whole 4-byte fields. Enforcing the width check on them made the worldserver refuse to
+    // start ("has 0 field(s) (expected 6)").
+    bool const widened = strchr(fmt, FT_UINT64) != nullptr;
+    if (widened && (fieldCount != strlen(fmt) || !fieldCount))
+    {
+        fclose(f);
+        return false;
+    }
+    if (!fieldCount)
     {
         fclose(f);
         return false;
@@ -102,7 +112,7 @@ bool DBCFileLoader::Load(char const* filename, char const* fmt)
 
     uint32 const lastFieldSize = fmt[fieldCount - 1] == FT_BYTE || fmt[fieldCount - 1] == FT_NA_BYTE
         ? sizeof(uint8) : sizeof(uint32);
-    if (fieldsOffset[fieldCount - 1] + lastFieldSize != recordSize)
+    if (widened && fieldsOffset[fieldCount - 1] + lastFieldSize != recordSize)
     {
         fclose(f);
         return false;
