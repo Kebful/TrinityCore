@@ -41,6 +41,7 @@
 #include "Log.h"
 #include "Player.h"
 #include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "Unit.h"
 #include "FFXIV/Combat/FFXIVSpellStages.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
@@ -158,9 +159,14 @@ FfxivPotencySelection SelectFromRow(FfxivActionPotencyRow const& row, bool combo
         if (row.damage > 0)
             return MakeSelection(FfxivPotencySource::Plain, row.damage);
     }
-    else if (row.damage > 0)
+    else if (row.damage > 0 || row.combo > 0 || row.flank > 0 || row.front > 0 || row.rear > 0)
     {
-        return MakeSelection(FfxivPotencySource::Plain, row.damage);
+        // A friendly effect target (the caster's own buff, an ally) never takes the row's damage: a
+        // self-cast whose text states an attack names a later hit on someone else ("delivers an attack
+        // with a potency of 55 every time you suffer physical damage", Vengeance 44 / Damnation 36923),
+        // which a livescript deals at that moment. The cure column stays the damage row's rule: it is
+        // the action's own only when the row states no damage-side potency at all.
+        return MakeSelection(FfxivPotencySource::None, 0);
     }
 
     // A heal-only row (Cure, Medica, Physick): the cure column is the action's own potency.
@@ -750,8 +756,13 @@ namespace
 // percent factors, and force_crit / force_direct_hit become guarantees. These are the same rows the
 // status aura carries for the client, so the engine/UI and our math read one number. A row with no
 // aura semantic (a marker) contributes nothing.
+//
+// A status's guarantee is a weaponskill's: every guarantee the shipped statuses state names
+// weaponskills ("each stack guaranteeing weaponskill attacks are critical and direct hits", Berserk 86;
+// Fell Cleave / Decimate under Inner Release 1177). An ability, a DoT tick or a script's potency (a
+// retaliation) under the same status takes the percentages only.
 void CollectFfxivCombatModifiers(::Unit& caster, ::Unit& target, std::vector<FfxivPercentFactor>& buffs,
-                                 FfxivCombatGuarantees& guarantees)
+                                 FfxivCombatGuarantees& guarantees, bool weaponskill)
 {
     for (Status::FfxivStatusEffectRow const& effect : Status::CollectActiveFfxivStatusEffects(caster))
     {
@@ -762,10 +773,10 @@ void CollectFfxivCombatModifiers(::Unit& caster, ::Unit& target, std::vector<Ffx
                     buffs.push_back(FfxivPercentFactor{ 100 + effect.value, 100 });
                 break;
             case Status::FFXIV_STATUS_EFFECT_FORCE_CRIT:
-                guarantees.critical = guarantees.critical || effect.value != 0;
+                guarantees.critical = guarantees.critical || (weaponskill && effect.value != 0);
                 break;
             case Status::FFXIV_STATUS_EFFECT_FORCE_DIRECT_HIT:
-                guarantees.directHit = guarantees.directHit || effect.value != 0;
+                guarantees.directHit = guarantees.directHit || (weaponskill && effect.value != 0);
                 break;
             default:
                 break; // max HP / move speed / damage taken are the engine's or the target's
@@ -782,9 +793,9 @@ void CollectFfxivCombatModifiers(::Unit& caster, ::Unit& target, std::vector<Ffx
 } // namespace
 
 void CollectFfxivStatusCombatModifiers(::Unit& caster, ::Unit& target, std::vector<FfxivPercentFactor>& buffs,
-                                        FfxivCombatGuarantees& guarantees)
+                                        FfxivCombatGuarantees& guarantees, bool weaponskill)
 {
-    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees, weaponskill);
 }
 
 // --------------------------------------------------------------------------
@@ -803,6 +814,102 @@ int32 GetFfxivActionEffectValue(uint32 actionId, uint8 kind)
         return 0;
     auto const value = action->second.find(kind);
     return value == action->second.end() ? 0 : value->second;
+}
+
+// --------------------------------------------------------------------------
+// script-owned potencies
+// --------------------------------------------------------------------------
+
+namespace
+{
+// The potency a script call runs: its own literal, else the spell's action row at the caster's job
+// and level (the converted effects' "explicit value || table" rule).
+int32 ScriptPotency(Player& caster, uint32 spellId, int32 explicitPotency, bool cure)
+{
+    if (explicitPotency > 0)
+        return explicitPotency;
+    uint32 const actionId = ResolveFfxivActionIdFromSpell(spellId);
+    if (actionId == 0)
+        return 0;
+    FfxivDerivedStats const& stats = caster.GetFFXIVStats();
+    FfxivActionPotencyRow const* const row = FindFfxivActionPotencyRow(actionId, stats.jobId, stats.level);
+    if (!row)
+        return 0;
+    return int32(cure ? row->cure : row->damage);
+}
+} // namespace
+
+int64 ComputeFfxivScriptPotencyHeal(::Player& caster, ::Unit& target, uint32 spellId, int32 curePotency,
+                                    bool* crit)
+{
+    if (crit)
+        *crit = false;
+    if (!target.IsAlive())
+        return 0;
+    int32 const potency = ScriptPotency(caster, spellId, curePotency, true);
+    if (potency <= 0)
+        return 0;
+
+    FfxivDerivedStats const& stats = caster.GetFFXIVStats();
+    uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
+    FfxivSeededRollSource rolls(FfxivActionRollSeed(caster.GetGUID().GetRawValue(), spellId,
+                                                    target.GetGUID().GetRawValue(), GameTime::GetGameTimeMS()));
+    // A heal takes no damage modifier (see ComputeFfxivActionEffectHeal).
+    FfxivHealResult const result = ComputeFfxivHeal(stats, potency, ComputeFfxivActionWeaponDamagePercent(stats),
+                                                    targetLevel, FfxivPartyFromGroup(caster), FfxivTraitState{},
+                                                    rolls);
+    if (crit)
+        *crit = result.crit;
+    return result.value > 0 ? result.value : 0;
+}
+
+int64 DealFfxivScriptPotencyHeal(::Player& caster, ::Unit& target, uint32 spellId, int32 curePotency)
+{
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo)
+        return 0;
+    bool crit = false;
+    int64 const value = ComputeFfxivScriptPotencyHeal(caster, target, spellId, curePotency, &crit);
+    if (value <= 0)
+        return 0;
+    HealInfo healInfo(&caster, &target, uint32(std::min<int64>(value, std::numeric_limits<uint32>::max())),
+                      spellInfo, spellInfo->GetSchoolMask());
+    caster.HealBySpell(healInfo, crit);
+    // What the target actually recovered: a share of it ("100% of that recovered by Nascent Flash",
+    // Nascent Glint 1858) must not include the overheal.
+    return healInfo.GetEffectiveHeal();
+}
+
+int64 DealFfxivScriptPotencyDamage(::Player& caster, ::Unit& target, uint32 spellId, int32 potency)
+{
+    SpellInfo const* const spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || !target.IsAlive() || &target == &caster || caster.IsFriendlyTo(&target))
+        return 0;
+    int32 const resolved = ScriptPotency(caster, spellId, potency, false);
+    if (resolved <= 0)
+        return 0;
+
+    FfxivDerivedStats const& stats = caster.GetFFXIVStats();
+    uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
+    std::vector<FfxivPercentFactor> buffs;
+    FfxivCombatGuarantees guarantees;
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees, false); // a script hit is no weaponskill
+    FfxivSeededRollSource rolls(FfxivActionRollSeed(caster.GetGUID().GetRawValue(), spellId,
+                                                    target.GetGUID().GetRawValue(), GameTime::GetGameTimeMS()));
+    FfxivDirectDamageResult const result = ComputeFfxivDirectDamage(
+        stats, resolved, ComputeFfxivActionWeaponDamagePercent(stats), targetLevel, FfxivPartyFromGroup(caster),
+        FfxivTraitState{}, rolls, buffs, guarantees);
+    if (result.value <= 0)
+        return 0;
+
+    // Applied exactly like the action hook's own hit: the number is final, so no WoW armor, resist or
+    // spell-bonus stage runs on it.
+    SpellNonMeleeDamage damageInfo(&caster, &target, spellInfo->Id, spellInfo->GetSchoolMask());
+    damageInfo.damage = uint32(std::min<int64>(result.value, std::numeric_limits<uint32>::max()));
+    damageInfo.HitInfo = result.crit ? SPELL_HIT_TYPE_CRIT : 0;
+    caster.SendSpellNonMeleeDamageLog(&damageInfo);
+    caster.DealSpellDamage(&damageInfo, true);
+    return damageInfo.damage;
 }
 
 namespace
@@ -902,7 +1009,9 @@ FfxivActionEffectResult ComputeFfxivActionEffectDamage(::Player& caster, ::Unit&
     uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
     std::vector<FfxivPercentFactor> buffs;
     FfxivCombatGuarantees guarantees;
-    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+    FfxivActionSpellRow const* const castRow = FindFfxivActionSpellRow(spellInfo->Id);
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees,
+                                castRow && castRow->category == FFXIV_ACTION_CATEGORY_WEAPONSKILL);
 
     // Per target: the seed carries the target guid, so two targets of one area cast draw different
     // variance and crit (the property the old cast-wide hook lacked).
@@ -960,14 +1069,14 @@ FfxivActionEffectResult ComputeFfxivActionEffectHeal(::Player& caster, ::Unit& t
 
     int32 const weaponDamagePercent = ComputeFfxivActionWeaponDamagePercent(stats);
     uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
-    std::vector<FfxivPercentFactor> buffs;
-    FfxivCombatGuarantees guarantees;
-    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
     FfxivSeededRollSource rolls(FfxivActionRollSeed(caster.GetGUID().GetRawValue(), actionId,
                                                     target.GetGUID().GetRawValue(), nowMs));
 
+    // No modifier list: the ffxiv_status_effect rows are damage percentages (dealt by the caster,
+    // taken by the target) and never scale a heal -- the DUMMY hook's cure branch passes none either,
+    // so a cure on a tank under Vengeance (damage taken -30%) is not cut by 30%.
     FfxivHealResult const result = ComputeFfxivActionHeal(
-        stats, selection, weaponDamagePercent, targetLevel, FfxivPartyFromGroup(caster), rolls, buffs);
+        stats, selection, weaponDamagePercent, targetLevel, FfxivPartyFromGroup(caster), rolls);
     out.value = result.value;
     out.crit = result.crit;
     return out;
@@ -992,7 +1101,7 @@ int64 ComputeFfxivActionEffectDotTick(::Player& caster, ::Unit& target, ::SpellI
     uint8 const targetLevel = uint8(std::min<uint32>(target.GetLevel(), 255));
     std::vector<FfxivPercentFactor> buffs;
     FfxivCombatGuarantees guarantees;
-    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees, false); // a tick is no weaponskill
     FfxivSeededRollSource rolls(FfxivActionRollSeed(caster.GetGUID().GetRawValue(), actionId,
                                                     target.GetGUID().GetRawValue(), nowMs));
     return ComputeFfxivDotTick(stats, potency, ComputeFfxivActionWeaponDamagePercent(stats), targetLevel,
@@ -1155,7 +1264,8 @@ bool TryApplyFfxivActionEffect(::Player& caster, ::Unit& target, ::SpellInfo con
     // and our math read the same number. Force-crit/DH rows are guarantees, not percentages.
     std::vector<FfxivPercentFactor> buffs;
     FfxivCombatGuarantees guarantees;
-    CollectFfxivCombatModifiers(caster, target, buffs, guarantees);
+    CollectFfxivCombatModifiers(caster, target, buffs, guarantees,
+                                spellRow->category == FFXIV_ACTION_CATEGORY_WEAPONSKILL);
 
     bool applied = false;
     if (selection.IsDamage())

@@ -83,6 +83,12 @@ bool DBCFileLoader::Load(char const* filename, char const* fmt)
 
     EndianConvert(stringSize);
 
+    if (fieldCount != strlen(fmt) || !fieldCount)
+    {
+        fclose(f);
+        return false;
+    }
+
     fieldsOffset = new uint32[fieldCount];
     fieldsOffset[0] = 0;
     for (uint32 i = 1; i < fieldCount; ++i)
@@ -92,6 +98,14 @@ bool DBCFileLoader::Load(char const* filename, char const* fmt)
             fieldsOffset[i] += sizeof(uint8);
         else                                                // 4 byte fields (int32/float/strings)
             fieldsOffset[i] += sizeof(uint32);
+    }
+
+    uint32 const lastFieldSize = fmt[fieldCount - 1] == FT_BYTE || fmt[fieldCount - 1] == FT_NA_BYTE
+        ? sizeof(uint8) : sizeof(uint32);
+    if (fieldsOffset[fieldCount - 1] + lastFieldSize != recordSize)
+    {
+        fclose(f);
+        return false;
     }
 
     data = new unsigned char[recordSize * recordCount + stringSize];
@@ -129,6 +143,9 @@ uint32 DBCFileLoader::GetFormatRecordSize(char const* format, int32* index_pos)
     {
         switch (format[x])
         {
+            case FT_UINT64:
+                recordsize += sizeof(uint64);
+                break;
             case FT_FLOAT:
                 recordsize += sizeof(float);
                 break;
@@ -224,6 +241,15 @@ char* DBCFileLoader::AutoProduceData(char const* format, uint32& records, char**
         {
             switch (format[x])
             {
+                case FT_UINT64:
+                {
+                    ASSERT(format[x + 1] == FT_NA);
+                    auto const record = getRecord(y);
+                    uint64 const value = uint64(record.getUInt(x)) | (uint64(record.getUInt(x + 1)) << 32);
+                    memcpy(&dataTable[offset], &value, sizeof(value));
+                    offset += sizeof(value);
+                    break;
+                }
                 case FT_FLOAT:
                     *((float*)(&dataTable[offset])) = getRecord(y).getFloat(x);
                     offset += sizeof(float);
@@ -274,6 +300,9 @@ char* DBCFileLoader::AutoProduceStrings(char const* format, char* dataTable)
         {
             switch (format[x])
             {
+                case FT_UINT64:
+                    offset += sizeof(uint64);
+                    break;
                 case FT_FLOAT:
                     offset += sizeof(float);
                     break;

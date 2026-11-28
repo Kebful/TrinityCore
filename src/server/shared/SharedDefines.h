@@ -146,8 +146,13 @@ enum Classes
 
 // max+1 for player class
 // @tswow-begin
-#define MAX_CLASSES       32
-#define CLASSMASK_ALL_PLAYABLE 4294967295
+#define MAX_CLASSES       64
+#define CLASSMASK_ALL_PLAYABLE UINT64_MAX
+
+constexpr uint64 ClassMaskForId(uint32 classId)
+{
+    return classId >= 1 && classId <= MAX_CLASSES ? uint64(1) << (classId - 1) : 0;
+}
 // @tswow-end
 
 #define MAX_TALENT_TREES 3

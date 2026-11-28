@@ -1700,11 +1700,6 @@ void World::SetInitialWorldSettings()
     TC_LOG_INFO("server.loading", "Loading FFXIV class mana table...");
     FFXIV::Mana::LoadFfxivClassManaTable();
 
-    // FFXIV hosted jobs (ffxiv_job_slot): which Soul of <Job> makes a class slot a job of its own.
-    // A missing table leaves every player on their class's ClassJob row.
-    TC_LOG_INFO("server.loading", "Loading FFXIV hosted job table...");
-    FFXIV::Jobs::LoadFfxivJobSlotTable();
-
     TC_LOG_INFO("server.loading", "Loading SpellInfo diminishing infos...");
     sSpellMgr->LoadSpellInfoDiminishing();
 
@@ -1815,6 +1810,7 @@ void World::SetInitialWorldSettings()
 
     TC_LOG_INFO("server.loading", "Loading Items...");                         // must be after LoadRandomEnchantmentsTable and LoadPageTexts
     sObjectMgr->LoadItemTemplates();
+    FFXIV::Jobs::LoadFfxivJobSlotTable();
 
     // @tswow-begin
     TC_LOG_INFO("server.loading", "Loading Custom Items...");

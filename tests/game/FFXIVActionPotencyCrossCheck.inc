@@ -144,7 +144,7 @@
     { 3547, 0xFFFF, 0xFFFF, 3 },  // the Forbidden Chakra
     { 3549, 0xFFFF, 0xFFFF, 3 },  // Fell Cleave
     { 3550, 180, 0xFFFF, 1 },  // Decimate
-    { 3551, 0xFFFF, 400, 2 },  // Raw Intuition
+    { 3551, 0xFFFF, 0xFFFF, 0 },  // Raw Intuition
     { 3552, 0xFFFF, 1200, 2 },  // Equilibrium
     { 3554, 0xFFFF, 0xFFFF, 3 },  // Fang and Claw
     { 3555, 0xFFFF, 0xFFFF, 3 },  // Geirskogul
@@ -208,7 +208,7 @@
     { 7385, 0xFFFF, 0xFFFF, 0 },  // Passage of Arms
     { 7386, 150, 0xFFFF, 1 },  // Onslaught
     { 7387, 0xFFFF, 0xFFFF, 3 },  // Upheaval
-    { 7388, 0xFFFF, 100, 2 },  // Shake It Off
+    { 7388, 0xFFFF, 300, 2 },  // Shake It Off
     { 7389, 0xFFFF, 0xFFFF, 0 },  // Inner Release
     { 7390, 0xFFFF, 0xFFFF, 0 },  // Delirium
     { 7391, 0xFFFF, 0xFFFF, 3 },  // Quietus
@@ -368,7 +368,7 @@
     { 16461, 150, 0xFFFF, 1 },  // Intervene
     { 16462, 100, 0xFFFF, 1 },  // Mythril Tempest
     { 16463, 200, 0xFFFF, 1 },  // Chaotic Cyclone
-    { 16464, 0xFFFF, 400, 2 },  // Nascent Flash
+    { 16464, 0xFFFF, 0xFFFF, 0 },  // Nascent Flash
     { 16465, 700, 0xFFFF, 1 },  // Inner Chaos
     { 16466, 100, 0xFFFF, 1 },  // Flood of Darkness
     { 16467, 300, 0xFFFF, 1 },  // Edge of Darkness
@@ -497,7 +497,7 @@
     { 24405, 0xFFFF, 0xFFFF, 0 },  // Arcane Circle
     { 25746, 0xFFFF, 250, 2 },  // Holy Sheltron
     { 25747, 450, 0xFFFF, 1 },  // Expiacion
-    { 25751, 0xFFFF, 400, 2 },  // Bloodwhetting
+    { 25751, 0xFFFF, 0xFFFF, 0 },  // Bloodwhetting
     { 25752, 150, 0xFFFF, 1 },  // Orogeny
     { 25753, 720, 0xFFFF, 1 },  // Primal Rend
     { 25754, 0xFFFF, 0xFFFF, 0 },  // Oblation
@@ -603,7 +603,7 @@
     { 35922, 0xFFFF, 0xFFFF, 0 },  // Twinblood
     { 36920, 0xFFFF, 0xFFFF, 0 },  // Guardian
     { 36921, 580, 0xFFFF, 1 },  // Imperator
-    { 36923, 55, 300, 1 },  // Damnation
+    { 36923, 55, 0xFFFF, 1 },  // Damnation
     { 36924, 700, 0xFFFF, 1 },  // Primal Wrath
     { 36925, 800, 0xFFFF, 1 },  // Primal Ruination
     { 36926, 0xFFFF, 0xFFFF, 0 },  // Shadowstride

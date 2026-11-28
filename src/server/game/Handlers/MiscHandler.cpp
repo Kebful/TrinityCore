@@ -311,7 +311,8 @@ void WorldSession::HandleWhoOpcode(WorldPacket& recvData)
 
     uint32 matchCount = 0;
 
-    uint32 levelMin, levelMax, racemask, classmask, zonesCount, strCount;
+    uint32 levelMin, levelMax, racemask, zonesCount, strCount;
+    uint64 classmask;
     uint32 zoneids[10];                                     // 10 is client limit
     std::string packetPlayerName, packetGuildName;
 
@@ -402,7 +403,7 @@ void WorldSession::HandleWhoOpcode(WorldPacket& recvData)
 
         // check if class matches classmask
         uint8 class_ = target.GetClass();
-        if (!(classmask & (1 << class_)))
+        if (!(classmask & ClassMaskForId(class_)))
             continue;
 
         // check if race matches racemask

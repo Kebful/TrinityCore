@@ -565,7 +565,7 @@ void LoadDBCStores(const std::string& dataPath)
 
             // store class talent tab pages
             for (uint32 cls = 1; cls <= MAX_CLASSES; ++cls)
-                if (talentTabInfo->ClassMask & (1u << (cls - 1)))
+                if (talentTabInfo->ClassMask & ClassMaskForId(cls))
                     sTalentTabPages[cls][talentTabInfo->OrderIndex] = talentTabInfo->ID;
         }
     }
@@ -968,7 +968,7 @@ SkillRaceClassInfoEntry const* GetSkillRaceClassInfo(uint32 skill, uint8 race, u
     {
         if (itr->second->RaceMask && !(itr->second->RaceMask & (1u << (race - 1))))
             continue;
-        if (itr->second->ClassMask && !(itr->second->ClassMask & (1u << (class_ - 1))))
+        if (itr->second->ClassMask && !(itr->second->ClassMask & ClassMaskForId(class_)))
             continue;
 
         return itr->second;

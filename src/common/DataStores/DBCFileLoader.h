@@ -27,6 +27,7 @@ enum DbcFieldFormat
     FT_NA='x',                                              //not used or unknown, 4 byte size
     FT_NA_BYTE='X',                                         //not used or unknown, byte
     FT_STRING='s',                                          //char*
+    FT_UINT64='q',                                          // uint64 across two WDBC words (qx)
     FT_FLOAT='f',                                           //float
     FT_INT='i',                                             //uint32
     FT_BYTE='b',                                            //uint8

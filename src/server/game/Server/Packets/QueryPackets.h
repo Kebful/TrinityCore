@@ -160,7 +160,7 @@ namespace WorldPackets
             int32 BuyPrice = 0;
             uint32 SellPrice = 0;
             uint32 InventoryType = 0;
-            uint32 AllowableClass = 0;
+            uint64 AllowableClass = 0;
             uint32 AllowableRace = 0;
             uint32 ItemLevel = 0;
             uint32 RequiredLevel = 0;

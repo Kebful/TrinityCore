@@ -19092,8 +19092,17 @@ void Player::_LoadSpells(PreparedQueryResult result)
     if (result)
     {
         do
-            AddSpell((*result)[0].GetUInt32(), (*result)[1].GetBool(), false, false, (*result)[2].GetBool(), true);
-        while (result->NextRow());
+        {
+            uint32 const spellId = (*result)[0].GetUInt32();
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            // Characters may still have spells saved from the old shared job masks.
+            // Spell-line coverage admits Rogue's own actions on both Rogue and Ninja.
+            if (info && info->SpellFamilyName >= SPELLFAMILY_FFXIV_GLA &&
+                info->SpellFamilyName <= SPELLFAMILY_FFXIV_HEALER_SHARED &&
+                !IsSpellFitByClassAndRace(spellId))
+                continue;
+            AddSpell(spellId, (*result)[1].GetBool(), false, false, (*result)[2].GetBool(), true);
+        } while (result->NextRow());
     }
 }
 
@@ -23593,7 +23602,7 @@ void Player::LearnQuestRewardedSpells()
 void Player::LearnSkillRewardedSpells(uint32 skillId, uint32 skillValue)
 {
     uint32 raceMask  = GetRaceMask();
-    uint32 classMask = GetClassMask();
+    uint64 classMask = GetClassMask();
     std::vector<SkillLineAbilityEntry const*> const* skillLineAbilities = GetSkillLineAbilitiesBySkill(skillId);
     if (!skillLineAbilities)
         return;
@@ -23936,7 +23945,7 @@ Player* Player::GetTrader() const
 bool Player::IsSpellFitByClassAndRace(uint32 spell_id) const
 {
     uint32 racemask  = GetRaceMask();
-    uint32 classmask = GetClassMask();
+    uint64 classmask = GetClassMask();
 
     SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spell_id);
     if (bounds.first == bounds.second)

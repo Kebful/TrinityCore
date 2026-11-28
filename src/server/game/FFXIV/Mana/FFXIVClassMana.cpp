@@ -17,7 +17,6 @@
 
 #include "FFXIVClassMana.h"
 #include "DatabaseEnv.h"
-#include "FFXIV/Jobs/FFXIVJobSlot.h"
 #include "Log.h"
 #include "Player.h"
 #include "Timer.h"
@@ -89,15 +88,6 @@ FfxivClassManaRow const* GetFfxivClassManaRow(uint8 classId)
 
 FfxivClassManaRow const* GetFfxivManaRow(Player const& player)
 {
-    // Only a hosted job may be looked up by job id: the ids of the module classes and of the ARR
-    // jobs overlap the ClassJob rows (class 21 is Paladin, ClassJob 21 is Warrior), so a class's own
-    // job id must never be read as a class id. A hosted job has an ffxiv_job_slot row; only then is
-    // its own row authoritative, and the class's row is the fallback (Sage on Conjurer is mana
-    // through the class).
-    uint8 const jobId = Jobs::GetFfxivPlayerJobId(player);
-    if (Jobs::GetFfxivJobSlotRow(jobId))
-        if (FfxivClassManaRow const* row = GetFfxivClassManaRow(jobId))
-            return row;
     return GetFfxivClassManaRow(player.GetClass());
 }
 

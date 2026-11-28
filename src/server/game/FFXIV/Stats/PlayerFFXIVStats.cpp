@@ -252,18 +252,11 @@ FFXIV::Stats::FfxivDerivedStats const& Player::GetFFXIVStats() const
 
 void Player::RefreshFFXIVJob()
 {
-    // The job a player has can change without a class switch: equipping or removing the Soul of
-    // <Job> does it (FFXIV/Jobs/FFXIVJobSlot.h). This is called from the equip/login path
-    // (Unit::UpdateDisplayPower) and after a class switch restored the equipment profile.
     uint8 const jobId = FFXIV::Jobs::GetFfxivPlayerJobId(*this);
 
-    // The bar first: the client's MP gauge binds on the unit's power type, so a Dark Knight must
-    // show mana before the packets below go out. A hosted MP job on a physical slot adopts the
-    // class's base mana pool (player_classlevelstats.basemana) when it has none yet.
-    uint8 classPower = 0; // POWER_MANA
+    uint8 displayPower = POWER_MANA;
     if (ChrClassesEntry const* entry = sChrClassesStore.LookupEntry(GetClass()))
-        classPower = entry->DisplayPower;
-    uint8 const displayPower = FFXIV::Jobs::GetFfxivJobDisplayPower(jobId, classPower);
+        displayPower = entry->DisplayPower;
     if (uint8(GetPowerType()) != displayPower)
     {
         bool const fillMana = displayPower == 0 && GetMaxPower(POWER_MANA) > 0 && GetPower(POWER_MANA) == 0;

@@ -501,7 +501,7 @@ struct CreatureAddon
 struct VendorItem
 {
     // @tswow-begin masks
-    VendorItem(uint32 _item, int32 _maxcount, uint32 _incrtime, uint32 _ExtendedCost, uint32 _raceMask, uint32 _classMask)
+    VendorItem(uint32 _item, int32 _maxcount, uint32 _incrtime, uint32 _ExtendedCost, uint32 _raceMask, uint64 _classMask)
         : item(_item), maxcount(_maxcount), incrtime(_incrtime), ExtendedCost(_ExtendedCost), raceMask(_raceMask), classMask(_classMask) { }
     // @tswow-end
 
@@ -511,7 +511,7 @@ struct VendorItem
     uint32 ExtendedCost;
     // @tswow-begin masks
     uint32 raceMask;
-    uint32 classMask;
+    uint64 classMask;
     // @tswow-end
 
     //helpers
@@ -532,7 +532,7 @@ struct VendorItemData
     bool Empty() const { return m_items.empty(); }
     uint8 GetItemCount() const { return m_items.size(); }
     // @tswow-begin masks
-    void AddItem(uint32 item, int32 maxcount, uint32 ptime, uint32 ExtendedCost, uint32 raceMask, uint32 classMask)
+    void AddItem(uint32 item, int32 maxcount, uint32 ptime, uint32 ExtendedCost, uint32 raceMask, uint64 classMask)
     {
         m_items.emplace_back(item, maxcount, ptime, ExtendedCost, raceMask, classMask);
     }

@@ -1170,7 +1170,7 @@ void ObjectMgr::CheckCreatureTemplate(CreatureTemplate const* cInfo)
         }
     }
 
-    if (!cInfo->unit_class || ((1u << (cInfo->unit_class-1)) & CLASSMASK_ALL_CREATURES) == 0)
+    if (!(ClassMaskForId(cInfo->unit_class) & CLASSMASK_ALL_CREATURES))
     {
         TC_LOG_ERROR("sql.sql", "Creature (Entry: {}) has invalid unit_class ({}) in creature_template. Set to 1 (UNIT_CLASS_WARRIOR).", cInfo->Entry, cInfo->unit_class);
         const_cast<CreatureTemplate*>(cInfo)->unit_class = UNIT_CLASS_WARRIOR;
@@ -3062,7 +3062,7 @@ void ObjectMgr::LoadItemTemplates()
         itemTemplate.BuyPrice                  = int32(fields[10].GetInt64());
         itemTemplate.SellPrice                 = fields[11].GetUInt32();
         itemTemplate.InventoryType             = uint32(fields[12].GetUInt8());
-        itemTemplate.AllowableClass            = fields[13].GetInt32();
+        itemTemplate.AllowableClass            = fields[13].GetInt64();
         itemTemplate.AllowableRace             = fields[14].GetInt32();
         itemTemplate.ItemLevel                 = uint32(fields[15].GetUInt16());
         itemTemplate.RequiredLevel             = uint32(fields[16].GetUInt8());
@@ -3671,7 +3671,7 @@ void ObjectMgr::LoadCustomItemTemplates()
         itemTemplate->BuyPrice = int32(fields[10].GetInt64());
         itemTemplate->SellPrice = fields[11].GetUInt32();
         itemTemplate->InventoryType = uint32(fields[12].GetUInt8());
-        itemTemplate->AllowableClass = fields[13].GetInt32();
+        itemTemplate->AllowableClass = fields[13].GetInt64();
         itemTemplate->AllowableRace = fields[14].GetInt32();
         itemTemplate->ItemLevel = uint32(fields[15].GetUInt16());
         itemTemplate->RequiredLevel = uint32(fields[16].GetUInt8());
@@ -4386,7 +4386,7 @@ void ObjectMgr::LoadPlayerInfo()
             {
                 Field* fields = result->Fetch();
                 uint32 raceMask = fields[0].GetUInt32();
-                uint32 classMask = fields[1].GetUInt32();
+                uint64 classMask = fields[1].GetUInt64();
                 PlayerCreateInfoSkill skill;
                 skill.SkillId = fields[2].GetUInt16();
                 skill.Rank = fields[3].GetUInt16();
@@ -4421,7 +4421,7 @@ void ObjectMgr::LoadPlayerInfo()
                     {
                         for (uint32 classIndex = CLASS_WARRIOR; classIndex <= MAX_CLASSES; ++classIndex)
                         {
-                            if (classMask == 0 || ((1u << (classIndex - 1)) & classMask))
+                            if (classMask == 0 || (ClassMaskForId(classIndex) & classMask))
                             {
                                 if (!GetSkillRaceClassInfo(skill.SkillId, raceIndex, classIndex))
                                     continue;
@@ -4460,7 +4460,7 @@ void ObjectMgr::LoadPlayerInfo()
             {
                 Field* fields = result->Fetch();
                 uint32 raceMask = fields[0].GetUInt32();
-                uint32 classMask = fields[1].GetUInt32();
+                uint64 classMask = fields[1].GetUInt64();
                 uint32 spellId = fields[2].GetUInt32();
 
                 if (raceMask != 0 && !(raceMask & RACEMASK_ALL_PLAYABLE))
@@ -4481,7 +4481,7 @@ void ObjectMgr::LoadPlayerInfo()
                     {
                         for (uint32 classIndex = CLASS_WARRIOR; classIndex <= MAX_CLASSES; ++classIndex)
                         {
-                            if (classMask == 0 || ((1u << (classIndex - 1)) & classMask))
+                            if (classMask == 0 || (ClassMaskForId(classIndex) & classMask))
                             {
                                 if (auto& info = _playerInfo[raceIndex][classIndex])
                                 {
@@ -4520,7 +4520,7 @@ void ObjectMgr::LoadPlayerInfo()
             {
                 Field* fields       = result->Fetch();
                 uint32 raceMask     = fields[0].GetUInt32();
-                uint32 classMask    = fields[1].GetUInt32();
+                uint64 classMask    = fields[1].GetUInt64();
                 uint32 spellId      = fields[2].GetUInt32();
 
                 if (raceMask != 0 && !(raceMask & RACEMASK_ALL_PLAYABLE))
@@ -4541,7 +4541,7 @@ void ObjectMgr::LoadPlayerInfo()
                     {
                         for (uint32 classIndex = CLASS_WARRIOR; classIndex <= MAX_CLASSES; ++classIndex)
                         {
-                            if (classMask == 0 || ((1u << (classIndex - 1)) & classMask))
+                            if (classMask == 0 || (ClassMaskForId(classIndex) & classMask))
                             {
                                 if (auto& info = _playerInfo[raceIndex][classIndex])
                                 {
@@ -5042,7 +5042,7 @@ void ObjectMgr::LoadSpellAutolearn()
             Field* fields = result->Fetch();
             uint32 spell     = fields[0].GetUInt32();
             uint32 racemask  = fields[1].GetUInt32();
-            uint32 classmask = fields[2].GetUInt32();
+            uint64 classmask = fields[2].GetUInt64();
             uint32 level     = fields[3].GetUInt32();
             if (level >= _spellAutoLearns.size())
             {
@@ -9709,7 +9709,7 @@ int32 ObjectMgr::GetBaseReputationOf(FactionEntry const* factionEntry, uint8 rac
         return 0;
 
     uint32 raceMask = (1u << (race - 1));
-    uint32 classMask = (1u << (playerClass-1));
+    uint64 classMask = ClassMaskForId(playerClass);
 
     for (uint8 i = 0; i < 4; ++i)
     {
@@ -10126,7 +10126,7 @@ void ObjectMgr::LoadTrainers()
             spell.ReqLevel = fields[8].GetUInt8();
             // @tswow-begin
             spell.raceMask = fields[9].GetUInt32();
-            spell.classMask = fields[10].GetUInt32();
+            spell.classMask = fields[10].GetUInt64();
             // @tswow-end
 
             SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spell.SpellId);
@@ -10182,7 +10182,7 @@ void ObjectMgr::LoadTrainers()
             std::string greeting = fields[3].GetString();
             // @tswow-begin
             uint32 raceMask = fields[4].GetUInt32();
-            uint32 classMask = fields[5].GetUInt32();
+            uint64 classMask = fields[5].GetUInt64();
             // @tswow-end
             std::vector<Trainer::Spell> spells;
             auto spellsItr = spellsByTrainer.find(trainerId);
@@ -10357,7 +10357,7 @@ uint32 ObjectMgr::LoadReferenceVendor(int32 vendor, int32 item, std::set<uint32>
             uint32 ExtendedCost = fields[3].GetUInt32();
             // @tswow-begin masks
             uint32 raceMask     = fields[4].GetUInt32();
-            uint32 classMask    = fields[5].GetUInt32();
+            uint64 classMask    = fields[5].GetUInt64();
             // @tswow-end
 
             if (!IsVendorItemValid(vendor, item_id, maxcount, incrtime, ExtendedCost, nullptr, skip_vendors))
@@ -10415,7 +10415,7 @@ void ObjectMgr::LoadVendors()
             uint32 ExtendedCost = fields[4].GetUInt32();
             // @tswow-begin load masks
             uint32 raceMask     = fields[5].GetUInt32();
-            uint32 classMask    = fields[6].GetUInt32();
+            uint64 classMask    = fields[6].GetUInt64();
             // @tswow-end
 
             if (!IsVendorItemValid(entry, item_id, maxcount, incrtime, ExtendedCost, nullptr, &skip_vendors))
@@ -10556,7 +10556,7 @@ Trainer::Trainer const* ObjectMgr::GetTrainer(uint32 creatureId) const
 }
 
 // @tswow-begin masks
-void ObjectMgr::AddVendorItem(uint32 entry, uint32 item, int32 maxcount, uint32 incrtime, uint32 extendedCost, uint32 raceMask, uint32 classMask, bool persist /*= true*/)
+void ObjectMgr::AddVendorItem(uint32 entry, uint32 item, int32 maxcount, uint32 incrtime, uint32 extendedCost, uint32 raceMask, uint64 classMask, bool persist /*= true*/)
 // @tswow-end
 {
     VendorItemData& vList = _cacheVendorItemStore[entry];
@@ -10575,7 +10575,7 @@ void ObjectMgr::AddVendorItem(uint32 entry, uint32 item, int32 maxcount, uint32 
         stmt->setUInt32(4, extendedCost);
         // @tswow-begin masks
         stmt->setUInt32(5, raceMask);
-        stmt->setUInt32(6, classMask);
+        stmt->setUInt64(6, classMask);
         // @tswow-end
 
         WorldDatabase.Execute(stmt);
@@ -10941,7 +10941,7 @@ void ObjectMgr::LoadCreatureClassLevelStats()
         uint8 Level = fields[0].GetUInt8();
         uint8 Class = fields[1].GetUInt8();
 
-        if (!Class || ((1u << (Class - 1)) & CLASSMASK_ALL_CREATURES) == 0)
+        if (!(ClassMaskForId(Class) & CLASSMASK_ALL_CREATURES))
             TC_LOG_ERROR("sql.sql", "Creature base stats for level {} has invalid class {}", Level, Class);
 
         CreatureBaseStats stats;

@@ -97,7 +97,7 @@ struct NPCVendorEntry
     uint32 ExtendedCost;
     // @tswow-begin masks
     uint32 raceMask = 0;
-    uint32 classMask = 0;
+    uint64 classMask = 0;
     // @tswow-end
 };
 

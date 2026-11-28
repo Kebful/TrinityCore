@@ -191,7 +191,7 @@ constexpr FfxivTribeRow kTribeTable[FFXIV_TRIBE_COUNT] =
     { 16,  0,  0,  -1,  -1,   0,   3,   2,   0 },
 };
 
-// Module class id (characters.class / ChrClasses 12..30) -> ClassJob row (the FFXIV
+// Module class id (characters.class / ChrClasses 12..42) -> ClassJob row (the FFXIV
 // job id), resolved by matching the module class display name to ClassJob column 0.
 // Every module class is listed; classJobId 0 means no name match and must never
 // ship (kClassJobMapUnmatched is asserted to 0 at build time). Not part of the
@@ -218,6 +218,17 @@ constexpr FfxivClassJobMapRow kClassJobMap[FFXIV_MODULE_CLASS_COUNT] =
     { 28, 25, "Black Mage" }, // ClassJob 25 black mage BLM
     { 29, 27, "Summoner" }, // ClassJob 27 summoner SMN
     { 30, 28, "Scholar" }, // ClassJob 28 scholar SCH
+    { 31, 32, "Dark Knight" }, // ClassJob 32 dark knight DRK
+    { 32, 33, "Astrologian" }, // ClassJob 33 astrologian AST
+    { 33, 31, "Machinist" }, // ClassJob 31 machinist MCH
+    { 34, 34, "Samurai" }, // ClassJob 34 samurai SAM
+    { 35, 35, "Red Mage" }, // ClassJob 35 red mage RDM
+    { 37, 37, "Gunbreaker" }, // ClassJob 37 gunbreaker GNB
+    { 38, 38, "Dancer" }, // ClassJob 38 dancer DNC
+    { 39, 39, "Reaper" }, // ClassJob 39 reaper RPR
+    { 40, 40, "Sage" }, // ClassJob 40 sage SGE
+    { 41, 41, "Viper" }, // ClassJob 41 viper VPR
+    { 42, 42, "Pictomancer" }, // ClassJob 42 pictomancer PCT
 };
 constexpr uint8 kClassJobMapUnmatched = 0;
 } // namespace FFXIV::Stats::Tables

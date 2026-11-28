@@ -73,8 +73,7 @@ void ClearFfxivClassManaRows();
 
 // The row for a ChrClasses id, or nullptr (stock mana rules).
 FfxivClassManaRow const* GetFfxivClassManaRow(uint8 classId);
-// The row for the player's FFXIV job: a hosted job's own row (ffxiv_class_mana keyed by the job id,
-// e.g. Dark Knight 32), else their class's row. FFXIV/Jobs/FFXIVJobSlot.h.
+// The MP regeneration row for the player's active class.
 FfxivClassManaRow const* GetFfxivManaRow(Player const& player);
 bool HasFfxivMana(Player const& player);
 

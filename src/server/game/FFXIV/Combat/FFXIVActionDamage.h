@@ -67,6 +67,8 @@
  * combo potency), then the target-relative positional column (flank / front / rear, by the angle
  * from the target's facing -- FFXIV positionals are measured on the *target's* hitbox), then the
  * plain damage column. A cure column is used only when the row states no damage-side potency at all.
+ * On a friendly target (the caster, an ally) a damage-side row selects nothing: such a self-cast's
+ * attack is a later hit on someone else (Vengeance's retaliation), which its livescript deals.
  *
  * Combo window
  * ------------
@@ -324,11 +326,13 @@ FfxivHealResult ComputeFfxivActionHeal(FfxivDerivedStats const& stats,
                                        std::span<FfxivPercentFactor const> buffs = {});
 
 // The active ffxiv_status_effect rows as the pipeline's inputs: damage_done_pct on `caster` and
-// damage_taken_pct on `target` become buff factors; force_crit / force_direct_hit become guarantees.
-// The status apply path uses the same function for a DoT tick, so an aura and our math read one row.
+// damage_taken_pct on `target` become buff factors; force_crit / force_direct_hit become guarantees,
+// and only for a weaponskill (`weaponskill`): every guarantee a shipped status states names
+// weaponskills. The status apply path uses the same function for a DoT tick (no guarantee), so an
+// aura and our math read one row.
 void CollectFfxivStatusCombatModifiers(::Unit& caster, ::Unit& target,
                                        std::vector<FfxivPercentFactor>& buffs,
-                                       FfxivCombatGuarantees& guarantees);
+                                       FfxivCombatGuarantees& guarantees, bool weaponskill = false);
 
 // --- the effect-driven cast path (the one-time spine) ---------------------------------------
 //
@@ -388,6 +392,25 @@ bool ComputeFfxivActionAuraAmount(::Player& caster, ::Unit& target, ::SpellInfo 
 
 // One action effect row's value, 0 when the table does not carry it.
 int32 GetFfxivActionEffectValue(uint32 actionId, uint8 kind);
+
+// --- script-owned potencies -----------------------------------------------------------------
+//
+// A potency a livescript applies at the moment its text names, not at the cast: a status's
+// retaliation ("delivers an attack with a potency of 55 every time you suffer physical damage"), the
+// cure on each weaponskill (Bloodwhetting), a barrier sized as a heal (Stem the Tide), a regen tick.
+// The number is the literal the script reads off the aura it owns; these functions only run it
+// through the same pipeline, stats, party and per-target roll the action hook uses. `spellId` is the
+// spell the hit or heal is logged under (the status aura or the action spell). `potency` 0 takes the
+// spell's own ffxiv_action_potency column (damage or cure) at the caster's job and level -- the same
+// "explicit value || table" rule the converted effects follow; a spell that is no action then gives 0.
+//
+// Nothing is cast: no combo step, status, gauge or charge is touched. Status guarantees do not apply
+// (none is a weaponskill), and a heal takes no damage modifier. Damage is never dealt to the caster
+// or a friendly unit. Each returns the amount it computed (0 when nothing applied).
+int64 ComputeFfxivScriptPotencyHeal(::Player& caster, ::Unit& target, uint32 spellId, int32 curePotency,
+                                    bool* crit = nullptr);
+int64 DealFfxivScriptPotencyHeal(::Player& caster, ::Unit& target, uint32 spellId, int32 curePotency);
+int64 DealFfxivScriptPotencyDamage(::Player& caster, ::Unit& target, uint32 spellId, int32 potency);
 
 // ffxiv_action_effect kind 0: the "Increases <gauge> by N" grant its ActionTransient text states.
 constexpr uint8 FFXIV_ACTION_EFFECT_GAUGE_DELTA = 0;

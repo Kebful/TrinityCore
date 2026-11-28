@@ -902,13 +902,13 @@ class TC_GAME_API Unit : public WorldObject
         uint32 GetRaceMask() const { return 1u << (GetRace() - 1); }
         uint8 GetClass() const { return GetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_CLASS); }
         void SetClass(uint8 classId) { SetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_CLASS, classId); }
-        uint32 GetClassMask() const { return 1u << (GetClass() - 1); }
+        uint64 GetClassMask() const { return ClassMaskForId(GetClass()); }
         Gender GetGender() const { return Gender(GetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_GENDER)); }
         void SetGender(Gender gender) { SetByteValue(UNIT_FIELD_BYTES_0, UNIT_BYTES_0_OFFSET_GENDER, gender); }
         virtual Gender GetNativeGender() const { return GetGender(); }
         virtual void SetNativeGender(Gender gender) { SetGender(gender); }
         // @tswow-begin
-        bool MatchRaceClassMask(uint32 raceMask, uint32 classMask, bool allowZero = true) const
+        bool MatchRaceClassMask(uint32 raceMask, uint64 classMask, bool allowZero = true) const
         {
             return ((allowZero && classMask == 0) || (GetClassMask() & classMask))
                 && ((allowZero && raceMask == 0) || (GetRaceMask() & raceMask));

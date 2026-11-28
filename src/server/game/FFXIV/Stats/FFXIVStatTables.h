@@ -121,7 +121,7 @@ struct FfxivTribeRow
  * Module class -> FFXIV job.
  *
  * The server stores the module's own ChrClasses id in `characters.class`
- * (Player::GetClass()): FFXIV classes/jobs are rows 12..30, allocated by the data
+ * (Player::GetClass()): FFXIV classes/jobs are rows 12..42, allocated by the data
  * build (release/modules/ffxivhaven/datascripts/shared/content.ts FfxivClassIDs).
  * That is NOT the ClassJob row id -- Marauder is class 13 but ClassJob 3 -- so the
  * generator resolves every module class by matching its display name to ClassJob
@@ -129,11 +129,11 @@ struct FfxivTribeRow
  * ClassJob name match is emitted as classJobId 0 and the build fails on
  * kClassJobMapUnmatched.
  */
-constexpr uint8 FFXIV_MODULE_CLASS_COUNT = 19; // module ChrClasses rows 12..30
+constexpr uint8 FFXIV_MODULE_CLASS_COUNT = 30; // module ChrClasses rows 12..42
 
 struct FfxivClassJobMapRow
 {
-    uint8 classId;              // characters.class / ChrClasses id (12..30)
+    uint8 classId;              // characters.class / ChrClasses id (12..42)
     uint8 classJobId;           // ClassJob row; 0 = no name match (must never ship)
     char const* name;           // module class display name the match used
 };

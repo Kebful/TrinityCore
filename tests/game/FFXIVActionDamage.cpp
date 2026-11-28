@@ -415,6 +415,11 @@ TEST_CASE("FFXIV action potency: plain, combo, positional and cure selection", "
     // No damage-side potency at all, even on a hostile target.
     CHECK(SelectFfxivActionPotency(CURE, WHM, 100, 0, 0, true).source == FfxivPotencySource::Cure);
 
+    // A damage row on a friendly target (the caster's own buff) selects nothing: the attack such a
+    // self-cast states is a later hit on someone else (Vengeance's retaliation), a livescript's.
+    CHECK(SelectFfxivActionPotency(FAST_BLADE, PLD, 100, 0, 0, false).source == FfxivPotencySource::None);
+    CHECK(SelectFfxivActionPotency(RIOT_BLADE, PLD, 100, FAST_BLADE, 0, false).source == FfxivPotencySource::None);
+
     ClearFfxivActionDamageTables();
 }
 

@@ -59,7 +59,7 @@ namespace Trainer
         std::array<uint32, 3> ReqAbility = { };
         uint8 ReqLevel = 0;
         // @tswow-begin
-        uint32 classMask = 0;
+        uint64 classMask = 0;
         uint32 raceMask = 0;
         // @tswow-end
 
@@ -70,7 +70,7 @@ namespace Trainer
     {
     public:
         // @tswow-begin
-        Trainer(uint32 trainerId, Type type, uint32 requirement, std::string greeting, uint32 classMask, uint32 raceMask, std::vector<Spell> spells);
+        Trainer(uint32 trainerId, Type type, uint32 requirement, std::string greeting, uint64 classMask, uint32 raceMask, std::vector<Spell> spells);
         // @tswow-end
 
         Spell const* GetSpell(uint32 spellId) const;
@@ -96,7 +96,7 @@ namespace Trainer
         Type _type;
         uint32 _requirement;
         // @tswow-begin
-        uint32 _classMask;
+        uint64 _classMask;
         uint32 _raceMask;
         // @tswow-endk
         std::vector<Spell> _spells;

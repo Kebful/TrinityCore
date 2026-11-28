@@ -618,7 +618,7 @@ struct TC_GAME_API ItemTemplate
     int32  BuyPrice;
     uint32 SellPrice;
     uint32 InventoryType;
-    uint32 AllowableClass;
+    uint64 AllowableClass;
     uint32 AllowableRace;
     uint32 ItemLevel;
     uint32 RequiredLevel;

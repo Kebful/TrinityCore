@@ -27,7 +27,7 @@ namespace
 {
 // Mirrors PlayerClassSwitch.cpp's MAX_CLASS_SWITCH_LEVEL: the client protocol and the
 // gt* tables carry 100 levels per class.
-constexpr uint8 MAX_CLASS_SWITCH_LEVEL = 100;
+constexpr uint8 MAX_CLASS_SWITCH_LEVEL = 255;
 
 class ByteWriter
 {
@@ -172,16 +172,14 @@ std::string FormatActionError(uint8 spec, uint8 button, uint32 actionId)
 }
 }
 
-uint32 ClassIdToMask(uint8 classId)
+uint64 ClassIdToMask(uint8 classId)
 {
-    if (!IsSupportedClassId(classId))
-        return 0;
-    return 1u << (classId - 1);
+    return ClassMaskForId(classId);
 }
 
 bool IsSupportedClassId(uint8 classId)
 {
-    return classId >= 1 && classId <= 32;
+    return classId >= 1 && classId <= MAX_CLASSES;
 }
 
 uint64 ComputeSessionTag(uint8 const* bytes, size_t size)
@@ -503,7 +501,7 @@ bool ValidateStoredProfile(StoredClassProfile const& profile, std::string* error
     if (!profile.Revision)
         return SetError(error, "stored profile revision is missing");
     if (!IsSupportedClassId(profile.ClassId))
-        return SetError(error, "stored profile class is outside the uint32 class-mask range");
+        return SetError(error, "stored profile class is outside the 64-bit class-mask range");
     if (!profile.Level || profile.Level > MAX_CLASS_SWITCH_LEVEL)
         return SetError(error, "stored profile level is invalid");
     if (profile.NextLevelXp && profile.Xp > profile.NextLevelXp)
@@ -908,8 +906,8 @@ std::vector<uint8> EncodeActiveClassStatus(StatusStage stage, RequestResult resu
     std::vector<ActiveClassStatusDescriptor> const& classes)
 {
     if (stage < StatusStage::State || stage > StatusStage::Confirmed ||
-        activeClassId > 32 || pendingClassId > 32 || !revision || !session ||
-        classes.size() > 32)
+        activeClassId > MAX_CLASSES || pendingClassId > MAX_CLASSES || !revision || !session ||
+        classes.size() > MAX_CLASSES)
         return {};
 
     std::set<uint8> classIds;

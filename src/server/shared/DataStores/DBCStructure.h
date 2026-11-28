@@ -1356,9 +1356,9 @@ struct SkillLineAbilityEntry
     uint32 SkillLine;                                       // 1
     uint32 Spell;                                           // 2
     uint32 RaceMask;                                        // 3
-    uint32 ClassMask;                                       // 4
+    uint64 ClassMask;                                       // 4
     //uint32 ExcludeRace;                                   // 5
-    //uint32 ExcludeClass;                                  // 6
+    //uint64 ExcludeClass;
     uint32 MinSkillLineRank;                                // 7
     uint32 SupercededBySpell;                               // 8
     uint32 AcquireMethod;                                   // 9
@@ -1382,7 +1382,7 @@ struct SkillRaceClassInfoEntry
     //uint32 ID;                                            // 0
     uint32 SkillID;                                         // 1
     uint32 RaceMask;                                        // 2
-    uint32 ClassMask;                                       // 3
+    uint64 ClassMask;                                       // 3
     uint32 Flags;                                           // 4
     //uint32 MinLevel;                                      // 5
     uint32 SkillTierID;                                     // 6
@@ -1711,7 +1711,7 @@ struct TalentTabEntry
     //uint32 Name_lang_mask;                                // 17
     //unit32 SpellIconID;                                   // 18
     //uint32 RaceMask;                                      // 19
-    uint32 ClassMask;                                       // 20
+    uint64 ClassMask;                                       // 20
     uint32 PetTalentMask;                                   // 21
     uint32 OrderIndex;                                      // 22
     //char const* BackgroundFile;                           // 23

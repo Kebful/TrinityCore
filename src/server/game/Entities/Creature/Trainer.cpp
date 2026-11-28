@@ -36,7 +36,7 @@ namespace Trainer
     }
 
     // @tswow-begin
-    Trainer::Trainer(uint32 trainerId, Type type, uint32 requirement, std::string greeting, uint32 classMask, uint32 raceMask, std::vector<Spell> spells) : _trainerId(trainerId), _type(type), _requirement(requirement), _classMask(classMask), _raceMask(raceMask), _spells(std::move(spells))
+    Trainer::Trainer(uint32 trainerId, Type type, uint32 requirement, std::string greeting, uint64 classMask, uint32 raceMask, std::vector<Spell> spells) : _trainerId(trainerId), _type(type), _requirement(requirement), _classMask(classMask), _raceMask(raceMask), _spells(std::move(spells))
     // @tswow-end
     {
         _greeting[DEFAULT_LOCALE] = std::move(greeting);
@@ -60,7 +60,7 @@ namespace Trainer
 
             // @tswow-begin masks and event
             uint32 raceMask = trainerSpell.raceMask;
-            uint32 classMask = trainerSpell.classMask;
+            uint64 classMask = trainerSpell.classMask;
             if(!player->MatchRaceClassMask(trainerSpell.raceMask,trainerSpell.classMask))
             {
                 continue;

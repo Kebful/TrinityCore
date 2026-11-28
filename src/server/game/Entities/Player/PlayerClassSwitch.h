@@ -444,7 +444,7 @@ struct ActiveClassSnapshot
     SharedProgressionState SharedProgression;
 };
 
-uint32 ClassIdToMask(uint8 classId);
+uint64 ClassIdToMask(uint8 classId);
 bool IsSupportedClassId(uint8 classId);
 uint64 ComputeSessionTag(uint8 const* bytes, size_t size);
 uint64 ComputeFnv1a64(uint8 const* bytes, size_t size);

@@ -288,6 +288,17 @@ TEST_CASE("FFXIV module class map (characters.class -> ClassJob)", "[ffxiv]")
         { 28, "Black Mage", 25, "BLM" },
         { 29, "Summoner",   27, "SMN" },
         { 30, "Scholar",    28, "SCH" },
+        { 31, "Dark Knight", 32, "DRK" },
+        { 32, "Astrologian", 33, "AST" },
+        { 33, "Machinist",   31, "MCH" },
+        { 34, "Samurai",     34, "SAM" },
+        { 35, "Red Mage",    35, "RDM" },
+        { 37, "Gunbreaker",  37, "GNB" },
+        { 38, "Dancer",      38, "DNC" },
+        { 39, "Reaper",      39, "RPR" },
+        { 40, "Sage",        40, "SGE" },
+        { 41, "Viper",       41, "VPR" },
+        { 42, "Pictomancer", 42, "PCT" },
     };
 
     SECTION("every module class maps to its ClassJob row by name")
@@ -324,7 +335,7 @@ TEST_CASE("FFXIV module class map (characters.class -> ClassJob)", "[ffxiv]")
     {
         // Stock WoW classes 1..11 and anything above the module allocation. The
         // class map must tolerate them: any class can log in.
-        for (uint8 classId : { uint8(0), uint8(1), uint8(2), uint8(11), uint8(31), uint8(255) })
+        for (uint8 classId : { uint8(0), uint8(1), uint8(2), uint8(11), uint8(36), uint8(43), uint8(255) })
         {
             INFO("class " << uint32(classId));
             CHECK(FindFfxivClassJobMapRow(classId) == nullptr);

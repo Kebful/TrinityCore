@@ -16,6 +16,7 @@
 #include "CustomPacketWrite.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "FFXIV/Jobs/FFXIVJobSlot.h"
 #include "FFXIV/Stats/FFXIVStatTables.h"
 #include "GameTime.h"
 #include "Item.h"
@@ -53,7 +54,7 @@ constexpr size_t MAX_REQUESTS_PER_MINUTE = 6;
 constexpr std::chrono::seconds CLIENT_RESPONSE_TIMEOUT(10);
 // The client's class-switch protocol and the gt* tables carry 100 levels per class
 // (gtChanceToMeleeCrit.dbc is 30 classes x 100); the server cap is MaxPlayerLevel.
-constexpr uint8 MAX_CLASS_SWITCH_LEVEL = 100;
+constexpr uint8 MAX_CLASS_SWITCH_LEVEL = 255;
 
 struct RuntimeClassDefinition
 {
@@ -218,7 +219,7 @@ std::set<uint32> CollectFfxivClassActionSpells(uint8 classId)
     if (FFXIV::Stats::GetFfxivClassJobId(classId) == FFXIV::Stats::FFXIV_NEUTRAL_JOB_ID)
         return {};
     std::set<uint32> spellIds;
-    uint32 const classMask = ClassIdToMask(classId);
+    uint64 const classMask = ClassIdToMask(classId);
     for (std::vector<SpellAutoLearn> const& level : sObjectMgr->GetSpellAutolearns())
         for (SpellAutoLearn const& spell : level)
             if ((spell.classmask & classMask) && sSpellMgr->GetSpellInfo(spell.spell))
@@ -309,7 +310,7 @@ public:
                 "selection requests require a class ID", error);
         if (!IsSupportedClassId(classId))
             return Reject(player, runtime, RequestResult::UnknownClass,
-                "class ID is outside the uint32 class-mask representable range", error);
+                "class ID is outside the 64-bit class-mask range", error);
 
         char const* readinessError = nullptr;
         if (!IsReady(player, false, &readinessError))
@@ -1320,9 +1321,9 @@ private:
             uint8(sWorld->getIntConfig(CONFIG_START_DEATH_KNIGHT_PLAYER_LEVEL)));
         ClassDefinition const& def = definition.Definition;
         if (!IsSupportedClassId(def.ClassId))
-            return SetError(error, "class ID must be between 1 and 32");
+            return SetError(error, "class ID must be between 1 and 64");
         if (!def.ExpGroup || !IsSupportedClassId(def.ExpGroup))
-            return SetError(error, "exp group must be a class ID between 1 and 32");
+            return SetError(error, "exp group must be a class ID between 1 and 64");
         if (!def.Enabled)
             return true;
         if (!def.InitialLevel ||
@@ -1573,8 +1574,8 @@ private:
                         sSpellMgr->GetSkillLineAbilityMapBounds(spell.Id);
                     for (auto itr = bounds.first; itr != bounds.second; ++itr)
                     {
-                        if (GetSkillRaceClassInfo(
-                            itr->second->SkillLine, player->GetRace(), profile->ClassId))
+                        if ((!itr->second->ClassMask || (itr->second->ClassMask & ClassIdToMask(profile->ClassId))) &&
+                            GetSkillRaceClassInfo(itr->second->SkillLine, player->GetRace(), profile->ClassId))
                         {
                             hasCoverage = true;
                             break;
@@ -2184,8 +2185,8 @@ private:
                     bool covered = false;
                     for (auto itr = bounds.first; itr != bounds.second; ++itr)
                     {
-                        if (GetSkillRaceClassInfo(
-                            itr->second->SkillLine, player->GetRace(), profile->ClassId))
+                        if ((!itr->second->ClassMask || (itr->second->ClassMask & ClassIdToMask(profile->ClassId))) &&
+                            GetSkillRaceClassInfo(itr->second->SkillLine, player->GetRace(), profile->ClassId))
                         {
                             covered = true;
                             break;
@@ -2441,9 +2442,9 @@ private:
         return true;
     }
 
-    bool ValidateEquipment(Player* player, StoredClassProfile const& profile, std::string* error)
+    bool ValidateEquipment(Player* player, StoredClassProfile& profile, std::string* error)
     {
-        uint32 classMask = ClassIdToMask(profile.ClassId);
+        uint64 classMask = ClassIdToMask(profile.ClassId);
         uint32 raceMask = ClassIdToMask(player->GetRace());
         uint32 weaponProficiency = 0;
         uint32 armorProficiency = (1u << ITEM_SUBCLASS_ARMOR_MISC);
@@ -2476,9 +2477,17 @@ private:
         Item* offhand = nullptr;
         for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
         {
-            StoredEquipmentItem const& stored = profile.Equipment[slot];
+            StoredEquipmentItem& stored = profile.Equipment[slot];
             if (!stored.EquippedGuid)
                 continue;
+            // A saved host loadout can still reference a crystal that now belongs to a job.
+            // Clear the slot reference while leaving the item in the character's inventory.
+            if (uint8 const stoneClass = FFXIV::Jobs::GetFfxivJobStoneClassId(stored.ItemId);
+                stoneClass && stoneClass != profile.ClassId)
+            {
+                stored = {};
+                continue;
+            }
             Item* item = player->GetItemByGuid(ObjectGuid(stored.EquippedGuid));
             if (!item || item->GetEntry() != stored.ItemId ||
                 item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT) != stored.Enchantments[0] ||
@@ -3241,12 +3250,45 @@ private:
         }
     }
 
+    // The active (display) power of an FFXIV class can be script-owned: rage mirrors the job gauge
+    // (jobgauge.ts), and mana/energy/focus come from class stats that a profile may not have applied
+    // yet. A snapshot built before any of that runs carries a zero maximum and fails validation
+    // ("snapshot active power maximum is missing"), whichever pool the class displays - the failing
+    // snapshot can be the source (the class being left) as much as the target.
+    void EnsureDisplayPowerMaximum(Player* player)
+    {
+        if (!player)
+            return;
+        Powers const power = player->GetPowerType();
+        if (player->GetMaxPower(power) > 0)
+            return;
+        switch (power)
+        {
+            case POWER_MANA:
+                player->SetMaxPower(power, player->GetCreateMana() > 0 ? player->GetCreateMana() : 10000);
+                break;
+            case POWER_RAGE:
+                // Tenths contract shared with FFXIV_RAGE_MAX_FIELD in jobgauge.ts: 100 gauge = 1000.
+                player->SetMaxPower(power, 1000);
+                break;
+            case POWER_ENERGY:
+            case POWER_FOCUS:
+                player->SetMaxPower(power, 100);
+                break;
+            default:
+                break;
+        }
+    }
+
     bool BuildSnapshot(Player* player, StoredClassProfile const& profile, PlayerRuntime& runtime,
         ActiveClassSnapshot* snapshot, std::string* error)
     {
         ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(player->GetClass());
         if (!classEntry)
             return SetError(error, "active class DBC entry is missing");
+
+        // Before anything reads the display pool: the snapshot is validated before scripts run.
+        EnsureDisplayPowerMaximum(player);
 
         ActiveClassSnapshot built;
         built.Session = player->GetSession()->GetActiveClassSessionTag();
@@ -3368,6 +3410,13 @@ private:
         for (auto const& [spellId, spell] : player->m_spells)
         {
             if (spell.state == PLAYERSPELL_REMOVED || !spell.active || spell.disabled)
+                continue;
+            // The client refuses a snapshot that retains a spell from an inactive class family
+            // ("snapshot retains a spell from an inactive class family", ActiveClassRuntimeValidation):
+            // a profile captured on another class can still hold its actions. Family-less spells
+            // (professions, riding, the FFXIV shared actions) stay.
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (info && info->SpellFamilyName && info->SpellFamilyName != classEntry->SpellClassSet)
                 continue;
             built.Spells.push_back({ int32(spellId), 0 });
             known.insert(int32(spellId));

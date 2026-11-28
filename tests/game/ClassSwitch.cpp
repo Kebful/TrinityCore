@@ -58,18 +58,21 @@ ActiveClassSnapshot MinimalSnapshot()
 }
 }
 
-TEST_CASE("Class switch class IDs and masks cover the uint32 boundary", "[ClassSwitch]")
+TEST_CASE("Class switch class IDs and masks cover both mask words and the uint64 boundary", "[ClassSwitch]")
 {
-    for (uint32 classId = 1; classId <= 32; ++classId)
+    for (uint32 classId = 1; classId <= 64; ++classId)
     {
         REQUIRE(IsSupportedClassId(uint8(classId)));
-        REQUIRE(ClassIdToMask(uint8(classId)) == (1u << (classId - 1)));
+        REQUIRE(ClassIdToMask(uint8(classId)) == (uint64(1) << (classId - 1)));
     }
     REQUIRE(ClassIdToMask(1) == 0x00000001u);
     REQUIRE(ClassIdToMask(11) == 0x00000400u);
     REQUIRE(ClassIdToMask(32) == 0x80000000u);
     REQUIRE_FALSE(IsSupportedClassId(0));
-    REQUIRE_FALSE(IsSupportedClassId(33));
+    REQUIRE(ClassIdToMask(33) == 0x0000000100000000ULL);
+    REQUIRE(ClassIdToMask(64) == 0x8000000000000000ULL);
+    REQUIRE_FALSE(IsSupportedClassId(65));
+    REQUIRE(ClassIdToMask(65) == 0);
     uint8 sessionKey[40] = {};
     REQUIRE(ComputeSessionTag(sessionKey, sizeof(sessionKey)) == 0x40d69e0cf0f65c45ULL);
 }
@@ -786,6 +789,17 @@ TEST_CASE("Class switch status encodes the final client field order", "[ClassSwi
     classes.push_back(classes.front());
     REQUIRE(EncodeActiveClassStatus(StatusStage::State, RequestResult::Ok,
         8, 0, 1, 2, classes).empty());
+
+    std::vector<ActiveClassStatusDescriptor> wideRoster;
+    for (uint8 classId = 1; classId <= 64; ++classId)
+        wideRoster.push_back({ classId, 100, CLASS_FLAG_AVAILABLE, "Class" });
+    auto const wideStatus = EncodeActiveClassStatus(StatusStage::State, RequestResult::Ok,
+        41, 0, 1, 2, wideRoster);
+    REQUIRE(wideStatus.size() > 23);
+    REQUIRE(wideStatus[22] == 64);
+    wideRoster.push_back({ 65, 100, CLASS_FLAG_AVAILABLE, "Out of range" });
+    REQUIRE(EncodeActiveClassStatus(StatusStage::State, RequestResult::Ok,
+        41, 0, 1, 2, wideRoster).empty());
 
     std::vector<ActiveClassStatusDescriptor> invalidUtf8{
         { 8, 23, CLASS_FLAG_ACTIVE, std::string("\xFF", 1) }

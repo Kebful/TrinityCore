@@ -502,8 +502,8 @@ void Player::ApplyFeralAPBonus(int32 amount, bool apply)
     UpdateAttackPowerAndDamage();
 }
 
-uint32 meleeAPFormulas[32];
-uint32 rangedAPFormulas[32];
+uint32 meleeAPFormulas[MAX_CLASSES + 1];
+uint32 rangedAPFormulas[MAX_CLASSES + 1];
 
 enum class ClassStatFormulaTypes: uint32 {
     MELEE =  1,
@@ -521,10 +521,20 @@ enum class ClassStatValueTypes : uint32 {
 
 void LoadAPFormulas()
 {
-    for (int i = 0; i < 32; ++i)
+    for (uint32 classId = 0; classId <= MAX_CLASSES; ++classId)
     {
-        meleeAPFormulas[i] = i;
-        rangedAPFormulas[i] = i;
+        meleeAPFormulas[classId] = classId;
+        rangedAPFormulas[classId] = classId;
+    }
+
+    // The stat tables use zero-based indices and SQL can override these defaults.
+    for (uint32 index = CLASS_DRUID; index < MAX_CLASSES; ++index)
+    {
+        dodge_cap[index] = 100.0f;
+        miss_cap[index] = 16.0f;
+        m_diminishing_k[index] = 0.98f;
+        dodge_base[index] = 0.035f;
+        crit_to_dodge[index] = 0.87f;
     }
 
     {
@@ -538,9 +548,8 @@ void LoadAPFormulas()
                 ClassStatFormulaTypes stat = ClassStatFormulaTypes(field[1].GetUInt32());
                 uint32 clsOut = field[2].GetUInt32();
 
-                if (cls >= MAX_CLASSES) {
+                if (cls > MAX_CLASSES || clsOut > MAX_CLASSES)
                     continue;
-                }
 
                 switch (stat) {
                     case ClassStatFormulaTypes::MELEE:

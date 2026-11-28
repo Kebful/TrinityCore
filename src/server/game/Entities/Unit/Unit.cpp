@@ -60,7 +60,6 @@
 #include "Player.h"
 #include "FFXIV/Combat/FFXIVSpellStages.h"
 #include "FFXIV/Gauge/FFXIVJobGauge.h"
-#include "FFXIV/Jobs/FFXIVJobSlot.h"
 #include "PlayerAI.h"
 #include "QuestDef.h"
 #include "ReputationMgr.h"
@@ -5606,11 +5605,6 @@ void Unit::UpdateDisplayPower()
                 ChrClassesEntry const* cEntry = sChrClassesStore.LookupEntry(GetClass());
                 if (cEntry && cEntry->DisplayPower < MAX_POWERS)
                     displayPower = Powers(cEntry->DisplayPower);
-                // FFXIV: a job hosted on this class slot (the Soul of <Job> the player wears, see
-                // FFXIV/Jobs/FFXIVJobSlot.h) shows its own power bar -- Dark Knight on Marauder
-                // shows MP. No stone: the class's power, unchanged.
-                displayPower = Powers(FFXIV::Jobs::GetFfxivJobDisplayPower(
-                    FFXIV::Jobs::GetFfxivPlayerJobId(*ToPlayer()), uint8(displayPower)));
             }
             else if (GetTypeId() == TYPEID_UNIT)
             {
@@ -5635,8 +5629,7 @@ void Unit::UpdateDisplayPower()
 
     SetPowerType(displayPower);
 
-    // FFXIV: the power bar above may be a hosted job's instead of the class's; re-derive the job so
-    // the snapshot/gauge follow an equipped or removed Soul of <Job> (FFXIV/Jobs/FFXIVJobSlot.h).
+    // Refresh the job snapshot after applying the class power type.
     if (GetTypeId() == TYPEID_PLAYER)
         ToPlayer()->RefreshFFXIVJob();
 }
