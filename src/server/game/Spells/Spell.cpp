@@ -4977,6 +4977,9 @@ void Spell::TakePower()
 
 void Spell::TakeAmmo()
 {
+    // @ffxiv: no ammunition is ever consumed (Duskhaven returns here too, "@dh-begin ... just return").
+    return;
+
     // Only players use ammo
     Player* player = m_caster->ToPlayer();
     if (!player)
@@ -7241,59 +7244,11 @@ SpellCastResult Spell::CheckItems(uint32* param1 /*= nullptr*/, uint32* param2 /
                 if (!item || item->IsBroken())
                     return SPELL_FAILED_EQUIPPED_ITEM;
 
+                // @ffxiv: ammunition is disabled, the same way Duskhaven disables it (their
+                // "@dh-begin hater disable ammo" switch): a bow, gun, crossbow, wand or thrown weapon
+                // fires without arrows/bullets and the stock SPELL_FAILED_NO_AMMO gate is never hit.
                 switch (item->GetTemplate()->SubClass)
                 {
-                    case ITEM_SUBCLASS_WEAPON_THROWN:
-                    {
-                        uint32 const ammo = item->GetEntry();
-                        if (!player->HasItemCount(ammo))
-                            return SPELL_FAILED_NO_AMMO;
-                        break;
-                    }
-                    case ITEM_SUBCLASS_WEAPON_GUN:
-                    case ITEM_SUBCLASS_WEAPON_BOW:
-                    case ITEM_SUBCLASS_WEAPON_CROSSBOW:
-                    {
-                        uint32 const ammo = player->GetUInt32Value(PLAYER_AMMO_ID);
-                        if (!ammo)
-                        {
-                            // Requires No Ammo
-                            if (player->HasAura(46699))
-                                break;                      // skip other checks
-
-                            return SPELL_FAILED_NO_AMMO;
-                        }
-
-                        ItemTemplate const* ammoProto = sObjectMgr->GetItemTemplate(ammo);
-                        if (!ammoProto)
-                            return SPELL_FAILED_NO_AMMO;
-
-                        if (ammoProto->Class != ITEM_CLASS_PROJECTILE)
-                            return SPELL_FAILED_NO_AMMO;
-
-                        // check ammo ws. weapon compatibility
-                        switch (item->GetTemplate()->SubClass)
-                        {
-                            case ITEM_SUBCLASS_WEAPON_BOW:
-                            case ITEM_SUBCLASS_WEAPON_CROSSBOW:
-                                if (ammoProto->SubClass != ITEM_SUBCLASS_ARROW)
-                                    return SPELL_FAILED_NO_AMMO;
-                                break;
-                            case ITEM_SUBCLASS_WEAPON_GUN:
-                                if (ammoProto->SubClass != ITEM_SUBCLASS_BULLET)
-                                    return SPELL_FAILED_NO_AMMO;
-                                break;
-                            default:
-                                return SPELL_FAILED_NO_AMMO;
-                        }
-
-                        if (!player->HasItemCount(ammo))
-                        {
-                            player->SetUInt32Value(PLAYER_AMMO_ID, 0);
-                            return SPELL_FAILED_NO_AMMO;
-                        }
-                        break;
-                    }
                     case ITEM_SUBCLASS_WEAPON_WAND:
                         break;
                     default:
